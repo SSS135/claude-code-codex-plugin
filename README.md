@@ -2,12 +2,12 @@
   <img src="./assets/readme/hero.svg" width="100%" alt="Codex for Claude Code. Illustration of a Claude Code session: one Codex agent is still running npm test, another has completed, and a one-line notice wakes Claude with its result.">
 </p>
 
-A Claude Code plugin that runs OpenAI Codex (luna, sol, astra, terra) as native Claude Code background subagents. Claude hands a task to a `codex:sol` agent through its own Agent tool and carries on. The job shows in the native task list, `SendMessage` and `TaskStop` reach it, and when Codex finishes, the native `Agent "<description>" finished` notification brings Claude the Codex final message, word for word. A live pane lists every job, and Codex approval requests show up as Claude Code dialogs.
+A Claude Code plugin that runs OpenAI Codex (luna, sol, astra, terra) as native Claude Code background subagents. Claude hands a task to a `codex:sol` agent through its own Agent tool and carries on. The job shows in the native task list, `SendMessage` and `TaskStop` reach it, and when Codex finishes, the native `Agent "<description>" finished` notification brings Claude the Codex final message, word for word. Codex approval requests show up as Claude Code dialogs.
 
 ## How it works
 
 <p align="center">
-  <img src="./assets/readme/flow.svg" width="100%" alt="Four steps: Claude starts a codex:luna background agent and moves on; Codex works in its own sandbox while the /codex pane shows progress; escalations go to a Claude Code dialog in ask mode or to Codex's reviewer in auto mode; the result arrives as a native task notification and SendMessage continues the thread.">
+  <img src="./assets/readme/flow.svg" width="100%" alt="Four steps: Claude starts a codex:luna background agent and moves on; Codex works in its own sandbox while the native task list shows progress; escalations go to a Claude Code dialog in ask mode or to Codex's reviewer in auto mode; the result arrives as a native task notification and SendMessage continues the thread.">
 </p>
 
 The plugin registers four agent types, one per Codex model: `codex:luna`, `codex:sol`, `codex:astra` and `codex:terra`. Claude uses them like `general-purpose`, so you can ask in plain words, for example "have a Codex agent fix the flaky retry test". Claude turns that into an Agent call like this:
@@ -91,19 +91,12 @@ Besides the agent types, Claude sees two tools as `mcp__codex__<name>`:
 
 | Tool | Parameters | What it does |
 | --- | --- | --- |
-| `codex_list` | none | Lists Codex jobs with model, status and current activity. |
+| `codex_list` | none | Lists this session's Codex jobs, newest first and at most the latest 10, with model, status, tokens and current activity. |
 | `codex_result` | `id`, `full` | Status and final message. With `full=true` it adds the turn digest: commands with exit codes, file changes and messages. |
 
-`id` is the agent's agentId or the job's name (its description, as `codex_list` shows it). A third tool, `codex_await`, serves the wrapper agents alone and refuses any other caller.
+`id` is the agent's agentId or the job's name (its description, as `codex_list` shows it); `codex_result` reads any job the plugin still holds, including older ones and other sessions'. A third tool, `codex_await`, serves the wrapper agents alone and refuses any other caller.
 
-In the transcript each call is one row like a native one, for example `● Codex(list)` over `⎿  2 agents · 1 running`. While jobs run they are also named at the end of the hint line under the prompt (`codex: Fix flaky retry test (luna)`), and the `/codex` pane shows what each is doing.
-
-## Commands
-
-- `/codex` opens the jobs pane and lists the jobs.
-- `/codex stop <name>` interrupts a job's Codex turn (its agent then finishes with "Codex turn interrupted.").
-- `/codex models` lists the models Codex offers and the efforts each one takes.
-- `/codex rules` lists Codex allow rules, and `/codex rules rm <n>` removes one.
+In the transcript each call is one row like a native one, for example `● Codex(list)` over `⎿  2 agents · 1 running`. While jobs run they are also named at the end of the hint line under the prompt (`codex: Fix flaky retry test (luna)`); the native task list (↓ to manage) shows and stops them.
 
 ## Configuration
 
@@ -134,7 +127,7 @@ When a setting comes from several places, the prompt's header lines beat the pro
 - `never`: no escalation. The sandbox alone decides.
 - `yolo`: full bypass with no sandbox and no approvals. Claude uses it only when you ask for it explicitly in the request, or when a project's `.claude/codex.json` makes it the default. You cannot set it as a user-wide default.
 
-"Allow always" writes a rule to Codex's global rules file, `~/.codex/rules/default.rules`. That rule then applies to every Codex session on the machine, including ones started outside this plugin.
+"Allow always" adds a `prefix_rule` to Codex's own rules file, `~/.codex/rules/default.rules`, managed like any Codex rule. That rule then applies to every Codex session on the machine, including ones started outside this plugin.
 
 ## Architecture
 
@@ -148,7 +141,7 @@ The bridge exists because the plugin API cannot write to a child process's stdin
 
 ## Known limits
 
-- The wrapper agent is defined on `haiku`, because an agent type must name a Claude model; the plugin answers every request of its loop, so that model is never called. Where the engine names the agent's model (its task details), it may say haiku; the `/codex` pane and `codex_list` show the Codex model.
+- The wrapper agent is defined on `haiku`, because an agent type must name a Claude model; the plugin answers every request of its loop, so that model is never called. Where the engine names the agent's model (its task details), it may say haiku; `codex_list` and `codex_result` show the Codex model.
 - If the plugin's `turn.step` hook fails for a wrapper request, the engine sends that request to haiku, whose system prompt tells it to call `codex_await` and deliver its result unchanged. A failure is reported in the transcript's dim plugin line.
 - In auto mode the hand-back arrives with the engine's note that auto mode's classifier was unavailable for the agent's work: the classifier judges a model's actions with its request, and the wrapper's steps make no request. Only that classifier may allow `SubagentHandback`, so the plugin cannot allow it itself. The report under the note is the Codex final message, verbatim.
 - The final message and each `message_claude` message are passed on whole up to 20,000 characters; a longer one is cut there. At most 50 messages wait unread per job.
@@ -156,8 +149,8 @@ The bridge exists because the plugin API cannot write to a child process's stdin
 - A Codex thread is started before the Agent call's subagent; if another plugin then refuses the spawn, that thread stays unused.
 - The model is chosen by the agent type alone: the four aliases, no other Codex model id.
 - Each Agent call starts a new Codex thread. `SendMessage` continues one; there is no way to attach a new agent to an older thread.
-- The plugin API does not tell a tool row whether ctrl+o is expanding it, so the text a `codex_*` call returned is not drawn under its row; `codex_result` or the `/codex` pane shows a job's result.
-- The running-jobs line under the prompt is drawn on the terminal only; the desktop app shows the `/codex` pane.
+- The plugin API does not tell a tool row whether ctrl+o is expanding it, so the text a `codex_*` call returned is not drawn under its row; `codex_result` shows a job's result.
+- The running-jobs line under the prompt is drawn on the terminal only.
 - Resuming a thread right after Claude Code restarts can take about 20 seconds while Codex reloads it.
 - The hooks plugin API is early access and may change between Claude Code releases.
 

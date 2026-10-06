@@ -8,7 +8,7 @@ export type CodexAgent = {
   /** The native subagent's agentId, which SendMessage and TaskStop take. */
   id: string
   name: string
-  /** The short task label the transcript and the pane show (the spawn's description, else its prompt's first line). */
+  /** The short task label the transcript shows (the spawn's description, else its prompt's first line). */
   description: string
   threadId: string
   model: string
@@ -27,7 +27,6 @@ export type CodexAgent = {
   lastMessage: string
   /** One line of what it is doing now. */
   activity: string
-  lastCommand: string
   tokens: number
   error: string | null
   /** The key bin/codex-msg names this job by (in the thread's developer instructions). */
@@ -43,19 +42,10 @@ export type CodexAgent = {
   sessionId: string
 }
 
-export type CodexApproval = {
-  agentId: string
-  requestId: number | string
-  summary: string
-}
-
 declare module 'claude-code' {
   interface PluginState {
     codex: {
       agents: Record<string, CodexAgent>
-      selected: string | null
-      showResult: boolean
-      approvals: CodexApproval[]
       /** Survives reloads: names this session's bridge daemon. */
       bridgeKey: string | null
     }

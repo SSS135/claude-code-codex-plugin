@@ -1,10 +1,10 @@
 {
   "name": "codex",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "author": {
     "name": "SSS135"
   },
-  "description": "Run OpenAI Codex jobs as native background subagents (codex:luna, codex:sol, codex:astra, codex:terra): the native task list, SendMessage, TaskStop and finish notifications, with approvals and a live pane.",
+  "description": "Run OpenAI Codex jobs as native background subagents (codex:luna, codex:sol, codex:astra, codex:terra): the native task list, SendMessage, TaskStop and finish notifications, with Codex approval requests as Claude Code dialogs.",
   "types": "./types/index.d.ts",
   "userConfig": {
     "codexPath": {

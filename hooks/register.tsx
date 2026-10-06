@@ -34,19 +34,15 @@ import {
   parseProjectConfig,
   permissionsFor,
   PROJECT_CONFIG,
-  ruleLines,
-  RULES_FILE,
-  withoutRule,
   type BridgeEvent,
   byThread,
   clip,
   CodexError,
-  COMMAND,
   describeAgent,
   findIn,
   firstLine,
-  formatTokens,
   isLive,
+  listText,
   outputText,
   rowArgs,
   rowResult,
@@ -59,9 +55,7 @@ import {
   LineBuffer,
   modelEffortError,
   effortFor,
-  MODEL_EFFORTS,
   PER_MODEL_EFFORT,
-  PANE,
   PREFIX,
   resolveModel,
   resultText,
@@ -73,12 +67,9 @@ import {
   messageSummary,
   type Settings,
   sorted,
-  statusColor,
-  statusDot,
   STILL_RUNNING,
   textInput,
   threadResumeParams,
-  timeOf,
   TOOL_SPECS,
   trim,
   turnStartParams,
@@ -93,9 +84,6 @@ type Engine = EngineInterface
 // ------------------------------------------------------------ state
 
 const agentsAtom = atom({ plugin: 'codex', key: 'agents' } as const, {})
-const selectedAtom = atom({ plugin: 'codex', key: 'selected' } as const, null)
-const showResultAtom = atom({ plugin: 'codex', key: 'showResult' } as const, false)
-const approvalsAtom = atom({ plugin: 'codex', key: 'approvals' } as const, [])
 const bridgeKeyAtom = atom({ plugin: 'codex', key: 'bridgeKey' } as const, null)
 
 const STORE_KEY = 'agents'
@@ -264,8 +252,8 @@ type WaitAnswer =
   | { status: 'message'; messages: string[] }
   | { status: 'timeout' }
 
-/** Long-polls until the thread's turn ends or, given `msgKey`, the job sends a codex-msg message: time inside $.http.fetch is budget-free. */
-async function waitTurn($: Engine, threadId: string, timeoutMs: number, msgKey?: string): Promise<WaitAnswer> {
+/** Long-polls until the thread's turn ends or the job (named by `msgKey`) sends a codex-msg message: time inside $.http.fetch is budget-free. */
+async function waitTurn($: Engine, threadId: string, timeoutMs: number, msgKey: string): Promise<WaitAnswer> {
   // $.http.fetch gives up after 30 s and takes no timeout option: poll in slices under that.
   const deadline = (await $.clock.now()) + timeoutMs
   for (;;) {
@@ -361,7 +349,6 @@ async function newAgent($: Engine, id: string, threadId: string, input: JobInput
     lastTurnStatus: null,
     lastMessage: '',
     activity: 'starting',
-    lastCommand: '',
     tokens: 0,
     error: null,
     msgKey: input.msgKey,
@@ -405,16 +392,6 @@ async function sendMessage($: Engine, agent: CodexAgent, text: string): Promise<
   }
   await startTurn($, agent, text)
   return 'started'
-}
-
-/** Interrupts the running turn and waits up to 15 s for it to end. */
-async function stopAgent($: Engine, agent: CodexAgent): Promise<string> {
-  if (agent.status !== 'running' || !agent.currentTurnId) return `${agent.name} is not running (${agent.status}).`
-  await rpc($, 'turn/interrupt', { threadId: agent.threadId, turnId: agent.currentTurnId })
-  const answer = await waitTurn($, agent.threadId, 15_000)
-  // No msgKey: only the turn's end or the timeout answers.
-  if (answer.status === 'timeout' || answer.status === 'message') return `Interrupt sent to ${agent.name}; its turn has not ended yet.`
-  return `${agent.name} stopped (${answer.turn?.status ?? 'interrupted'}). A SendMessage to agent ${agent.id} continues it with the same sandbox and approvals.`
 }
 
 // ------------------------------------------------------------ native agents
@@ -604,13 +581,8 @@ async function onRequest($: Engine, id: number | string, method: string, params:
   const question = approvalQuestion(method, params, agent ? `Codex ${agent.name} (${agent.model})` : 'A Codex agent')
   let verdict: Verdict | null = null
   if (question !== null) {
-    await update($, approvalsAtom, list => [...list, { agentId: agent?.id ?? '', requestId: id, summary: question }])
-    try {
-      const reason = typeof params.reason === 'string' && params.reason ? `\nReason: ${params.reason}` : ''
-      verdict = await askPerson($, `${question}${reason}\nAllow it?`, approvalOptions(method, params))
-    } finally {
-      await update($, approvalsAtom, list => list.filter(one => one.requestId !== id))
-    }
+    const reason = typeof params.reason === 'string' && params.reason ? `\nReason: ${params.reason}` : ''
+    verdict = await askPerson($, `${question}${reason}\nAllow it?`, approvalOptions(method, params))
   }
   await post($, '/reply', { id, ...approvalAnswer(method, params, verdict) })
   if (agent) {
@@ -683,41 +655,14 @@ async function projectConfig($: Engine): Promise<Partial<Defaults>> {
   return {}
 }
 
-async function rulesPath($: Engine): Promise<string> {
-  const home = await $.env.get('HOME')
-  if (!home) throw new CodexError('HOME is not set')
-  return `${home}/${RULES_FILE}`
-}
-
-/** /codex rules [rm <n>]: Codex's own allow rules, which "Allow always" adds. */
-async function rulesCommand($: Engine, rest: string[]): Promise<string> {
-  const path = await rulesPath($)
-  const text = (await $.fs.exists(path)) ? await $.fs.read(path) : ''
-  if (rest[0] === 'rm') {
-    const n = Number(rest[1])
-    const edited = Number.isInteger(n) ? withoutRule(text, n) : null
-    if (!edited) return `No rule ${rest[1] ?? ''} in ${path}. /codex rules lists them.`
-    await $.fs.write(path, edited.text)
-    return `Removed ${edited.removed}\nCodex reads its rules when it starts: agents already running keep the rule until this session restarts.`
-  }
-  const rules = ruleLines(text)
-  if (rules.length === 0) return `No Codex allow rules in ${path}. "Allow always" in an approval dialog adds one.`
-  return [`Codex allow rules (${path}):`, ...rules.map((entry, i) => `${i + 1}. ${entry.rule}`), 'Remove one with /codex rules rm <n>.'].join('\n')
-}
-
 const textArg = (value: unknown) => (typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined)
 
 const TOOL_NAMES: readonly ToolName[] = ['codex_list', 'codex_result', 'codex_await']
 
-/** Serves codex_list and codex_result; a CodexError becomes the call's error text. */
+/** Serves codex_list (this session's jobs) and codex_result (any job); a CodexError becomes the call's error text. */
 async function runTool($: Engine, name: 'codex_list' | 'codex_result', e: unknown): Promise<string> {
   const args = e as Record<string, unknown>
-  if (name === 'codex_list') {
-    const agents = sorted(await read($, agentsAtom))
-    if (agents.length === 0) return 'No Codex agents yet. The Agent tool starts one with subagent_type codex:luna, codex:sol, codex:astra or codex:terra.'
-    const now = await $.clock.now()
-    return agents.map(agent => describeAgent(agent, now)).join('\n')
-  }
+  if (name === 'codex_list') return listText(sorted(await read($, agentsAtom)), await $.session.id(), await $.clock.now())
   const ref = textArg(args.id)
   if (!ref) throw new CodexError('id is required')
   const agent = findIn(await read($, agentsAtom), ref)
@@ -746,10 +691,8 @@ export const register: Register = (on, options) => {
     }
     for (const tool of TOOL_SPECS) await $.tool.register(tool)
     for (const spec of agentSpecs(effectiveDefaults(settings, project))) await $.agent.register(spec)
-    await $.command.register(COMMAND)
     await loadFromStore($)
     await startBridge($, settings)
-    if (Object.keys(await read($, agentsAtom)).length > 0) void $.ui.open({ id: PANE, title: 'Codex agents' })
     return started
   })
 
@@ -801,7 +744,6 @@ export const register: Register = (on, options) => {
       // The subagent runs: it ends at once with this reason as its answer.
       await patchAgent($, agent.id, () => ({ status: 'failed', error: `the Codex turn did not start: ${errorText(error)}` }))
     }
-    void $.ui.open({ id: PANE, title: 'Codex agents' })
     return spawned
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'codex: the Codex job did not start (the hook failed or ran out of time)' }))
 
@@ -897,102 +839,7 @@ export const register: Register = (on, options) => {
     return e.tool.startsWith(PREFIX) && e.tool !== AWAIT_TOOL ? { ...described, isDeferred: false } : described
   })
 
-  // ---------------------------------------------------------- command
-
-  on('command.run', { command: 'codex' }, async ($, e) => {
-    const [verb = '', ...rest] = e.args.trim().split(/\s+/)
-    if (verb === 'stop') {
-      const agent = findIn(await read($, agentsAtom), rest.join(' '))
-      if (!agent) return { text: `No Codex agent "${rest.join(' ')}".` }
-      return { text: await stopAgent($, agent) }
-    }
-    if (verb === 'models') {
-      const found = await listModels($)
-      const lines = [...found.entries()].map(([id, efforts]) => `${id}: ${efforts.join(', ')}`)
-      const defaults = effectiveDefaults(settings, await projectConfig($))
-      return {
-        text: `${lines.join('\n')}\nDefaults: effort ${defaults.effort ?? Object.entries(MODEL_EFFORTS).map(([alias, effort]) => `${alias} ${effort}`).join(', ')}, sandbox ${defaults.sandbox}, approvals ${defaults.approvals}.`,
-      }
-    }
-    if (verb === 'rules') return { text: await rulesCommand($, rest) }
-    await $.ui.open({ id: PANE, title: 'Codex agents' })
-    const now = await $.clock.now()
-    const agents = sorted(await read($, agentsAtom))
-    return { text: agents.length ? agents.map(agent => describeAgent(agent, now)).join('\n') : 'No Codex agents yet.' }
-  })
-
   // ---------------------------------------------------------- drawing
-
-  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text, Button } = $.ui.resolve(e)
-    const agents = sorted(await read($, agentsAtom))
-    const selected = await read($, selectedAtom)
-    const showResult = await read($, showResultAtom)
-    const approvals = await read($, approvalsAtom)
-    const now = await $.clock.now()
-    const width = Math.max(20, e.props.bodyColumns - 2)
-    if (agents.length === 0) return <Text dimColor>No Codex agents yet. The model starts them with the Agent tool (codex:luna, codex:sol, ...).</Text>
-    const current = agents.find(agent => agent.id === selected) ?? agents[0]
-    return (
-      <Box flexDirection="column">
-        {approvals.map(approval => (
-          <Text color="permission" wrap="truncate-end">
-            ? {approval.summary}
-          </Text>
-        ))}
-        {agents.map(agent => (
-          <Box key={`row-${agent.id}`} flexDirection="column">
-            <Box flexDirection="row" gap={1}>
-              <Text color={statusColor(agent)}>{statusDot(agent)}</Text>
-              <Button
-                key={`pick-${agent.id}`}
-                plain
-                label={agent.name}
-                onPress={() => update($, selectedAtom, () => agent.id)}
-              />
-              <Text color="suggestion">
-                {agent.model}/{agent.effort}
-              </Text>
-              <Text dimColor>
-                {agent.status} {timeOf(agent, now)} {formatTokens(agent.tokens)}
-              </Text>
-              {agent.description && <Text wrap="truncate-end">{agent.description}</Text>}
-            </Box>
-            <Text dimColor wrap="truncate-end">
-              {'  '}
-              {clip(firstLine(agent.status === 'running' ? agent.activity : agent.lastMessage || agent.activity), width)}
-            </Text>
-          </Box>
-        ))}
-        {current && (
-          <Box flexDirection="column" marginTop={1}>
-            <Text bold>
-              {current.name} ({current.id}) {current.sandbox}, approvals {current.approvals}
-            </Text>
-            <Box flexDirection="row" gap={1}>
-              {current.status === 'running' && <Button key="stop" label="Stop" onPress={() => stopAgent($, current)} />}
-              <Button
-                key="result"
-                label={showResult ? 'Hide result' : 'Result'}
-                onPress={() => update($, showResultAtom, value => !value)}
-              />
-            </Box>
-            {current.error && <Text color="error">{current.error}</Text>}
-            {showResult && (
-              <Box flexDirection="column">
-                {current.digest.slice(-12).map(line => (
-                  <Text dimColor wrap="truncate-end">
-                    {line}
-                  </Text>
-                ))}
-                <Text>{current.lastMessage || 'No final message yet.'}</Text>
-              </Box>
-            )}
-          </Box>
-        )}
-      </Box>
-    )
-  })
 
   // Every codex_* call draws like a native Agent row: one header line and one result line, each
   // cut to the width, never wrapped. They read only the call's own props.

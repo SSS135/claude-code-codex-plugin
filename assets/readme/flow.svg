@@ -30,7 +30,7 @@
       <text font-size="20" fill="#c3c7ce">
         <tspan x="20" y="80">Codex works in its</tspan>
         <tspan x="20" y="108">own sandbox. The</tspan>
-        <tspan x="20" y="136">/codex pane shows</tspan>
+        <tspan x="20" y="136">The task list shows</tspan>
         <tspan x="20" y="164">each agent live.</tspan>
       </text>
     </g>

@@ -27,7 +27,6 @@ export type BridgeEvent =
 export class CodexError extends Error {}
 
 export const PREFIX = 'mcp__codex__'
-export const PANE = 'codex'
 export const SANDBOXES: CodexSandbox[] = ['read-only', 'workspace-write', 'full-access']
 export const APPROVALS: CodexApprovals[] = ['auto', 'ask', 'never', 'yolo']
 export const MAX_AGENTS = 40
@@ -70,12 +69,6 @@ export const isLive = (agent: CodexAgent): boolean => agent.status === 'running'
 
 export const timeOf = (agent: CodexAgent, now: number): string =>
   isLive(agent) ? elapsed(agent.turnStartedAt, now) : agent.turnEndedAt ? elapsed(agent.turnStartedAt, agent.turnEndedAt) : ''
-
-export const statusColor = (agent: CodexAgent): string =>
-  isLive(agent) ? 'warning' : agent.status === 'idle' ? 'success' : agent.status === 'failed' ? 'error' : 'inactive'
-
-export const statusDot = (agent: CodexAgent): string =>
-  isLive(agent) ? '*' : agent.status === 'idle' ? '+' : agent.status === 'failed' ? 'x' : '-'
 
 /** Splits a stream of text pieces into whole lines. */
 export class LineBuffer {
@@ -210,10 +203,7 @@ const changeKind = (kind: unknown) =>
   typeof kind === 'string' ? kind : typeof kind === 'object' && kind !== null ? String((kind as { type?: string }).type ?? 'edit') : 'edit'
 
 export function itemStarted(item: Item): Partial<CodexAgent> | null {
-  if (item.type === 'commandExecution' && item.command) {
-    const command = shortCommand(item.command)
-    return { activity: `$ ${command}`, lastCommand: command }
-  }
+  if (item.type === 'commandExecution' && item.command) return { activity: `$ ${shortCommand(item.command)}` }
   if (item.type === 'fileChange') return { activity: `editing ${(item.changes ?? []).map(one => one.path).join(', ')}` }
   if (item.type === 'reasoning') return { activity: 'thinking' }
   if (item.type === 'mcpToolCall') return { activity: `tool ${item.server}.${item.tool}` }
@@ -583,7 +573,20 @@ export function wrapperAnswer(agent: CodexAgent): string {
 export function describeAgent(agent: CodexAgent, now: number): string {
   const time = timeOf(agent, now)
   const doing = isLive(agent) ? agent.activity : (agent.lastTurnStatus ?? agent.status)
-  return `${agent.id} ${agent.name} [${agent.model}/${agent.effort}, ${agent.sandbox}, approvals ${agent.approvals}] ${agent.status}${time ? ` ${time}` : ''}: ${clip(firstLine(doing), 100)}`
+  return `${agent.id} ${agent.name} [${agent.model}/${agent.effort}, ${agent.sandbox}, approvals ${agent.approvals}] ${agent.status}${time ? ` ${time}` : ''}, ${formatTokens(agent.tokens)}: ${clip(firstLine(doing), 100)}`
+}
+
+/** How many of a session's jobs codex_list shows. */
+export const LIST_LIMIT = 10
+
+/** codex_list: the session's jobs, newest first (`agents` sorted so), the latest LIST_LIMIT of them. */
+export function listText(agents: readonly CodexAgent[], sessionId: string, now: number): string {
+  const mine = agents.filter(agent => agent.sessionId === sessionId)
+  if (mine.length === 0) return 'No Codex agents in this session. The Agent tool starts one with subagent_type codex:luna, codex:sol, codex:astra or codex:terra.'
+  const lines = mine.slice(0, LIST_LIMIT).map(agent => describeAgent(agent, now))
+  const older = mine.length - LIST_LIMIT
+  if (older > 0) lines.push(`${older} older (codex_result still reads them by id).`)
+  return lines.join('\n')
 }
 
 export function resultText(agent: CodexAgent, full: boolean, now: number): string {
@@ -641,7 +644,7 @@ export function rowResult(tool: ToolName, text: string): { main: string; dim: st
 export function runningTail(agents: CodexAgent[]): string | undefined {
   const live = agents.filter(isLive)
   if (live.length === 0) return undefined
-  if (live.length > 3) return `${live.length} codex agents running · /codex`
+  if (live.length > 3) return `${live.length} codex agents running`
   return `codex: ${live.map(agent => `${agent.name} (${aliasOf(agent.model)})`).join(' · ')}`
 }
 
@@ -652,7 +655,7 @@ const ID_PARAM = { type: 'string', description: "The agent id (the codex:* agent
 export const TOOL_SPECS: ToolSpec[] = [
   {
     name: 'codex_list',
-    description: 'List the Codex jobs (codex:* agents) with model, status and what each is doing.',
+    description: `List this session's Codex jobs (codex:* agents), newest first, the latest ${LIST_LIMIT}: model, status and what each is doing.`,
     inputSchema: { type: 'object', properties: {} },
   },
   {
@@ -671,33 +674,6 @@ export const TOOL_SPECS: ToolSpec[] = [
     inputSchema: { type: 'object', properties: {} },
   },
 ]
-
-export const COMMAND = {
-  name: 'codex',
-  description: 'Codex agents: open the pane, stop one, list models, or list and remove Codex allow rules',
-  argumentHint: '[stop <name> | models | rules | rules rm <n>]',
-}
-
-// ------------------------------------------------------------ Codex allow rules
-
-/** Codex's own rules file, where "Allow always" lands (relative to $HOME). */
-export const RULES_FILE = '.codex/rules/default.rules'
-
-/** The file's rule lines with their line index, numbered from 1 for /codex rules. */
-export const ruleLines = (text: string): { line: number; rule: string }[] =>
-  text
-    .split('\n')
-    .map((rule, line) => ({ line, rule: rule.trim() }))
-    .filter(entry => entry.rule.startsWith('prefix_rule('))
-
-/** The file without its n-th rule (1-based), or null when there is no such rule. */
-export function withoutRule(text: string, n: number): { text: string; removed: string } | null {
-  const target = ruleLines(text)[n - 1]
-  if (!target) return null
-  const lines = text.split('\n')
-  lines.splice(target.line, 1)
-  return { text: lines.join('\n'), removed: target.rule }
-}
 
 /** The label of the wrapper's own SendMessage row (not sent: the message is). */
 export const messageSummary = (text: string): string => `Codex: ${clip(firstLine(text), 60)}`

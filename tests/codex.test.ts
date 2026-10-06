@@ -2,7 +2,7 @@ import type { On, SessionMessage, TurnStepChunk, TurnStepResult } from 'claude-c
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
 
-import { agentDescription, agentSpecs, approvalAnswer, approvalOptions, configDirs, effectiveDefaults, effortFor, parseHeader, permissionsFor, withoutRule, wrapperAnswer } from '../hooks/model'
+import { agentDescription, agentSpecs, approvalAnswer, approvalOptions, configDirs, effectiveDefaults, effortFor, listText, parseHeader, permissionsFor, wrapperAnswer } from '../hooks/model'
 import type { CodexAgent } from '../types'
 
 // A fake bridge: the relay's stdout is a queue the test pushes NDJSON into,
@@ -109,19 +109,12 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
     yield { kind: 'text' as const, index: 0, text: 'from Claude' }
     return { turnId: e.turnId, index: e.index, answer: 'from Claude', toolUses: [], stopReason: 'end_turn' as const, usage: null }
   })
-  on('command.register', (_$, e) => ({ value: { command: e.name } }))
   on('session.id', () => ({ value: 'session-1' }))
   on('session.cwd', () => ({ value: '/work/app' }))
   on('session.root', () => ({ value: '/work' }))
   on('fs.exists', (_$, e) => ({ value: e.path in fake.files }))
   on('fs.read', (_$, e) => (e.path in fake.files ? { value: fake.files[e.path] as string } : { deny: `no file ${e.path}` }))
-  on('fs.write', (_$, e) => {
-    fake.files[e.path] = e.text
-    return { value: undefined }
-  })
-  mock.env(on, { HOME: '/home/u' })
   on('ui.log', () => ({ value: undefined }))
-  on('ui.open', () => ({ value: { isPlaced: true as const } }))
 
   // The store, answered here so the test can read what the plugin mirrors into it.
   on('store.get', (_$, e) => ({ value: fake.store[e.key] }))
@@ -541,18 +534,6 @@ test('TaskStop: an aborted wrapper turn interrupts the Codex turn', { timeoutMs:
   done(fake)
 })
 
-test('/codex stop interrupts the running turn', async ($, on) => {
-  const fake = fakeBridge(on)
-  await start($, fake)
-  await spawn($, fake)
-  fake.waitQueue = [{ status: 'completed', turn: { id: 'turn-1', status: 'interrupted', items: [] } }]
-  const presentation = { isFullscreen: false, columns: 120 }
-  const ran = await $.command.run({ command: 'codex', args: 'stop Sleep a while', origin: { kind: 'plugin' as const, name: 'test' }, presentation })
-  expect(fake.rpcs.find(rpc => rpc.method === 'turn/interrupt')?.params).toEqual({ threadId: 'th-1', turnId: 'turn-1' })
-  expect(ran.text).toContain('Sleep a while stopped (interrupted). A SendMessage to agent a1 continues it')
-  done(fake)
-})
-
 test('an approval asks the person and posts the reply; a dismissed dialog declines', { timeoutMs: 20_000 }, async ($, on) => {
   const fake = fakeBridge(on)
   await start($, fake)
@@ -670,24 +651,6 @@ test('effort: a userConfig defaultEffort replaces the per-model built-ins, below
   done(fake)
 })
 
-test('/codex rules lists and removes Codex allow rules', async ($, on) => {
-  const path = '/home/u/.codex/rules/default.rules'
-  const text = 'prefix_rule(pattern=["touch", "/x"], decision="allow")\nprefix_rule(pattern=["ls"], decision="allow")\n'
-  const fake = fakeBridge(on, {}, { [path]: text })
-  await start($, fake)
-  const presentation = { isFullscreen: false, columns: 120 }
-  const origin = { kind: 'plugin' as const, name: 'test' }
-  const listed = await $.command.run({ command: 'codex', args: 'rules', origin, presentation })
-  expect(listed.text).toContain('1. prefix_rule(pattern=["touch", "/x"]')
-  expect(listed.text).toContain('2. prefix_rule(pattern=["ls"]')
-  const removed = await $.command.run({ command: 'codex', args: 'rules rm 1', origin, presentation })
-  expect(removed.text).toContain('Removed prefix_rule(pattern=["touch", "/x"]')
-  expect(fake.files[path]).toBe('prefix_rule(pattern=["ls"], decision="allow")\n')
-  expect((await $.command.run({ command: 'codex', args: 'rules rm 5', origin, presentation })).text).toContain('No rule 5')
-  expect(withoutRule(text, 0)).toBeNull()
-  done(fake)
-})
-
 test('after a reload the registry comes back from the store and live turns reattach', async ($, on) => {
   const base = {
     threadId: 'th-old', model: 'gpt-6-luna', effort: 'low', sandbox: 'workspace-write', approvals: 'ask', cwd: '/work',
@@ -710,30 +673,6 @@ test('after a reload the registry comes back from the store and live turns reatt
   await send($, 'bbb222', 'continue')
   expect(fake.rpcs.map(rpc => rpc.method)).toEqual(['thread/resume', 'turn/start'])
   expect(fake.rpcs[0]?.params).toMatchObject({ threadId: 'th-lost', sandbox: 'workspace-write', approvalPolicy: 'on-request' })
-  done(fake)
-})
-
-test('the pane draws on terminal and desktop', { timeoutMs: 20_000 }, async ($, on) => {
-  const fake = fakeBridge(on)
-  await start($, fake)
-  await spawn($, fake)
-  push(fake, note('item/started', { threadId: 'th-1', item: { type: 'commandExecution', command: "/bin/zsh -lc 'sleep 20'" } }))
-  await until(fake, async () => (await agentsOf(fake)).a1?.activity === '$ sleep 20', 'activity')
-  for (const surface of ['terminal', 'desktop'] as const) {
-    const pane = await $.ui.mount({
-      plugin: 'codex',
-      surface,
-      component: 'Pane',
-      requestId: 'codex',
-      props: { title: 'Codex agents', isFocused: false, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 20 }, view: {} },
-    })
-    expect(await pane.find({ key: 'pick-a1' })).toBeDefined()
-    expect(await pane.find({ type: 'Text', text: /gpt-6-luna\/max/ })).toBeDefined()
-    expect(await pane.find({ type: 'Text', text: /sleep 20/ })).toBeDefined()
-    await pane.press({ key: 'result' })
-    expect(await pane.find({ key: 'stop' })).toBeDefined()
-    await pane.unmount()
-  }
   done(fake)
 })
 
@@ -811,6 +750,28 @@ test('codex_list and codex_result read the jobs', { timeoutMs: 20_000 }, async (
   push(fake, note('turn/completed', { threadId: 'th-1', turn: { id: 'turn-1', status: 'completed', items: [{ type: 'agentMessage', text: 'ALL GREEN', phase: 'final_answer' }] } }))
   await until(fake, async () => (await agentsOf(fake)).a1?.status === 'idle', 'idle')
   expect(String((await $.tool.call({ tool: 'mcp__codex__codex_result', id: 'Sleep a while' } as never)).result)).toContain('Final message:\nALL GREEN')
+  done(fake)
+})
+
+test("codex_list shows this session's latest 10 jobs, newest first; codex_result reads any job", { timeoutMs: 20_000 }, async ($, on) => {
+  const base = {
+    model: 'gpt-6-luna', effort: 'low', sandbox: 'workspace-write', approvals: 'auto', cwd: '/work', status: 'idle',
+    currentTurnId: null, lastTurnId: 'turn-1', lastTurnStatus: 'completed', lastMessage: 'OLD RESULT', activity: 'completed', msgKey: 'k', outbox: [],
+    tokens: 0, error: null, digest: [], updatedAt: 1, turnStartedAt: 1, turnEndedAt: 2, description: '',
+  }
+  const agents: Record<string, unknown> = {
+    other: { ...base, id: 'other', name: 'elsewhere', threadId: 'th-x', startedAt: 99, sessionId: 'session-0' },
+  }
+  for (let i = 1; i <= 12; i += 1) agents[`j${i}`] = { ...base, id: `j${i}`, name: `job ${i}`, threadId: `th-${i}`, startedAt: i, sessionId: 'session-1' }
+  const fake = fakeBridge(on, { agents })
+  await start($, fake, { reattached: true })
+  const listed = String((await $.tool.call({ tool: 'mcp__codex__codex_list' } as never)).result).split('\n')
+  expect(listed).toHaveLength(11)
+  expect(listed[0]).toMatch(/^j12 job 12 \[gpt-6-luna\/low, workspace-write, approvals auto\] idle 0s, 0 tok: completed$/)
+  expect(listed[9]).toMatch(/^j3 job 3 /)
+  expect(listed[10]).toBe('2 older (codex_result still reads them by id).')
+  expect(String((await $.tool.call({ tool: 'mcp__codex__codex_result', id: 'other' } as never)).result)).toContain('Final message:\nOLD RESULT')
+  expect(listText([], 'session-1', 0)).toContain('No Codex agents in this session')
   done(fake)
 })
 
