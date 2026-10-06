@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="330" viewBox="0 0 1200 330" role="img" aria-labelledby="title desc">
+  <title id="title">How a Codex task runs</title>
+  <desc id="desc">Four steps: Claude spawns an agent and gets its id at once; Codex works in its sandbox while Claude continues; escalations go to a Claude Code dialog (ask) or to Codex's own reviewer (auto); the result wakes Claude, and codex_send continues the same thread.</desc>
+
+  <rect width="1200" height="330" rx="24" fill="#111318"/>
+
+  <g id="track">
+    <path d="M68 64 H1132" stroke="#2c3139" stroke-width="2"/>
+    <circle cx="68" cy="64" r="7" fill="#e07a55"/>
+    <circle cx="348" cy="64" r="7" fill="#e6b450"/>
+    <circle cx="628" cy="64" r="7" fill="#e6b450"/>
+    <circle cx="908" cy="64" r="7" fill="#7fc98f"/>
+  </g>
+
+  <g id="steps" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+    <g transform="translate(48 96)">
+      <rect width="264" height="200" rx="14" fill="#1a1d23" stroke="#2c3139" stroke-width="2"/>
+      <text x="20" y="44" font-size="26" font-weight="700" fill="#f1efeb">Spawn</text>
+      <text x="20" y="80" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="19" fill="#e07a55">codex_spawn</text>
+      <text font-size="20" fill="#c3c7ce">
+        <tspan x="20" y="116">returns an id at once.</tspan>
+        <tspan x="20" y="144">Claude moves on to</tspan>
+        <tspan x="20" y="172">other work.</tspan>
+      </text>
+    </g>
+
+    <g transform="translate(328 96)">
+      <rect width="264" height="200" rx="14" fill="#1a1d23" stroke="#2c3139" stroke-width="2"/>
+      <text x="20" y="44" font-size="26" font-weight="700" fill="#f1efeb">Run</text>
+      <text font-size="20" fill="#c3c7ce">
+        <tspan x="20" y="80">Codex works in its</tspan>
+        <tspan x="20" y="108">own sandbox. The</tspan>
+        <tspan x="20" y="136">/codex pane shows</tspan>
+        <tspan x="20" y="164">each agent live.</tspan>
+      </text>
+    </g>
+
+    <g transform="translate(608 96)">
+      <rect width="264" height="200" rx="14" fill="#1a1d23" stroke="#2c3139" stroke-width="2"/>
+      <text x="20" y="44" font-size="26" font-weight="700" fill="#f1efeb">Approve</text>
+      <text font-size="20" fill="#c3c7ce">
+        <tspan x="20" y="80">In ask mode you get</tspan>
+        <tspan x="20" y="108">a Claude Code dialog.</tspan>
+        <tspan x="20" y="136">In auto mode, Codex's</tspan>
+        <tspan x="20" y="164">reviewer decides.</tspan>
+      </text>
+    </g>
+
+    <g transform="translate(888 96)">
+      <rect width="264" height="200" rx="14" fill="#1a1d23" stroke="#2c3139" stroke-width="2"/>
+      <text x="20" y="44" font-size="26" font-weight="700" fill="#f1efeb">Wake</text>
+      <text font-size="20" fill="#c3c7ce">
+        <tspan x="20" y="80">The result reaches</tspan>
+        <tspan x="20" y="108">Claude as a message.</tspan>
+      </text>
+      <text x="20" y="144" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="19" fill="#7fc98f">codex_send</text>
+      <text x="20" y="172" font-size="20" fill="#c3c7ce">continues the thread.</text>
+    </g>
+  </g>
+</svg>

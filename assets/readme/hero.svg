@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="430" viewBox="0 0 1200 430" role="img" aria-labelledby="title desc">
+  <title id="title">Codex for Claude Code</title>
+  <desc id="desc">Illustration of a Claude Code session with two Codex agents: one still running npm test, one finished, and the one-line notice that wakes Claude when an agent finishes.</desc>
+
+  <rect width="1200" height="430" rx="24" fill="#111318"/>
+
+  <g id="title-block" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+    <text x="64" y="96" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18" letter-spacing="2" fill="#e07a55">CLAUDE CODE PLUGIN</text>
+    <text x="62" y="170" font-size="60" font-weight="700" fill="#f1efeb">Codex for</text>
+    <text x="62" y="238" font-size="60" font-weight="700" fill="#f1efeb">Claude Code</text>
+    <text font-size="21" fill="#b4b9c1">
+      <tspan x="64" y="292">Run OpenAI Codex agents in the</tspan>
+      <tspan x="64" y="321">background. Claude keeps working</tspan>
+      <tspan x="64" y="350">and picks up each result when</tspan>
+      <tspan x="64" y="379">the agent finishes.</tspan>
+    </text>
+  </g>
+
+  <g id="session" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="19">
+    <rect x="474" y="40" width="670" height="350" rx="16" fill="#1a1d23" stroke="#2c3139" stroke-width="2"/>
+    <path d="M474 88 H1144" stroke="#2c3139" stroke-width="2"/>
+    <text x="502" y="71" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18" fill="#8d939c">Claude Code session</text>
+
+    <text x="502" y="136" fill="#f1efeb"><tspan font-weight="700">Codex</tspan> (auth-review gpt-6.1-sol/high) <tspan fill="#8d939c">Review src/auth</tspan></text>
+    <text x="526" y="166" fill="#e6b450">L $ npm test (2m14s, 38k tok)</text>
+
+    <text x="502" y="218" fill="#f1efeb"><tspan font-weight="700">Codex</tspan> (flaky gpt-6-luna/medium) <tspan fill="#8d939c">Fix retry.test.ts</tspan></text>
+    <text x="526" y="248" fill="#7fc98f">L completed in 48s, 12k tok</text>
+
+    <path d="M502 282 H1116" stroke="#2c3139" stroke-width="2" stroke-dasharray="4 6"/>
+    <text x="502" y="320" fill="#8d939c">Codex agent flaky (gpt-6-luna) finished: completed</text>
+    <text x="502" y="358" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18" fill="#e07a55">Claude wakes up here with the agent's result</text>
+  </g>
+</svg>

@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="420" viewBox="0 0 1200 420" role="img" aria-labelledby="title desc">
+  <title id="title">Bridge architecture</title>
+  <desc id="desc">The plugin's hooks module in Claude Code sends requests over HTTP on a Unix socket to a detached daemon. The daemon runs codex app-server over stdio. A relay process, bin/bridge.mjs, reads the daemon's events and passes them back to the hooks module as NDJSON on stdout.</desc>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#8d939c"/>
+    </marker>
+  </defs>
+
+  <rect width="1200" height="420" rx="24" fill="#111318"/>
+
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+    <g id="claude" transform="translate(48 56)">
+      <rect width="316" height="132" rx="14" fill="#1a1d23" stroke="#e07a55" stroke-width="2"/>
+      <text x="24" y="44" font-size="24" font-weight="700" fill="#f1efeb">Claude Code</text>
+      <text x="24" y="78" font-size="20" fill="#c3c7ce">hooks module</text>
+      <text x="24" y="108" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18" fill="#e07a55">mcp__codex__* tools</text>
+    </g>
+
+    <g id="daemon" transform="translate(512 56)">
+      <rect width="272" height="132" rx="14" fill="#1a1d23" stroke="#2c3139" stroke-width="2"/>
+      <text x="24" y="44" font-size="24" font-weight="700" fill="#f1efeb">daemon</text>
+      <text x="24" y="78" font-size="20" fill="#c3c7ce">detached, outlives</text>
+      <text x="24" y="106" font-size="20" fill="#c3c7ce">plugin reloads</text>
+    </g>
+
+    <g id="codex" transform="translate(904 56)">
+      <rect width="248" height="132" rx="14" fill="#1a1d23" stroke="#7fc98f" stroke-width="2"/>
+      <text x="24" y="44" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20" font-weight="700" fill="#f1efeb">codex</text>
+      <text x="24" y="72" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20" font-weight="700" fill="#f1efeb">app-server</text>
+      <text x="24" y="106" font-size="20" fill="#c3c7ce">JSON-RPC</text>
+    </g>
+
+    <g id="relay" transform="translate(512 268)">
+      <rect width="272" height="104" rx="14" fill="#1a1d23" stroke="#2c3139" stroke-width="2"/>
+      <text x="24" y="44" font-size="24" font-weight="700" fill="#f1efeb">relay</text>
+      <text x="24" y="78" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18" fill="#c3c7ce">bin/bridge.mjs</text>
+    </g>
+
+    <g id="links" fill="none" stroke="#8d939c" stroke-width="2">
+      <path d="M364 122 H504" marker-end="url(#arrow)"/>
+      <path d="M784 122 H896" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+      <path d="M648 188 V260" marker-end="url(#arrow)"/>
+      <path d="M512 320 H206 V196" marker-end="url(#arrow)"/>
+    </g>
+
+    <g id="labels" font-size="18" fill="#8d939c">
+      <text x="380" y="94">HTTP over</text>
+      <text x="380" y="154">Unix socket</text>
+      <text x="812" y="110">stdio</text>
+      <text x="664" y="232">event stream</text>
+      <text x="236" y="306">NDJSON on stdout</text>
+    </g>
+
+    <text x="48" y="402" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18" fill="#8d939c">socket: /tmp/cxb-&lt;uid&gt;/ (mode 0700)</text>
+  </g>
+</svg>
