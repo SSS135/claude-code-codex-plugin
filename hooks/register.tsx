@@ -58,6 +58,9 @@ import {
   itemStarted,
   LineBuffer,
   modelEffortError,
+  effortFor,
+  MODEL_EFFORTS,
+  PER_MODEL_EFFORT,
   PANE,
   PREFIX,
   resolveModel,
@@ -728,7 +731,7 @@ export const register: Register = (on, options) => {
   const settings: Settings = {
     codexPath: String(options.codexPath),
     nodePath: String(options.nodePath),
-    defaultEffort: String(options.defaultEffort),
+    defaultEffort: options.defaultEffort === PER_MODEL_EFFORT ? undefined : String(options.defaultEffort),
     defaultSandbox: String(options.defaultSandbox) as CodexSandbox,
     defaultApprovals: String(options.defaultApprovals) as CodexApprovals,
   }
@@ -767,7 +770,7 @@ export const register: Register = (on, options) => {
       if (body.trim() === '') return { deny: 'codex: the prompt is empty once its header lines are taken off' }
       const defaults = effectiveDefaults(settings, await projectConfig($))
       const model = resolveModel(alias)
-      const effort = header.effort ?? defaults.effort
+      const effort = header.effort ?? effortFor(defaults, alias)
       const { sandbox, approvals } = permissionsFor(header, defaults)
       await startBridge($, settings)
       const error = modelEffortError(await listModels($), model, effort)
@@ -908,7 +911,7 @@ export const register: Register = (on, options) => {
       const lines = [...found.entries()].map(([id, efforts]) => `${id}: ${efforts.join(', ')}`)
       const defaults = effectiveDefaults(settings, await projectConfig($))
       return {
-        text: `${lines.join('\n')}\nDefaults: effort ${defaults.effort}, sandbox ${defaults.sandbox}, approvals ${defaults.approvals}.`,
+        text: `${lines.join('\n')}\nDefaults: effort ${defaults.effort ?? Object.entries(MODEL_EFFORTS).map(([alias, effort]) => `${alias} ${effort}`).join(', ')}, sandbox ${defaults.sandbox}, approvals ${defaults.approvals}.`,
       }
     }
     if (verb === 'rules') return { text: await rulesCommand($, rest) }

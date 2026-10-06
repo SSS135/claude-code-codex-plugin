@@ -1,6 +1,6 @@
 {
   "name": "codex",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "author": {
     "name": "SSS135"
   },
@@ -22,9 +22,10 @@
     "defaultEffort": {
       "type": "string",
       "title": "Default effort",
-      "description": "Codex reasoning effort when the prompt sets no effort: header line.",
-      "default": "high",
+      "description": "Codex reasoning effort for every model when the prompt sets no effort: header line. per-model: each model's own default, luna max and sol, astra and terra high.",
+      "default": "per-model",
       "options": [
+        "per-model",
         "low",
         "medium",
         "high",

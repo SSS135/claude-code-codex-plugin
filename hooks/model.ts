@@ -10,7 +10,8 @@ import type { CodexAgent, CodexApprovals, CodexSandbox } from '../types'
 export type Settings = {
   codexPath: string
   nodePath: string
-  defaultEffort: string
+  /** Undefined (userConfig per-model): each model's built-in effort (MODEL_EFFORTS). */
+  defaultEffort: string | undefined
   defaultSandbox: CodexSandbox
   defaultApprovals: CodexApprovals
 }
@@ -37,6 +38,11 @@ export const MODEL_ALIASES: Record<string, string> = {
   astra: 'gpt-6-astra',
   terra: 'gpt-5.6-terra',
 }
+
+/** Each model's built-in effort, used when neither userConfig nor the project sets one. */
+export const MODEL_EFFORTS: Record<string, string> = { luna: 'max', sol: 'high', astra: 'high', terra: 'high' }
+/** The defaultEffort userConfig value (its default) that leaves effort to MODEL_EFFORTS. */
+export const PER_MODEL_EFFORT = 'per-model'
 
 export const resolveModel = (model: string): string => MODEL_ALIASES[model] ?? model
 export const aliasOf = (model: string): string =>
@@ -382,7 +388,8 @@ export function autoReviewDigest(params: Record<string, unknown>): string {
 
 // ------------------------------------------------------------ project config
 
-export type Defaults = { effort: string; sandbox: CodexSandbox; approvals: CodexApprovals }
+/** `effort` undefined: the model's own built-in (effortFor). */
+export type Defaults = { effort: string | undefined; sandbox: CodexSandbox; approvals: CodexApprovals }
 
 export const PROJECT_CONFIG = '.claude/codex.json'
 
@@ -422,12 +429,15 @@ export function configDirs(cwd: string, root: string): string[] {
   }
 }
 
-/** Precedence: prompt header lines > project config > userConfig (whose manifest defaults are the built-ins). */
+/** Precedence: prompt header lines > project config > userConfig > built-ins (sandbox and approvals: the manifest defaults; effort: MODEL_EFFORTS). */
 export const effectiveDefaults = (settings: Settings, project: Partial<Defaults>): Defaults => ({
   effort: project.effort ?? settings.defaultEffort,
   sandbox: project.sandbox ?? settings.defaultSandbox,
   approvals: project.approvals ?? settings.defaultApprovals,
 })
+
+/** The effort a `codex:<alias>` spawn runs with when its prompt sets none. */
+export const effortFor = (defaults: Defaults, alias: string): string => defaults.effort ?? (MODEL_EFFORTS[alias] as string)
 
 /** The sandbox and approvals a spawn runs with; yolo forces full access. */
 export function permissionsFor(
@@ -493,7 +503,13 @@ export const aliasOfType = (subagentType: string): string | undefined => {
   return alias in MODEL_ALIASES ? alias : undefined
 }
 
-const MODEL_NOTES: Record<string, string> = { luna: ' (fast, cheap)', sol: ' (strongest)' }
+/** When to pick each type: the main model reads this first in the agent listing. */
+const WHEN_TO_USE: Record<string, string> = {
+  sol: 'Default Codex agent for normal tasks: implementation, debugging, analysis, review, anything needing judgement.',
+  luna: 'For simple mechanical work and searches: find/grep/list, bulk renames, boilerplate, straightforward well-specified edits, data gathering. Cheap and fast; not for tasks needing judgement (use codex:sol).',
+  astra: 'Use ONLY when the user explicitly asks for astra; otherwise use codex:sol.',
+  terra: 'Use ONLY when the user explicitly asks for terra; otherwise use codex:sol.',
+}
 
 const effortsOf = (alias: string): string => (alias === 'luna' ? 'low|medium|high|xhigh|max' : 'low|medium|high|xhigh|max|ultra')
 
@@ -501,14 +517,14 @@ const effortsOf = (alias: string): string => (alias === 'luna' ? 'low|medium|hig
 export function agentDescription(alias: string, defaults: Defaults): string {
   const model = MODEL_ALIASES[alias] as string
   return [
-    `OpenAI Codex agent on ${model}${MODEL_NOTES[alias] ?? ''}. Use it like general-purpose for a complete, self-contained task, but the work is done by OpenAI Codex, not Claude: Codex gets your prompt verbatim and sees nothing of this conversation, and its final message comes back verbatim as this agent's result.`,
-    'It always runs in the background.',
-    'Optional header lines at the very top of the prompt, one "key: value" each, are stripped before Codex sees it:',
-    `"effort: ${effortsOf(alias)}" (default ${defaults.effort});`,
-    `"sandbox: read-only|workspace-write|full-access" (OS-enforced; workspace-write writes only inside the cwd plus /tmp; default ${defaults.sandbox});`,
-    `"approvals: auto|ask|never|yolo" (default ${defaults.approvals}; auto: Codex's own reviewer decides escalations, looser than Claude's auto mode; ask: the user approves each in a dialog; never: the sandbox alone decides; yolo: no sandbox and no approvals, ONLY when the user explicitly asked for it in this request).`,
-    `A project may set its own defaults in ${PROJECT_CONFIG}.`,
-    'Codex may message you mid-task (a question, a blocker, an interim finding) as a message from this agent. SendMessage to the agent steers its running Codex turn (so a reply reaches Codex at once), or starts a new turn on the same Codex thread once it finished; TaskStop interrupts the Codex turn.',
+    `${WHEN_TO_USE[alias]} OpenAI Codex on ${model}, effort ${effortFor(defaults, alias)}.`,
+    'Codex gets your prompt verbatim, sees nothing of this conversation, and its final message is the result. Always runs in the background.',
+    'Optional header lines at the top of the prompt, stripped before Codex sees it:',
+    `"effort: ${effortsOf(alias)}";`,
+    `"sandbox: read-only|workspace-write|full-access" (OS-enforced; workspace-write writes only in the cwd plus /tmp; default ${defaults.sandbox});`,
+    `"approvals: auto|ask|never|yolo" (default ${defaults.approvals}; auto: Codex's own reviewer decides escalations, looser than Claude's auto mode; ask: the user approves each; never: the sandbox alone decides; yolo: no sandbox and no approvals, ONLY when the user explicitly asked for it).`,
+    `Project defaults: ${PROJECT_CONFIG}.`,
+    'Codex may message you mid-task as this agent. SendMessage to it steers the running Codex turn, or starts a new turn on the same thread once it finished; TaskStop interrupts it.',
   ].join(' ')
 }
 

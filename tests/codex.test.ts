@@ -2,7 +2,7 @@ import type { On, SessionMessage, TurnStepChunk, TurnStepResult } from 'claude-c
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
 
-import { agentSpecs, approvalAnswer, approvalOptions, configDirs, effectiveDefaults, parseHeader, permissionsFor, withoutRule, wrapperAnswer } from '../hooks/model'
+import { agentDescription, agentSpecs, approvalAnswer, approvalOptions, configDirs, effectiveDefaults, effortFor, parseHeader, permissionsFor, withoutRule, wrapperAnswer } from '../hooks/model'
 import type { CodexAgent } from '../types'
 
 // A fake bridge: the relay's stdout is a queue the test pushes NDJSON into,
@@ -297,7 +297,7 @@ test('registers one native agent type per model alias, run on haiku with codex_a
   }
   const luna = String(fake.registeredAgents[0]?.description)
   expect(luna).toContain('gpt-6-luna')
-  expect(luna).toContain('(default medium)')
+  expect(luna).toContain('gpt-6-luna, effort medium.')
   expect(luna).toContain('effort: low|medium|high|xhigh|max"')
   expect(String(fake.registeredAgents[1]?.description)).toContain('|ultra')
   done(fake)
@@ -313,7 +313,7 @@ test('a codex:* spawn starts the Codex turn with the exact prompt, keyed by the 
   const prompt = 'Write unit tests for calc.js\n\n  keep the indentation\n'
   const agent = await spawn($, fake, prompt, { description: 'Write calc tests' })
   expect(fake.spawned[0]).toMatchObject({ subagentType: 'codex:luna', prompt, background: true })
-  expect(agent).toMatchObject({ id: 'a1', name: 'Write calc tests', description: 'Write calc tests', model: 'gpt-6-luna', effort: 'high', status: 'running', currentTurnId: 'turn-1', cwd: '/work/app' })
+  expect(agent).toMatchObject({ id: 'a1', name: 'Write calc tests', description: 'Write calc tests', model: 'gpt-6-luna', effort: 'max', status: 'running', currentTurnId: 'turn-1', cwd: '/work/app' })
   expect(fake.rpcs.map(rpc => rpc.method)).toEqual(['model/list', 'thread/start', 'thread/name/set', 'turn/start'])
   expect(fake.rpcs[1]?.params).toMatchObject({ model: 'gpt-6-luna', cwd: '/work/app', sandbox: 'workspace-write', approvalPolicy: 'on-request', approvalsReviewer: 'auto_review', ephemeral: false })
   // The job can message the session: bin/codex-msg as an MCP server, named with the bridge's socket and the job's key.
@@ -324,7 +324,7 @@ test('a codex:* spawn starts the Codex turn with the exact prompt, keyed by the 
   expect(started.config.mcp_servers.claude_session?.args).toEqual([expect.stringMatching(/\/bin\/codex-msg$/), '/tmp/cxb-test/s', msgKey])
   expect(started.developerInstructions).toContain('call the message_claude tool of the claude_session MCP server')
   expect(fake.rpcs[2]?.params).toEqual({ threadId: 'th-1', name: 'Write calc tests' })
-  expect(fake.rpcs[3]?.params).toMatchObject({ threadId: 'th-1', effort: 'high', input: [{ type: 'text', text: prompt, text_elements: [] }] })
+  expect(fake.rpcs[3]?.params).toMatchObject({ threadId: 'th-1', effort: 'max', input: [{ type: 'text', text: prompt, text_elements: [] }] })
 
   // The cwd the Agent call set wins, and a second luna gets its own name.
   await spawn($, fake, 'x', { cwd: '/elsewhere' })
@@ -631,6 +631,45 @@ test('project config: header lines > .claude/codex.json (nearest up to the root)
   done(fake)
 })
 
+test('effort: per-model built-ins (luna max, others high) under header > project > userConfig', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  fake.agentIds.push('a4')
+  await start($, fake)
+  const descriptions = fake.registeredAgents.map(spec => String(spec.description))
+  expect(descriptions[0]).toMatch(/^For simple mechanical work and searches/)
+  expect(descriptions[0]).toContain('gpt-6-luna, effort max.')
+  expect(descriptions[1]).toMatch(/^Default Codex agent for normal tasks/)
+  expect(descriptions[1]).toContain('gpt-6.1-sol, effort high.')
+  expect(descriptions[2]).toMatch(/^Use ONLY when the user explicitly asks for astra/)
+  expect(descriptions[3]).toMatch(/^Use ONLY when the user explicitly asks for terra/)
+  // No effort set anywhere: each model's own.
+  await spawn($, fake, 'x')
+  await spawn($, fake, 'y', { subagentType: 'codex:sol' })
+  const turns = () => fake.rpcs.filter(rpc => rpc.method === 'turn/start').map(rpc => rpc.params.effort)
+  expect(turns()).toEqual(['max', 'high'])
+  // A project effort applies to every model; the header still wins.
+  fake.files['/work/.claude/codex.json'] = JSON.stringify({ effort: 'low' })
+  await spawn($, fake, 'z')
+  await spawn($, fake, 'effort: xhigh\nw')
+  expect(turns().slice(2)).toEqual(['low', 'xhigh'])
+  done(fake)
+})
+
+test('effort: a userConfig defaultEffort replaces the per-model built-ins, below the project', { options: { defaultEffort: 'medium' }, timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake)
+  expect(String(fake.registeredAgents[0]?.description)).toContain('gpt-6-luna, effort medium.')
+  await spawn($, fake, 'x')
+  fake.files['/work/.claude/codex.json'] = JSON.stringify({ effort: 'low' })
+  await spawn($, fake, 'y')
+  expect(fake.rpcs.filter(rpc => rpc.method === 'turn/start').map(rpc => rpc.params.effort)).toEqual(['medium', 'low'])
+  const settings = { codexPath: 'c', nodePath: 'n', defaultEffort: undefined, defaultSandbox: 'workspace-write' as const, defaultApprovals: 'auto' as const }
+  const builtIn = effectiveDefaults(settings, {})
+  expect(['luna', 'sol', 'astra', 'terra'].map(alias => effortFor(builtIn, alias))).toEqual(['max', 'high', 'high', 'high'])
+  expect(agentDescription('terra', builtIn)).toContain('gpt-5.6-terra, effort high.')
+  done(fake)
+})
+
 test('/codex rules lists and removes Codex allow rules', async ($, on) => {
   const path = '/home/u/.codex/rules/default.rules'
   const text = 'prefix_rule(pattern=["touch", "/x"], decision="allow")\nprefix_rule(pattern=["ls"], decision="allow")\n'
@@ -689,7 +728,7 @@ test('the pane draws on terminal and desktop', { timeoutMs: 20_000 }, async ($, 
       props: { title: 'Codex agents', isFocused: false, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 20 }, view: {} },
     })
     expect(await pane.find({ key: 'pick-a1' })).toBeDefined()
-    expect(await pane.find({ type: 'Text', text: /gpt-6-luna\/high/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /gpt-6-luna\/max/ })).toBeDefined()
     expect(await pane.find({ type: 'Text', text: /sleep 20/ })).toBeDefined()
     await pane.press({ key: 'result' })
     expect(await pane.find({ key: 'stop' })).toBeDefined()
@@ -768,7 +807,7 @@ test('codex_list and codex_result read the jobs', { timeoutMs: 20_000 }, async (
   await start($, fake)
   expect(String((await $.tool.call({ tool: 'mcp__codex__codex_list' } as never)).result)).toContain('subagent_type codex:luna')
   await spawn($, fake)
-  expect(String((await $.tool.call({ tool: 'mcp__codex__codex_list' } as never)).result)).toMatch(/^a1 Sleep a while \[gpt-6-luna\/high, workspace-write, approvals auto\] running/)
+  expect(String((await $.tool.call({ tool: 'mcp__codex__codex_list' } as never)).result)).toMatch(/^a1 Sleep a while \[gpt-6-luna\/max, workspace-write, approvals auto\] running/)
   push(fake, note('turn/completed', { threadId: 'th-1', turn: { id: 'turn-1', status: 'completed', items: [{ type: 'agentMessage', text: 'ALL GREEN', phase: 'final_answer' }] } }))
   await until(fake, async () => (await agentsOf(fake)).a1?.status === 'idle', 'idle')
   expect(String((await $.tool.call({ tool: 'mcp__codex__codex_result', id: 'Sleep a while' } as never)).result)).toContain('Final message:\nALL GREEN')

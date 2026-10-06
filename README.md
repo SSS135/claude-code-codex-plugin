@@ -2,7 +2,7 @@
   <img src="./assets/readme/hero.svg" width="100%" alt="Codex for Claude Code. Illustration of a Claude Code session: one Codex agent is still running npm test, another has completed, and a one-line notice wakes Claude with its result.">
 </p>
 
-A Claude Code plugin that runs OpenAI Codex (luna, sol, astra, terra) as native Claude Code background subagents. Claude hands a task to a `codex:luna` agent through its own Agent tool and carries on. The job shows in the native task list, `SendMessage` and `TaskStop` reach it, and when Codex finishes, the native `Agent "<description>" finished` notification brings Claude the Codex final message, word for word. A live pane lists every job, and Codex approval requests show up as Claude Code dialogs.
+A Claude Code plugin that runs OpenAI Codex (luna, sol, astra, terra) as native Claude Code background subagents. Claude hands a task to a `codex:sol` agent through its own Agent tool and carries on. The job shows in the native task list, `SendMessage` and `TaskStop` reach it, and when Codex finishes, the native `Agent "<description>" finished` notification brings Claude the Codex final message, word for word. A live pane lists every job, and Codex approval requests show up as Claude Code dialogs.
 
 ## How it works
 
@@ -10,11 +10,22 @@ A Claude Code plugin that runs OpenAI Codex (luna, sol, astra, terra) as native 
   <img src="./assets/readme/flow.svg" width="100%" alt="Four steps: Claude starts a codex:luna background agent and moves on; Codex works in its own sandbox while the /codex pane shows progress; escalations go to a Claude Code dialog in ask mode or to Codex's reviewer in auto mode; the result arrives as a native task notification and SendMessage continues the thread.">
 </p>
 
-The plugin registers four agent types, one per Codex model: `codex:luna`, `codex:sol`, `codex:astra` and `codex:terra`. Claude uses them like `general-purpose`, so you can ask in plain words, for example "have a Codex agent on luna fix the flaky retry test". Claude turns that into an Agent call like this:
+The plugin registers four agent types, one per Codex model: `codex:luna`, `codex:sol`, `codex:astra` and `codex:terra`. Claude uses them like `general-purpose`, so you can ask in plain words, for example "have a Codex agent fix the flaky retry test". Claude turns that into an Agent call like this:
 
 ```json
-{ "subagent_type": "codex:luna", "description": "Fix flaky retry test", "prompt": "effort: medium\nFix the flaky test in retry.test.ts and run it." }
+{ "subagent_type": "codex:sol", "description": "Fix flaky retry test", "prompt": "effort: medium\nFix the flaky test in retry.test.ts and run it." }
 ```
+
+### Which agent Claude picks
+
+Each agent type's description in Claude's agent listing opens with when to use it, so Claude routes by it:
+
+| Agent type | Model | Default effort | Use it for |
+| --- | --- | --- | --- |
+| `codex:sol` | `gpt-6.1-sol` | high | Normal tasks: implementation, debugging, analysis, review, anything needing judgement. The default. |
+| `codex:luna` | `gpt-6-luna` | max | Simple mechanical work and searches: find/grep/list, bulk renames, boilerplate, straightforward well-specified edits, data gathering. Cheap and fast. |
+| `codex:astra` | `gpt-6-astra` | high | Only when you ask for astra explicitly. |
+| `codex:terra` | `gpt-5.6-terra` | high | Only when you ask for terra explicitly. |
 
 What happens then:
 
@@ -31,7 +42,7 @@ Optional lines at the very top of the prompt, one `key: value` each, set how Cod
 
 | Line | Values | Default |
 | --- | --- | --- |
-| `effort:` | low, medium, high, xhigh, max, ultra (luna does not take ultra) | `defaultEffort` |
+| `effort:` | low, medium, high, xhigh, max, ultra (luna does not take ultra) | the model's own (luna max, the others high), unless `defaultEffort` or the project sets one |
 | `sandbox:` | read-only, workspace-write, full-access | `defaultSandbox` |
 | `approvals:` | auto, ask, never, yolo | `defaultApprovals` |
 
@@ -102,7 +113,7 @@ Set these in the install screen or the plugin's config menu (`userConfig`):
 | --- | --- | --- |
 | `codexPath` | `/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex` | The Codex CLI. If the path does not exist, `codex` is looked up on PATH. |
 | `nodePath` | `/opt/homebrew/bin/node` | Node used to run the bridge. If the path does not exist, `node` is looked up on PATH. |
-| `defaultEffort` | `high` | low, medium, high, xhigh, max, ultra (luna does not take ultra). |
+| `defaultEffort` | `per-model` | `per-model` uses each model's own default: max for luna, high for sol, astra and terra. Any other value (low, medium, high, xhigh, max, ultra) applies to every model; luna does not take ultra. |
 | `defaultSandbox` | `workspace-write` | read-only, workspace-write, full-access. |
 | `defaultApprovals` | `auto` | auto, ask, never. |
 
@@ -114,7 +125,7 @@ A project can set its own defaults in `.claude/codex.json`. The plugin uses the 
 { "effort": "medium", "sandbox": "workspace-write", "approvals": "ask" }
 ```
 
-When a setting comes from several places, the prompt's header lines beat the project's `.claude/codex.json`, which beats `userConfig`, which beats the built-in defaults. The model comes from the agent type: `codex:luna` is `gpt-6-luna` (fast, cheap), `codex:sol` is `gpt-6.1-sol` (strongest), `codex:astra` is `gpt-6-astra`, and `codex:terra` is `gpt-5.6-terra`.
+When a setting comes from several places, the prompt's header lines beat the project's `.claude/codex.json`, which beats `userConfig`, which beats the built-in defaults. For effort, the built-in default is per model (luna max, the others high); an `effort` in `.claude/codex.json`, or a `defaultEffort` other than `per-model`, replaces it for every model. The model comes from the agent type: `codex:luna` is `gpt-6-luna` (fast, cheap), `codex:sol` is `gpt-6.1-sol` (strongest, the default for normal work), `codex:astra` is `gpt-6-astra`, and `codex:terra` is `gpt-5.6-terra`.
 
 ## Approval modes
 
