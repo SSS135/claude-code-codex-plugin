@@ -521,12 +521,63 @@ test('SendMessage steers a running Codex turn and starts a new one once it ended
   done(fake)
 })
 
+const releases = (fake: Fake) => fake.rpcs.filter(rpc => rpc.method === 'thread/unsubscribe').map(rpc => rpc.params)
+
+test('an ended turn releases its thread, so Codex unloads it and stops its MCP servers; the next turn resumes it first', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake)
+  const agent = await spawn($, fake)
+  expect(releases(fake)).toEqual([])
+  push(fake, note('turn/completed', { threadId: 'th-1', turn: { id: 'turn-1', status: 'completed', items: [] } }))
+  await until(fake, async () => releases(fake).length === 1, 'the release')
+  expect(releases(fake)).toEqual([{ threadId: 'th-1' }])
+
+  // SendMessage after the release: the thread is resumed, codex-msg included, before the new turn.
+  const before = fake.rpcs.length
+  expect(await send($, 'a1', 'next task')).toEqual({ isDelivered: true })
+  expect(fake.rpcs.slice(before).map(rpc => rpc.method)).toEqual(['thread/resume', 'turn/start'])
+  const resumed = fake.rpcs[before]?.params as { threadId: string; config: { mcp_servers: { claude_session: { args: string[] } } } }
+  expect(resumed.threadId).toBe('th-1')
+  expect(resumed.config.mcp_servers.claude_session.args.slice(1)).toEqual(['/tmp/cxb-test/s', agent.msgKey])
+
+  // That turn's end releases it again; a repeated end does not.
+  push(fake, note('turn/completed', { threadId: 'th-1', turn: { id: 'turn-2', status: 'completed', items: [] } }))
+  await until(fake, async () => releases(fake).length === 2, 'the second release')
+  push(fake, note('turn/completed', { threadId: 'th-1', turn: { id: 'turn-2', status: 'completed', items: [] } }))
+  for (let i = 0; i < 5; i += 1) await fake.clock.settle()
+  expect(releases(fake)).toHaveLength(2)
+  done(fake)
+})
+
+test('a late end of an earlier turn neither ends nor releases the turn started after it', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake)
+  await spawn($, fake)
+  // The wrapper learns of the end from /wait before the notification lands, and a new turn starts.
+  fake.waitQueue = [completed('turn-1', 'R')]
+  expect((await awaitCall($, 'a1')).result).toBe('R')
+  await send($, 'a1', 'more')
+  expect((await agentsOf(fake)).a1).toMatchObject({ status: 'running', currentTurnId: 'turn-2' })
+
+  push(fake, note('turn/completed', { threadId: 'th-1', turn: { id: 'turn-1', status: 'completed', items: [] } }))
+  for (let i = 0; i < 5; i += 1) await fake.clock.settle()
+  expect((await agentsOf(fake)).a1).toMatchObject({ status: 'running', currentTurnId: 'turn-2' })
+  expect(releases(fake)).toEqual([])
+
+  push(fake, note('turn/completed', { threadId: 'th-1', turn: { id: 'turn-2', status: 'completed', items: [] } }))
+  await until(fake, async () => releases(fake).length === 1, 'the release')
+  done(fake)
+})
+
 test('TaskStop: an aborted wrapper turn interrupts the Codex turn', { timeoutMs: 20_000 }, async ($, on) => {
   const fake = fakeBridge(on)
   await start($, fake)
   await spawn($, fake)
   await $.turn.complete({ answer: '', durationMs: 5, isAborted: true, turnId: 't-a1', agentId: 'a1', reason: 'aborted' })
   expect(fake.rpcs.filter(rpc => rpc.method === 'turn/interrupt').map(rpc => rpc.params)).toEqual([{ threadId: 'th-1', turnId: 'turn-1' }])
+  // The interrupted turn's end releases the thread.
+  push(fake, note('turn/completed', { threadId: 'th-1', turn: { id: 'turn-1', status: 'interrupted', items: [] } }))
+  await until(fake, async () => releases(fake).length === 1, 'the release')
   // A turn that ended normally, or the main loop's, interrupts nothing.
   await $.turn.complete({ answer: 'x', durationMs: 5, isAborted: false, turnId: 't-a1', agentId: 'a1', reason: 'answer' })
   await $.turn.complete({ answer: '', durationMs: 5, isAborted: true, turnId: 'main', reason: 'aborted' })

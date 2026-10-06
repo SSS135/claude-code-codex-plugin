@@ -104,8 +104,12 @@ const SETTLE_BUDGET_MS = 5_000
 type Socket = { promise: Promise<string>; resolve: (path: string) => void; reject: (error: Error) => void }
 let socket: Socket | null = null
 let isBridgeRunning = false
-/** Threads loaded into the running app-server (thread/start or thread/resume). */
+/** The userConfig the bridge starts with; set when the module registers. */
+let bridgeSettings: Settings | null = null
+/** Threads this app-server connection is subscribed to (thread/start or thread/resume). */
 const loadedThreads = new Set<string>()
+/** Per thread, the tail of its loads, turn starts and releases, which run one at a time. */
+const threadQueues = new Map<string, Promise<unknown>>()
 /** The node binary the bridge runs on, which Codex runs bin/codex-msg on too. */
 let nodeBinary = 'node'
 /** Subagents seen at turn.step that are not codex:* agents. */
@@ -173,9 +177,11 @@ async function resolveBinary($: Engine, configured: string, name: string): Promi
   return (await $.fs.exists(configured)) ? configured : name
 }
 
-/** Starts the relay; its events reach `onEvent` in order for the session's life. */
-async function startBridge($: Engine, settings: Settings): Promise<void> {
+/** Starts the relay, unless it runs; its events reach `onEvent` in order until the daemon exits (the session ended, or it sat idle). */
+async function startBridge($: Engine): Promise<void> {
   if (isBridgeRunning) return
+  const settings = bridgeSettings
+  if (!settings) throw new CodexError('the codex plugin is not registered')
   isBridgeRunning = true
   const current = newSocket()
   socket = current
@@ -226,9 +232,15 @@ async function startBridge($: Engine, settings: Settings): Promise<void> {
   })()
 }
 
-async function post($: Engine, endpoint: string, body: unknown): Promise<Record<string, unknown>> {
+/** The daemon's socket, starting the bridge when none runs (the daemon exits when idle). */
+async function bridgeSocket($: Engine): Promise<string> {
+  await startBridge($)
   if (!socket) throw new CodexError('the codex bridge is not running')
-  const socketPath = await socket.promise
+  return socket.promise
+}
+
+async function post($: Engine, endpoint: string, body: unknown): Promise<Record<string, unknown>> {
+  const socketPath = await bridgeSocket($)
   const response = await $.http.fetch(`http://codex${endpoint}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -266,8 +278,36 @@ async function waitTurn($: Engine, threadId: string, timeoutMs: number, msgKey: 
 
 /** The thread params that let a job message this session through the bridge's socket (see messagingParams). */
 async function messagingFor($: Engine, msgKey: string): Promise<MessagingParams> {
-  if (!socket) throw new CodexError('the codex bridge is not running')
-  return messagingParams(nodeBinary, $.plugin.root, await socket.promise, msgKey)
+  const socketPath = await bridgeSocket($)
+  return messagingParams(nodeBinary, $.plugin.root, socketPath, msgKey)
+}
+
+/** Runs `work` once the thread's earlier loads, turn starts and releases have finished. */
+function onThread<T>(threadId: string, work: () => Promise<T>): Promise<T> {
+  const run = (threadQueues.get(threadId) ?? Promise.resolve()).then(work)
+  const tail = run.catch(() => undefined)
+  threadQueues.set(threadId, tail)
+  void tail.then(() => {
+    if (threadQueues.get(threadId) === tail) threadQueues.delete(threadId)
+  })
+  return run
+}
+
+/**
+ * Unsubscribes from a thread whose turn ended and that runs no newer one, so
+ * app-server unloads it once idle (about a minute later) and stops its MCP
+ * servers: bin/codex-msg and the MCP servers of Codex's own plugins. The next
+ * turn on it resumes it first (ensureLoaded).
+ */
+function releaseThread($: Engine, threadId: string): Promise<void> {
+  return onThread(threadId, async () => {
+    const agent = byThread(await read($, agentsAtom), threadId)
+    if (!loadedThreads.has(threadId) || (agent && isLive(agent))) return
+    loadedThreads.delete(threadId)
+    await rpc($, 'thread/unsubscribe', { threadId }).catch(error =>
+      $.ui.log(`codex: releasing thread ${threadId} failed: ${errorText(error)}`, { to: 'debug' }),
+    )
+  })
 }
 
 // ------------------------------------------------------------ operations
@@ -294,7 +334,7 @@ async function ensureLoaded($: Engine, agent: CodexAgent): Promise<void> {
   } catch (error) {
     if (error instanceof CodexError && error.message.includes('active writer')) {
       throw new CodexError(
-        `${agent.name}'s thread is still held by another Codex process: the previous Claude session's (it exits about 20 s after that session ends) or another live session's. Try again shortly.`,
+        `${agent.name}'s thread is still held by another Codex process: a previous bridge's (it exits about 20 s after its Claude session ends or the plugin reloads onto another version) or another live session's. Try again shortly.`,
       )
     }
     throw error
@@ -363,19 +403,21 @@ async function newAgent($: Engine, id: string, threadId: string, input: JobInput
 }
 
 /** Starts a new turn, passing sandbox, approvals, model and effort again. */
-async function startTurn($: Engine, agent: CodexAgent, text: string): Promise<CodexAgent> {
-  await ensureLoaded($, agent)
-  const now = await $.clock.now()
-  const started = await rpc<{ turn: { id: string } }>($, 'turn/start', turnStartParams(agent, text))
-  const written = await patchAgent($, agent.id, current => ({
-    status: 'running',
-    // turn/started may already have landed with the same id
-    currentTurnId: started.turn.id,
-    error: null,
-    activity: current.currentTurnId === started.turn.id ? current.activity : 'thinking',
-    turnStartedAt: now,
-  }))
-  return written ?? agent
+function startTurn($: Engine, agent: CodexAgent, text: string): Promise<CodexAgent> {
+  return onThread(agent.threadId, async () => {
+    await ensureLoaded($, agent)
+    const now = await $.clock.now()
+    const started = await rpc<{ turn: { id: string } }>($, 'turn/start', turnStartParams(agent, text))
+    const written = await patchAgent($, agent.id, current => ({
+      status: 'running',
+      // turn/started may already have landed with the same id
+      currentTurnId: started.turn.id,
+      error: null,
+      activity: current.currentTurnId === started.turn.id ? current.activity : 'thinking',
+      turnStartedAt: now,
+    }))
+    return written ?? agent
+  })
 }
 
 /** Steers the running turn, or starts a new one when none runs. */
@@ -557,7 +599,12 @@ async function onNotification($: Engine, method: string, params: Record<string, 
     case 'turn/completed': {
       if (!turn) return
       const now = await $.clock.now()
-      await patchAgent($, agent.id, current => afterTurn(current, turn, now))
+      // A late end of an earlier turn leaves a newer running one alone.
+      await patchAgent($, agent.id, current =>
+        current.currentTurnId === null || current.currentTurnId === turn.id ? afterTurn(current, turn, now) : {},
+      )
+      // Never hold the event loop on the release.
+      void releaseThread($, params.threadId)
       return
     }
   }
@@ -680,6 +727,7 @@ export const register: Register = (on, options) => {
     defaultSandbox: String(options.defaultSandbox) as CodexSandbox,
     defaultApprovals: String(options.defaultApprovals) as CodexApprovals,
   }
+  bridgeSettings = settings
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
@@ -692,7 +740,7 @@ export const register: Register = (on, options) => {
     for (const tool of TOOL_SPECS) await $.tool.register(tool)
     for (const spec of agentSpecs(effectiveDefaults(settings, project))) await $.agent.register(spec)
     await loadFromStore($)
-    await startBridge($, settings)
+    await startBridge($)
     return started
   })
 
@@ -715,7 +763,6 @@ export const register: Register = (on, options) => {
       const model = resolveModel(alias)
       const effort = header.effort ?? effortFor(defaults, alias)
       const { sandbox, approvals } = permissionsFor(header, defaults)
-      await startBridge($, settings)
       const error = modelEffortError(await listModels($), model, effort)
       if (error) return { deny: `codex: ${error}` }
       input = {
@@ -736,13 +783,17 @@ export const register: Register = (on, options) => {
       return { deny: `codex: ${errorText(error)}` }
     }
     const spawned = await next({ ...e, background: true })
-    if (spawned.agentId === undefined) return spawned
+    if (spawned.agentId === undefined) {
+      void releaseThread($, threadId)
+      return spawned
+    }
     const agent = await putAgent($, await newAgent($, spawned.agentId, threadId, input))
     try {
       await startTurn($, agent, body)
     } catch (error) {
       // The subagent runs: it ends at once with this reason as its answer.
       await patchAgent($, agent.id, () => ({ status: 'failed', error: `the Codex turn did not start: ${errorText(error)}` }))
+      void releaseThread($, threadId)
     }
     return spawned
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'codex: the Codex job did not start (the hook failed or ran out of time)' }))
@@ -816,7 +867,6 @@ export const register: Register = (on, options) => {
   // A pattern: the tools table a type-check reads lists the MCP tools of the last reload alone.
   on('tool.call', { tool: new RegExp(`^${AWAIT_TOOL}$`) }, async ($, e, next) => {
     try {
-      await startBridge($, settings)
       return { result: await awaitJob($, e.agentId, next.signal) }
     } catch (error) {
       return { deny: errorText(error) }

@@ -4,10 +4,13 @@
 // Two roles in one file:
 //   relay:  node bridge.mjs <codexPath> <sessionKey>
 //           Started by the plugin with $.process.spawn. Finds (or starts) the
-//           daemon for this Claude session, then copies its event stream to
-//           stdout as NDJSON. First line: {"type":"ready","socket",...}.
-//           It exits when its parent goes away or stdout breaks; the plugin
-//           killing it on reload is expected and harmless.
+//           daemon for this Claude session and this build of the bridge (the
+//           daemon's directory is <sessionKey>-<BUILD>, so a reload onto another
+//           plugin version or path starts a new daemon instead of driving an old
+//           one), then copies its event stream to stdout as NDJSON. First line:
+//           {"type":"ready","socket",...}. It exits when its parent goes away,
+//           stdout breaks or the daemon exits; the plugin killing it on reload is
+//           expected and harmless.
 //   launch: node bridge.mjs --launch <codexPath> <dir>
 //           Started detached by the relay; starts the daemon detached, writes
 //           its pid to <dir>/pid and exits at once. The daemon is thus never a
@@ -24,9 +27,17 @@
 //             POST /wait  {threadId, msgKey?, timeoutMs} long-poll for turn end or a codex-msg message
 //             POST /msg   {key, text}                  bin/codex-msg: a message from a Codex job
 //           While no relay is attached it buffers events (so a plugin reload
-//           loses nothing) and exits, killing codex, after GRACE_MS alone.
+//           loses nothing) and exits, killing codex, after GRACE_MS alone. With a
+//           relay attached it exits after IDLE_MS with no turn running and no
+//           request in flight; the plugin starts a new one when it next needs
+//           Codex. Codex stops a thread's MCP servers (bin/codex-msg among them)
+//           when it unloads the thread, and all of them when it exits. It also
+//           stops daemons of bridge builds that predate this lifecycle (their
+//           directory is the bare session key) once it has seen them run no
+//           turn for LEGACY_IDLE_MS.
 
 import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import http from 'node:http'
 import path from 'node:path'
@@ -34,12 +45,20 @@ import readline from 'node:readline'
 import { fileURLToPath } from 'node:url'
 
 const GRACE_MS = 20_000
+const IDLE_MS = 10 * 60_000
+const IDLE_CHECK_MS = 60_000
+/** Half the idle window, so a daemon about to idle out itself still stops an idle legacy one. */
+const LEGACY_IDLE_MS = IDLE_MS / 2
 const BUFFER_CAP = 5_000
 const MAILBOX_CAP = 50
 const MESSAGE_CAP = 20_000
 /** What a codex-msg delivery hands a waiting /wait. */
 const MAIL = Symbol('mail')
 const SELF = fileURLToPath(import.meta.url)
+/** Names this bridge build: its path and its code. */
+const BUILD = createHash('sha256').update(SELF).update(fs.readFileSync(SELF)).digest('hex').slice(0, 8)
+/** A daemon directory of a build before BUILD was part of it: the session key alone. */
+const isLegacyDir = name => /^[A-Za-z0-9]+$/.test(name)
 
 // Notifications the plugin never reads: streaming deltas and chatter.
 const NOISE = new Set([
@@ -116,6 +135,9 @@ async function daemon(codexPath, dir) {
   let subscriber = null
   let graceTimer = null
   let everSubscribed = false
+  /** Requests other than /events being served, and when the daemon was last in use. */
+  let inFlight = 0
+  let lastUse = Date.now()
 
   const emit = event => {
     if (subscriber) subscriber.write(JSON.stringify(event) + '\n')
@@ -165,6 +187,7 @@ async function daemon(codexPath, dir) {
     if (method === 'turn/completed' && params.turn) {
       active.delete(params.threadId)
       lastTurn.set(params.threadId, params.turn)
+      lastUse = Date.now()
     }
     if (method === 'serverRequest/resolved' && params.requestId !== undefined) outstanding.delete(params.requestId)
     if (!isNoise(method)) emit({ type: 'notification', method, params })
@@ -191,7 +214,10 @@ async function daemon(codexPath, dir) {
   const shutdown = code => {
     if (codex.exitCode === null && codex.signalCode === null) codex.kill('SIGTERM')
     cleanup()
-    process.exit(code)
+    // End the relay's stream before exiting, so the relay reads an ordinary end, not a reset.
+    if (subscriber) subscriber.end()
+    subscriber = null
+    setTimeout(() => process.exit(code), 100)
   }
 
   const armGrace = () => {
@@ -214,15 +240,23 @@ async function daemon(codexPath, dir) {
   const init = await rpc('initialize', { clientInfo: { name: 'claude-code-codex-plugin', version: '0.1.0' } }, 30_000)
   if (init.error) {
     process.stderr.write(`initialize failed: ${JSON.stringify(init.error)}\n`)
-    shutdown(1)
+    return shutdown(1)
   }
   writeCodex({ method: 'initialized' })
 
   const server = http.createServer(async (req, res) => {
     try {
       const url = new URL(req.url ?? '/', 'http://bridge')
+      if (url.pathname !== '/events') {
+        inFlight += 1
+        lastUse = Date.now()
+        res.on('close', () => {
+          inFlight -= 1
+          lastUse = Date.now()
+        })
+      }
       if (req.method === 'GET' && url.pathname === '/health') {
-        return sendJson(res, 200, { ok: true, pid: process.pid, codexPid: codex.pid, active: Object.fromEntries(active) })
+        return sendJson(res, 200, { ok: true, pid: process.pid, codexPid: codex.pid, build: BUILD, active: Object.fromEntries(active) })
       }
       if (req.method === 'GET' && url.pathname === '/events') {
         if (subscriber) subscriber.end()
@@ -310,6 +344,37 @@ async function daemon(codexPath, dir) {
     fs.chmodSync(socketPath, 0o600)
     armGrace()
   })
+
+  // Legacy daemon directory -> since when its daemon has been seen running no turn.
+  const legacyIdleSince = new Map()
+  const stopIdleLegacy = async () => {
+    const base = path.dirname(dir)
+    const now = Date.now()
+    for (const name of fs.readdirSync(base).filter(isLegacyDir)) {
+      const health = await readHealth(path.join(base, name, 's'))
+      if (!health || Object.keys(health.active ?? {}).length > 0) {
+        legacyIdleSince.delete(name)
+        continue
+      }
+      const since = legacyIdleSince.get(name) ?? now
+      legacyIdleSince.set(name, since)
+      if (now - since < LEGACY_IDLE_MS) continue
+      legacyIdleSince.delete(name)
+      // The pid the daemon reports must be the one its launcher recorded.
+      let recorded = null
+      try {
+        recorded = fs.readFileSync(path.join(base, name, 'pid'), 'utf8').trim()
+      } catch {}
+      if (recorded !== String(health.pid)) continue
+      process.stderr.write(`stopping idle daemon ${name} (pid ${health.pid}) of an older bridge build\n`)
+      process.kill(health.pid, 'SIGTERM')
+    }
+  }
+  setInterval(() => {
+    if (active.size > 0 || inFlight > 0) lastUse = Date.now()
+    else if (subscriber && Date.now() - lastUse >= IDLE_MS) shutdown(0)
+    stopIdleLegacy().catch(error => process.stderr.write(`legacy daemon sweep failed: ${error.message}\n`))
+  }, IDLE_CHECK_MS)
 }
 
 // ---------------------------------------------------------------- relay
@@ -322,15 +387,20 @@ const request = (socketPath, method, urlPath, timeoutMs) =>
     req.end()
   })
 
-const isHealthy = async socketPath => {
+/** A daemon's /health answer, or null when none answers on the socket. */
+const readHealth = async socketPath => {
   try {
     const res = await request(socketPath, 'GET', '/health', 1000)
-    res.resume()
-    return res.statusCode === 200
+    res.setEncoding('utf8')
+    let text = ''
+    for await (const chunk of res) text += chunk
+    return res.statusCode === 200 ? JSON.parse(text) : null
   } catch {
-    return false
+    return null
   }
 }
+
+const isHealthy = async socketPath => (await readHealth(socketPath)) !== null
 
 const privateBase = () => {
   const base = `/tmp/cxb-${process.getuid()}`
@@ -350,8 +420,8 @@ async function relay(codexPath, sessionKey) {
   }, 1000).unref()
   for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => process.exit(0))
 
-  const key = sessionKey.replace(/[^A-Za-z0-9-]/g, '').slice(0, 16) || 'default'
-  const dir = path.join(privateBase(), key)
+  const key = sessionKey.replace(/[^A-Za-z0-9]/g, '').slice(0, 16) || 'default'
+  const dir = path.join(privateBase(), `${key}-${BUILD}`)
   const socketPath = path.join(dir, 's')
 
   if (!(await isHealthy(socketPath))) {
