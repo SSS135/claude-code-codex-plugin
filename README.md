@@ -4,6 +4,10 @@
 
 A Claude Code plugin that runs OpenAI Codex (luna, sol, astra, terra) as native Claude Code background subagents. Claude hands a task to a `codex:sol` agent through its own Agent tool and carries on. The job shows in the native task list, `SendMessage` and `TaskStop` reach it, and when Codex finishes, the native `Agent "<description>" finished` notification brings Claude the Codex final message, word for word. Codex approval requests show up as Claude Code dialogs.
 
+<p align="center">
+  <img src="./assets/readme/demo.gif" width="100%" alt="Demo: Claude starts a codex:sol agent that writes calc.js with two hidden bugs, then runs a reviewer and a test writer in parallel. The test writer asks Claude a question mid-task, Claude answers, both agents report back through native finish notifications, and Claude summarizes the two bugs they found.">
+</p>
+
 ## How it works
 
 <p align="center">
