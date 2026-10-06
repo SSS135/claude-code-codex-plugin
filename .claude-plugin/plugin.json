@@ -1,10 +1,10 @@
 {
   "name": "codex",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": {
     "name": "SSS135"
   },
-  "description": "Run OpenAI Codex agents as background workers: spawn, message, steer, stop, resume and read them, with approvals, a live pane and wake-on-completion.",
+  "description": "Run OpenAI Codex jobs as native background subagents (codex:luna, codex:sol, codex:astra, codex:terra): the native task list, SendMessage, TaskStop and finish notifications, with approvals and a live pane.",
   "types": "./types/index.d.ts",
   "userConfig": {
     "codexPath": {
@@ -19,16 +19,10 @@
       "description": "Node 18+ used to run the bridge process. When this path does not exist, `node` is looked up on PATH.",
       "default": "/opt/homebrew/bin/node"
     },
-    "defaultModel": {
-      "type": "string",
-      "title": "Default model",
-      "description": "Model when codex_spawn names none: luna, sol, astra, terra or a full model id.",
-      "default": "gpt-6.1-sol"
-    },
     "defaultEffort": {
       "type": "string",
       "title": "Default effort",
-      "description": "Reasoning effort when codex_spawn names none.",
+      "description": "Codex reasoning effort when the prompt sets no effort: header line.",
       "default": "high",
       "options": [
         "low",
@@ -42,7 +36,7 @@
     "defaultSandbox": {
       "type": "string",
       "title": "Default sandbox",
-      "description": "Sandbox when codex_spawn names none.",
+      "description": "Sandbox when the prompt sets no sandbox: header line.",
       "default": "workspace-write",
       "options": [
         "read-only",

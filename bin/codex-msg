@@ -1,0 +1,89 @@
+#!/usr/bin/env node
+// codex-msg: the MCP server that lets a Codex job message the Claude session
+// that runs it.
+//
+//   node codex-msg <socket> <key>
+//
+// The plugin names it in the Codex thread's config (mcp_servers.claude_session),
+// so codex app-server starts it outside the job's sandbox: Codex's read-only
+// and workspace-write sandboxes both refuse a shell command's connect() to the
+// bridge's Unix socket. It serves one tool, message_claude, over stdio
+// (newline-delimited JSON-RPC). The bridge daemon queues the text for the job's
+// codex:* agent, which passes it on to the main session with SendMessage,
+// verbatim. CommonJS on purpose: an extensionless script.
+
+'use strict'
+const http = require('node:http')
+const readline = require('node:readline')
+
+const [socketPath, key] = process.argv.slice(2)
+if (!socketPath || !key) {
+  process.stderr.write('usage: codex-msg <socket> <key>\n')
+  process.exit(2)
+}
+
+const TOOL = {
+  name: 'message_claude',
+  description:
+    'Send a message to the Claude Code session that started this job: a question you need answered, a blocker, or an important interim finding. Not for progress updates or your final result. A reply, if one comes, arrives as a new user message in your turn.',
+  inputSchema: { type: 'object', properties: { text: { type: 'string', description: 'The message, as the session should read it.' } }, required: ['text'] },
+  annotations: { readOnlyHint: true, openWorldHint: false },
+}
+
+const write = message => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n')
+
+const post = text =>
+  new Promise(resolve => {
+    const body = JSON.stringify({ key, text })
+    const req = http.request(
+      { socketPath, method: 'POST', path: '/msg', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } },
+      res => {
+        let answer = ''
+        res.setEncoding('utf8')
+        res.on('data', chunk => (answer += chunk))
+        res.on('end', () => resolve(res.statusCode === 200 ? null : `the bridge refused the message: ${answer}`))
+      },
+    )
+    req.on('error', error => resolve(`cannot reach the Claude session (${error.message})`))
+    req.end(body)
+  })
+
+async function call(params) {
+  if (params?.name !== TOOL.name) return { content: [{ type: 'text', text: `No tool ${params?.name}.` }], isError: true }
+  const text = typeof params.arguments?.text === 'string' ? params.arguments.text : ''
+  if (text.trim() === '') return { content: [{ type: 'text', text: 'The message is empty.' }], isError: true }
+  const error = await post(text)
+  if (error) return { content: [{ type: 'text', text: error }], isError: true }
+  return { content: [{ type: 'text', text: 'Sent to the Claude session. A reply, if any, arrives as a new user message.' }] }
+}
+
+readline.createInterface({ input: process.stdin }).on('line', async line => {
+  if (line.trim() === '') return
+  let message
+  try {
+    message = JSON.parse(line)
+  } catch {
+    return write({ id: null, error: { code: -32700, message: 'parse error' } })
+  }
+  const { id, method, params } = message
+  if (id === undefined) return // a notification
+  switch (method) {
+    case 'initialize':
+      return write({
+        id,
+        result: {
+          protocolVersion: params?.protocolVersion ?? '2025-06-18',
+          capabilities: { tools: {} },
+          serverInfo: { name: 'claude-session', version: '0.1.0' },
+        },
+      })
+    case 'ping':
+      return write({ id, result: {} })
+    case 'tools/list':
+      return write({ id, result: { tools: [TOOL] } })
+    case 'tools/call':
+      return write({ id, result: await call(params) })
+    default:
+      return write({ id, error: { code: -32601, message: `${method} is not supported` } })
+  }
+})

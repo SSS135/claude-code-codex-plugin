@@ -3,9 +3,13 @@ export type CodexSandbox = 'read-only' | 'workspace-write' | 'full-access'
 export type CodexApprovals = 'ask' | 'auto' | 'never' | 'yolo'
 export type CodexStatus = 'starting' | 'running' | 'idle' | 'interrupted' | 'failed'
 
+/** One Codex job: a Codex thread run under a native `codex:<alias>` subagent, keyed by that subagent's agentId. */
 export type CodexAgent = {
+  /** The native subagent's agentId, which SendMessage and TaskStop take. */
   id: string
   name: string
+  /** The short task label the transcript and the pane show (the spawn's description, else its prompt's first line). */
+  description: string
   threadId: string
   model: string
   effort: string
@@ -26,10 +30,12 @@ export type CodexAgent = {
   lastCommand: string
   tokens: number
   error: string | null
+  /** The key bin/codex-msg names this job by (in the thread's developer instructions). */
+  msgKey: string
+  /** codex-msg messages read from the bridge and not yet passed on to the main session. */
+  outbox: string[]
   /** Compact lines of the current or last turn: commands, file changes, messages. */
   digest: string[]
-  /** Wake the main session when the running turn ends. */
-  notify: boolean
   startedAt: number
   updatedAt: number
   turnStartedAt: number
@@ -49,9 +55,6 @@ declare module 'claude-code' {
       agents: Record<string, CodexAgent>
       selected: string | null
       showResult: boolean
-      /** tool_use_id of a codex_spawn / codex_send row -> agent id */
-      calls: Record<string, string>
-      mainBusy: boolean
       approvals: CodexApproval[]
       /** Survives reloads: names this session's bridge daemon. */
       bridgeKey: string | null

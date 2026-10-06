@@ -21,7 +21,8 @@
 //             GET  /events           NDJSON stream (one subscriber, the relay)
 //             POST /rpc   {method, params, timeoutMs?} -> {result} | {error}
 //             POST /reply {id, result} | {id, error}   answers a server request
-//             POST /wait  {threadId, timeoutMs}        long-poll for turn end
+//             POST /wait  {threadId, msgKey?, timeoutMs} long-poll for turn end or a codex-msg message
+//             POST /msg   {key, text}                  bin/codex-msg: a message from a Codex job
 //           While no relay is attached it buffers events (so a plugin reload
 //           loses nothing) and exits, killing codex, after GRACE_MS alone.
 
@@ -34,6 +35,10 @@ import { fileURLToPath } from 'node:url'
 
 const GRACE_MS = 20_000
 const BUFFER_CAP = 5_000
+const MAILBOX_CAP = 50
+const MESSAGE_CAP = 20_000
+/** What a codex-msg delivery hands a waiting /wait. */
+const MAIL = Symbol('mail')
 const SELF = fileURLToPath(import.meta.url)
 
 // Notifications the plugin never reads: streaming deltas and chatter.
@@ -100,6 +105,13 @@ async function daemon(codexPath, dir) {
   const active = new Map() // threadId -> running turnId
   const lastTurn = new Map() // threadId -> last completed turn
   const waiters = new Map() // threadId -> Set<(value) => void>
+  const mailboxes = new Map() // codex-msg key -> texts not yet read
+  const mailWaiters = new Map() // codex-msg key -> Set<(value) => void>
+  const drainMail = key => {
+    const messages = mailboxes.get(key) ?? []
+    mailboxes.delete(key)
+    return messages
+  }
   let buffer = []
   let subscriber = null
   let graceTimer = null
@@ -247,20 +259,42 @@ async function daemon(codexPath, dir) {
         return sendJson(res, 200, { ok: true })
       }
       if (url.pathname === '/wait') {
-        const { threadId, timeoutMs = 600_000 } = body
+        const { threadId, msgKey, timeoutMs = 600_000 } = body
+        // Messages first: a job may send one and end its turn before the next poll.
+        if (msgKey && mailboxes.get(msgKey)?.length) return sendJson(res, 200, { status: 'message', messages: drainMail(msgKey) })
         if (!active.has(threadId)) return sendJson(res, 200, { status: 'idle', turn: lastTurn.get(threadId) ?? null })
         const answer = await new Promise(resolve => {
           const set = waiters.get(threadId) ?? new Set()
           waiters.set(threadId, set)
+          const mail = msgKey ? (mailWaiters.get(msgKey) ?? new Set()) : null
+          if (mail) mailWaiters.set(msgKey, mail)
           const done = value => {
             clearTimeout(timer)
             set.delete(done)
-            resolve(value)
+            mail?.delete(done)
+            resolve(value === MAIL ? { status: 'message', messages: drainMail(msgKey) } : value)
           }
           const timer = setTimeout(() => done({ status: 'timeout', turnId: active.get(threadId) ?? null }), timeoutMs)
           set.add(done)
+          mail?.add(done)
         })
         return sendJson(res, 200, answer)
+      }
+      if (url.pathname === '/msg') {
+        const { key, text } = body
+        if (typeof key !== 'string' || key === '' || typeof text !== 'string' || text.trim() === '') {
+          return sendJson(res, 400, { error: { message: 'key and text are required' } })
+        }
+        const box = mailboxes.get(key) ?? []
+        if (box.length >= MAILBOX_CAP) return sendJson(res, 429, { error: { message: `${MAILBOX_CAP} messages are already waiting to be read` } })
+        box.push(text.slice(0, MESSAGE_CAP))
+        mailboxes.set(key, box)
+        const set = mailWaiters.get(key)
+        if (set) {
+          mailWaiters.delete(key)
+          for (const done of set) done(MAIL)
+        }
+        return sendJson(res, 200, { ok: true })
       }
       return sendJson(res, 404, { error: { message: 'not found' } })
     } catch (error) {

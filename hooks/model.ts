@@ -3,14 +3,13 @@
 // protocol parameters, how events change an agent, and the texts the model
 // and the person read.
 
-import type { ToolSpec } from 'claude-code'
+import type { EngineInterface, ToolSpec } from 'claude-code'
 
 import type { CodexAgent, CodexApprovals, CodexSandbox } from '../types'
 
 export type Settings = {
   codexPath: string
   nodePath: string
-  defaultModel: string
   defaultEffort: string
   defaultSandbox: CodexSandbox
   defaultApprovals: CodexApprovals
@@ -54,8 +53,8 @@ export const elapsed = (from: number, to: number): string => {
   const seconds = Math.max(0, Math.round((to - from) / 1000))
   if (seconds < 60) return `${seconds}s`
   const minutes = Math.floor(seconds / 60)
-  if (minutes < 60) return `${minutes}m${String(seconds % 60).padStart(2, '0')}s`
-  return `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, '0')}m`
+  if (minutes < 60) return `${minutes}m ${seconds % 60}s`
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m ${seconds % 60}s`
 }
 
 export const formatTokens = (tokens: number): string =>
@@ -124,8 +123,8 @@ export const uniqueName = (agents: Record<string, CodexAgent>, wanted: string): 
   const taken = new Set(Object.values(agents).map(agent => agent.name))
   if (!taken.has(wanted)) return wanted
   let n = 2
-  while (taken.has(`${wanted}-${n}`)) n += 1
-  return `${wanted}-${n}`
+  while (taken.has(`${wanted} (${n})`)) n += 1
+  return `${wanted} (${n})`
 }
 
 // ------------------------------------------------------------ codex params
@@ -146,15 +145,17 @@ export const approvalParams = (approvals: CodexApprovals) => ({
   approvalsReviewer: approvals === 'auto' ? 'auto_review' : 'user',
 })
 
+
 export const textInput = (text: string) => [{ type: 'text', text, text_elements: [] }]
 
-export const threadResumeParams = (agent: CodexAgent) => ({
+export const threadResumeParams = (agent: CodexAgent, messaging: MessagingParams | undefined) => ({
   threadId: agent.threadId,
   model: agent.model,
   cwd: agent.cwd,
   sandbox: sandboxMode(agent.sandbox),
   ...approvalParams(agent.approvals),
   excludeTurns: true,
+  ...messaging,
 })
 
 export const turnStartParams = (agent: CodexAgent, text: string) => ({
@@ -250,7 +251,6 @@ export function afterTurn(agent: CodexAgent, turn: Record<string, unknown>, now:
     error: error ?? (status === 'failed' ? 'the turn failed' : null),
     activity: status,
     turnEndedAt: now,
-    notify: false,
     ...(final !== null ? { lastMessage: final } : {}),
   }
 }
@@ -382,11 +382,11 @@ export function autoReviewDigest(params: Record<string, unknown>): string {
 
 // ------------------------------------------------------------ project config
 
-export type Defaults = { model: string; effort: string; sandbox: CodexSandbox; approvals: CodexApprovals }
+export type Defaults = { effort: string; sandbox: CodexSandbox; approvals: CodexApprovals }
 
 export const PROJECT_CONFIG = '.claude/codex.json'
 
-/** Parses a project's .claude/codex.json: optional defaults {model, effort, sandbox, approvals}. */
+/** Parses a project's .claude/codex.json: optional defaults {effort, sandbox, approvals}. */
 export function parseProjectConfig(text: string, path: string): Partial<Defaults> {
   let parsed: unknown
   try {
@@ -397,7 +397,7 @@ export function parseProjectConfig(text: string, path: string): Partial<Defaults
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new CodexError(`${path} must hold a JSON object`)
   const config = parsed as Record<string, unknown>
   const out: Partial<Defaults> = {}
-  for (const key of ['model', 'effort', 'sandbox', 'approvals'] as const) {
+  for (const key of ['effort', 'sandbox', 'approvals'] as const) {
     const value = config[key]
     if (value === undefined) continue
     if (typeof value !== 'string' || value === '') throw new CodexError(`${path}: "${key}" must be a non-empty string`)
@@ -405,7 +405,7 @@ export function parseProjectConfig(text: string, path: string): Partial<Defaults
     if (key === 'approvals' && !APPROVALS.includes(value as CodexApprovals)) throw new CodexError(`${path}: approvals must be one of ${APPROVALS.join(', ')}`)
     if (key === 'sandbox') out.sandbox = value as CodexSandbox
     else if (key === 'approvals') out.approvals = value as CodexApprovals
-    else out[key] = value
+    else out.effort = value
   }
   return out
 }
@@ -422,9 +422,8 @@ export function configDirs(cwd: string, root: string): string[] {
   }
 }
 
-/** Precedence: tool args > project config > userConfig (whose manifest defaults are the built-ins). */
+/** Precedence: prompt header lines > project config > userConfig (whose manifest defaults are the built-ins). */
 export const effectiveDefaults = (settings: Settings, project: Partial<Defaults>): Defaults => ({
-  model: project.model ?? settings.defaultModel,
   effort: project.effort ?? settings.defaultEffort,
   sandbox: project.sandbox ?? settings.defaultSandbox,
   approvals: project.approvals ?? settings.defaultApprovals,
@@ -452,50 +451,115 @@ export function permissionsFor(
   return { sandbox, approvals }
 }
 
-// ------------------------------------------------------------ wake ledger
+// ------------------------------------------------------------ codex-msg
+
+/** The MCP server, bin/codex-msg, through which a job messages the session; Codex starts it outside the job's sandbox. */
+export const MSG_SERVER = 'claude_session'
+
+/** What thread/start and thread/resume take so a job can message the session: the server in `config`, its use in the developer instructions. */
+export const messagingParams = (node: string, root: string, socketPath: string, key: string) => ({
+  config: { mcp_servers: { [MSG_SERVER]: { command: node, args: [`${root}/bin/codex-msg`, socketPath, key] } } },
+  developerInstructions: [
+    'You run as a background job of a Claude Code session, which gets your final message when your turn ends.',
+    `To message that session while you work, call the message_claude tool of the ${MSG_SERVER} MCP server with the text.`,
+    'Use it for a question you need answered, a blocker, or an important interim finding; never for progress updates, and never for your final result.',
+    'A reply, when the session sends one, arrives as a new user message in your turn; keep working on what you can while you wait for it.',
+  ].join('\n'),
+})
+
+export type MessagingParams = ReturnType<typeof messagingParams>
+
+// ------------------------------------------------------------ native agent types
 
 /**
- * Wake notices appended into a running main turn. A notice the engine stored
- * before one of the turn's model requests (a main-loop turn.step) began has
- * been read; one stored after the last request has not, and when the turn
- * ends it is pointed to with a short prompt; one whose append failed is sent
- * whole. Every notice thus reaches the model exactly once.
+ * Each model alias is a native agent type, `codex:<alias>`. Its subagent is a
+ * wrapper: the plugin starts the Codex turn with the spawn's own prompt, and
+ * answers every model request of the wrapper's loop itself (turn.step), so no
+ * Claude model reads or rewrites the task or the result.
  */
-export class WakeLedger {
-  private entries: { name: string; text: string; state: 'pending' | 'stored' | 'failed' | 'seen' }[] = []
+export const AGENT_PREFIX = 'codex:'
+export const AWAIT_TOOL = `${PREFIX}codex_await`
+/** The wrapper's Claude model: named because the definition needs one, and never called. */
+export const WRAPPER_MODEL = 'haiku'
+/** How a background subagent hands its report back where the engine requires it (auto mode); elsewhere its final text is the report. */
+export const HANDBACK_TOOL = 'SubagentHandback'
 
-  add(name: string, text: string): number {
-    this.entries.push({ name, text, state: 'pending' })
-    return this.entries.length - 1
-  }
+type AgentSpec = Parameters<EngineInterface['agent']['register']>[0]
 
-  settle(index: number, isStored: boolean): void {
-    const entry = this.entries[index]
-    if (entry && entry.state === 'pending') entry.state = isStored ? 'stored' : 'failed'
-  }
+/** The alias a `codex:<alias>` agent type names, or undefined for any other type. */
+export const aliasOfType = (subagentType: string): string | undefined => {
+  if (!subagentType.startsWith(AGENT_PREFIX)) return undefined
+  const alias = subagentType.slice(AGENT_PREFIX.length)
+  return alias in MODEL_ALIASES ? alias : undefined
+}
 
-  /** A main-loop model request began: every stored notice is in it. */
-  step(): void {
-    for (const entry of this.entries) if (entry.state === 'stored') entry.state = 'seen'
-  }
+const MODEL_NOTES: Record<string, string> = { luna: ' (fast, cheap)', sol: ' (strongest)' }
 
-  /** At turn end: the prompt to submit (or null), and the ledger cleared. */
-  flush(): string | null {
-    const unread = this.entries.filter(entry => entry.state === 'stored' || entry.state === 'pending')
-    const failed = this.entries.filter(entry => entry.state === 'failed')
-    this.entries = []
-    const parts = failed.map(entry => entry.text)
-    if (unread.length > 0) {
-      parts.push(
-        `Codex agent${unread.length > 1 ? 's' : ''} ${unread.map(entry => entry.name).join(', ')} finished while your last turn was ending; the result notice is in the conversation above.`,
-      )
-    }
-    return parts.length > 0 ? parts.join('\n\n') : null
-  }
+const effortsOf = (alias: string): string => (alias === 'luna' ? 'low|medium|high|xhigh|max' : 'low|medium|high|xhigh|max|ultra')
 
-  reset(): void {
-    this.entries = []
+/** The listing line the main model reads for `codex:<alias>`; `defaults` are the effective ones at session start. */
+export function agentDescription(alias: string, defaults: Defaults): string {
+  const model = MODEL_ALIASES[alias] as string
+  return [
+    `OpenAI Codex agent on ${model}${MODEL_NOTES[alias] ?? ''}. Use it like general-purpose for a complete, self-contained task, but the work is done by OpenAI Codex, not Claude: Codex gets your prompt verbatim and sees nothing of this conversation, and its final message comes back verbatim as this agent's result.`,
+    'It always runs in the background.',
+    'Optional header lines at the very top of the prompt, one "key: value" each, are stripped before Codex sees it:',
+    `"effort: ${effortsOf(alias)}" (default ${defaults.effort});`,
+    `"sandbox: read-only|workspace-write|full-access" (OS-enforced; workspace-write writes only inside the cwd plus /tmp; default ${defaults.sandbox});`,
+    `"approvals: auto|ask|never|yolo" (default ${defaults.approvals}; auto: Codex's own reviewer decides escalations, looser than Claude's auto mode; ask: the user approves each in a dialog; never: the sandbox alone decides; yolo: no sandbox and no approvals, ONLY when the user explicitly asked for it in this request).`,
+    `A project may set its own defaults in ${PROJECT_CONFIG}.`,
+    'Codex may message you mid-task (a question, a blocker, an interim finding) as a message from this agent. SendMessage to the agent steers its running Codex turn (so a reply reaches Codex at once), or starts a new turn on the same Codex thread once it finished; TaskStop interrupts the Codex turn.',
+  ].join(' ')
+}
+
+/** What the wrapper's model would follow if it ever ran (only when the plugin's turn.step hook failed). */
+export const WRAPPER_PROMPT = [
+  'You relay one OpenAI Codex job that the codex plugin has already started with your task.',
+  `Call the ${AWAIT_TOOL} tool with no arguments: it blocks until the Codex turn ends. While it says the job is still running, call it again.`,
+  'When it returns a message from Codex for the main session, send exactly that text with SendMessage to "main", then call it again.',
+  `When it returns the result, deliver exactly that text, nothing added, removed or reworded: with ${HANDBACK_TOOL} when you have that tool, else as your reply.`,
+  'Never do the task yourself and never call any other tool.',
+].join(' ')
+
+export const agentSpecs = (defaults: Defaults): AgentSpec[] =>
+  Object.keys(MODEL_ALIASES).map(alias => ({
+    name: alias,
+    description: agentDescription(alias, defaults),
+    prompt: WRAPPER_PROMPT,
+    tools: [AWAIT_TOOL, 'SendMessage', HANDBACK_TOOL],
+    model: WRAPPER_MODEL,
+    background: true,
+    omitClaudeMd: true,
+  }))
+
+const HEADER_KEYS = ['effort', 'sandbox', 'approvals'] as const
+type HeaderKey = (typeof HEADER_KEYS)[number]
+export type PromptHeader = Partial<Record<HeaderKey, string>> & { body: string }
+
+const HEADER_LINE = /^[ \t]*(effort|sandbox|approvals)[ \t]*:[ \t]*(\S+)[ \t]*$/i
+
+/** Reads the `effort:`, `sandbox:` and `approvals:` lines at the top of a prompt; `body` is the rest, as given. */
+export function parseHeader(prompt: string): PromptHeader {
+  const lines = prompt.split('\n')
+  const header: PromptHeader = { body: prompt }
+  let count = 0
+  for (const line of lines) {
+    const match = HEADER_LINE.exec(line)
+    if (!match) break
+    const key = (match[1] as string).toLowerCase() as HeaderKey
+    if (header[key] !== undefined) throw new CodexError(`the prompt's header sets ${key} twice`)
+    header[key] = (match[2] as string).toLowerCase()
+    count += 1
   }
+  if (count > 0) header.body = lines.slice(count).join('\n').replace(/^(?:[ \t]*\n)+/, '')
+  return header
+}
+
+/** The wrapper's final answer once the Codex turn ended: on success the Codex final message, verbatim. */
+export function wrapperAnswer(agent: CodexAgent): string {
+  if (agent.status === 'failed') return `Codex failed: ${agent.error ?? 'the turn failed'}`
+  if (agent.status === 'interrupted') return agent.error ? `Codex turn interrupted: ${agent.error}` : 'Codex turn interrupted.'
+  return agent.lastMessage || '(Codex finished without a final message.)'
 }
 
 // ------------------------------------------------------------ texts
@@ -514,101 +578,83 @@ export function resultText(agent: CodexAgent, full: boolean, now: number): strin
   return lines.join('\n')
 }
 
-export const WAKE_PATTERN = /^Codex agent (\S+) \(([^)]+)\) finished: (\w+)/
+// ------------------------------------------------------------ transcript rows
 
-export const wakeText = (agent: CodexAgent): string =>
-  `Codex agent ${agent.name} (${agent.model}) finished: ${agent.lastTurnStatus ?? agent.status}` +
-  ` after ${elapsed(agent.turnStartedAt, agent.turnEndedAt)}.` +
-  `${agent.error ? ` Error: ${agent.error}.` : ''} Result: ${clip(agent.lastMessage || '(no message)', 1500)}` +
-  `\n(id ${agent.id}; codex_result with full=true lists its commands and file changes, codex_send continues it.)`
+export type ToolName = 'codex_list' | 'codex_result' | 'codex_await'
 
-export const spawnedText = (agent: CodexAgent): string =>
-  `Spawned Codex agent ${agent.name} (id ${agent.id}) on ${agent.model}, effort ${agent.effort}, sandbox ${agent.sandbox}, approvals ${agent.approvals}, cwd ${agent.cwd}. ` +
-  'It is working in the background; you will be notified with its result when it finishes. Do not poll: continue with other work, or codex_wait if there is nothing else to do.'
+/** The short task label: the spawn's `description`, else its prompt's first line. */
+export const taskLabel = (input: { description?: string; prompt?: string }): string =>
+  firstLine(input.description ?? '') || clip(firstLine(input.prompt ?? ''), 80)
+
+/** A tool's result as text: a plugin tool's is a string, or text blocks. */
+export function outputText(output: unknown): string {
+  if (typeof output === 'string') return output
+  if (Array.isArray(output)) return output.map(part => (part as { text?: unknown }).text).filter(text => typeof text === 'string').join('\n')
+  if (typeof output === 'object' && output !== null && typeof (output as { text?: unknown }).text === 'string') return (output as { text: string }).text
+  return ''
+}
+
+/** What goes in a row's parentheses: the verb and the agent addressed. */
+export function rowArgs(tool: ToolName, input: Record<string, unknown>): string {
+  const verb = tool.slice('codex_'.length)
+  return typeof input.id === 'string' && input.id.trim() ? `${verb} ${input.id.trim()}` : verb
+}
+
+export const STILL_RUNNING = 'Codex is still running'
+
+/** The row's result line once the call succeeded, read from the model's text: main text and a dim tail. */
+export function rowResult(tool: ToolName, text: string): { main: string; dim: string } {
+  switch (tool) {
+    case 'codex_list': {
+      const lines = text.split('\n').filter(line => / \[[^\]]*\] \w+/.test(line))
+      if (lines.length === 0) return { main: 'No agents', dim: '' }
+      const running = lines.filter(line => /\] (running|starting)\b/.test(line)).length
+      return { main: `${lines.length} agent${lines.length === 1 ? '' : 's'} · ${running} running`, dim: '' }
+    }
+    case 'codex_result': {
+      const status = /\] (\w+)/.exec(text)?.[1] ?? 'done'
+      const final = /^Final message:\n(.*)$/m.exec(text)?.[1]
+      return { main: status === 'idle' ? 'done' : status, dim: final ? ` · ${firstLine(final)}` : '' }
+    }
+    case 'codex_await':
+      return text.startsWith(STILL_RUNNING) ? { main: 'still running', dim: '' } : { main: 'done', dim: ` · ${firstLine(text)}` }
+  }
+}
+
+/** The footer text while agents run, beside the prompt's hint line; undefined when none run. */
+export function runningTail(agents: CodexAgent[]): string | undefined {
+  const live = agents.filter(isLive)
+  if (live.length === 0) return undefined
+  if (live.length > 3) return `${live.length} codex agents running · /codex`
+  return `codex: ${live.map(agent => `${agent.name} (${aliasOf(agent.model)})`).join(' · ')}`
+}
 
 // ------------------------------------------------------------ tool specs
 
-/** The tool specs; `defaults` are the effective ones (project config over userConfig) at session start. */
-export function toolSpecs(defaults: Defaults): ToolSpec[] {
-  const id = { type: 'string', description: 'The agent id or name (from codex_spawn or codex_list).' }
-  return [
-    {
-      name: 'codex_spawn',
-      description: [
-        'Launch an OpenAI Codex agent as a background worker on a task, like the Agent tool but run by Codex.',
-        'Returns at once with the agent id; the agent works in the background and you are notified with its result when it finishes (do not poll).',
-        'Write a complete, self-contained prompt: the agent sees nothing of this conversation.',
-        `model: luna (fast, cheap), sol (strongest), astra, terra, or a full Codex model id; default ${defaults.model}.`,
-        `effort: thinking effort low, medium, high, xhigh, max (every model) or ultra (not luna); default ${defaults.effort}.`,
-        `sandbox (OS-enforced): read-only, workspace-write (writes only inside cwd, plus /tmp and $TMPDIR as Codex allows by default), full-access; default ${defaults.sandbox}.`,
-        `approvals: auto (Codex's own reviewer decides on escalations; in testing it approved writes outside the workspace, so it is looser than Claude's auto mode), ask (the user approves each escalation in a dialog), never (no escalation, the sandbox alone decides), yolo (full bypass: no sandbox and no approvals; pass it ONLY when the user explicitly asked for it in this request, never on your own initiative); default ${defaults.approvals}.`,
-        `Per-project defaults for model, effort, sandbox and approvals can be set in ${PROJECT_CONFIG} (a project may make yolo its default); explicit arguments override them.`,
-        'Follow up with codex_send (steer or continue), codex_stop, codex_result, codex_list, codex_wait.',
-      ].join(' '),
-      inputSchema: {
-        type: 'object',
-        properties: {
-          prompt: { type: 'string', description: 'The task for the agent.' },
-          name: { type: 'string', description: 'A short name to address it by (default: the model alias, numbered).' },
-          model: { type: 'string', description: `luna, sol, astra, terra or a full model id. Default ${defaults.model}.` },
-          effort: {
-            type: 'string',
-            enum: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
-            description: `Thinking effort. Default ${defaults.effort}. ultra is not available on luna.`,
-          },
-          sandbox: { type: 'string', enum: SANDBOXES, description: `Default ${defaults.sandbox}.` },
-          approvals: {
-            type: 'string',
-            enum: APPROVALS,
-            description: `Default ${defaults.approvals}. yolo only on the user's explicit request (it implies sandbox full-access).`,
-          },
-          cwd: { type: 'string', description: "Absolute working directory (the writable workspace). Default: this session's directory." },
-        },
-        required: ['prompt'],
-      },
+const ID_PARAM = { type: 'string', description: "The agent id (the codex:* agent's agentId) or its name, as codex_list shows them." }
+
+export const TOOL_SPECS: ToolSpec[] = [
+  {
+    name: 'codex_list',
+    description: 'List the Codex jobs (codex:* agents) with model, status and what each is doing.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'codex_result',
+    description:
+      "Read a Codex job's result: its status and the final message of the last turn. With full=true also a digest of the turn: commands with exit codes, file changes and messages.",
+    inputSchema: {
+      type: 'object',
+      properties: { id: ID_PARAM, full: { type: 'boolean', description: 'Include the turn digest.' } },
+      required: ['id'],
     },
-    {
-      name: 'codex_send',
-      description:
-        'Send a message to a Codex agent. While it is running the message is steered into the current turn (it reads it between steps); when it is idle, stopped or failed it starts a new turn on the same thread, keeping its history, sandbox and approvals. You are notified when that turn finishes.',
-      inputSchema: {
-        type: 'object',
-        properties: { id, message: { type: 'string', description: 'What to tell the agent.' } },
-        required: ['id', 'message'],
-      },
-    },
-    {
-      name: 'codex_stop',
-      description: "Interrupt a running Codex agent's current turn. The thread stays usable: codex_send continues it.",
-      inputSchema: { type: 'object', properties: { id }, required: ['id'] },
-    },
-    {
-      name: 'codex_list',
-      description: 'List the Codex agents with model, status and what each is doing.',
-      inputSchema: { type: 'object', properties: {} },
-    },
-    {
-      name: 'codex_result',
-      description:
-        "Read a Codex agent's result: its status and the final message of the last turn. With full=true also a digest of the turn: commands with exit codes, file changes and messages.",
-      inputSchema: {
-        type: 'object',
-        properties: { id, full: { type: 'boolean', description: 'Include the turn digest.' } },
-        required: ['id'],
-      },
-    },
-    {
-      name: 'codex_wait',
-      description:
-        'Block until a running Codex agent finishes its turn (or the timeout passes) and return its result. Only when you have nothing else to do: otherwise keep working, you are notified anyway.',
-      inputSchema: {
-        type: 'object',
-        properties: { id, timeoutSec: { type: 'number', description: 'Seconds to wait, default 600, at most 3600.' } },
-        required: ['id'],
-      },
-    },
-  ]
-}
+  },
+  {
+    name: 'codex_await',
+    description: "Internal to codex:* agents, which call it themselves: blocks until the agent's Codex turn ends. Never call it.",
+    inputSchema: { type: 'object', properties: {} },
+  },
+]
 
 export const COMMAND = {
   name: 'codex',
@@ -636,3 +682,6 @@ export function withoutRule(text: string, n: number): { text: string; removed: s
   lines.splice(target.line, 1)
   return { text: lines.join('\n'), removed: target.rule }
 }
+
+/** The label of the wrapper's own SendMessage row (not sent: the message is). */
+export const messageSummary = (text: string): string => `Codex: ${clip(firstLine(text), 60)}`
