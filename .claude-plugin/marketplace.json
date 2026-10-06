@@ -1,0 +1,6 @@
+{
+  "name": "codex-plugin",
+  "description": "Run OpenAI Codex agents from Claude Code like background subagents.",
+  "owner": { "name": "SSS135" },
+  "plugins": [{ "name": "codex", "source": "./" }]
+}

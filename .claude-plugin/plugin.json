@@ -1,0 +1,68 @@
+{
+  "name": "codex",
+  "version": "0.1.0",
+  "author": {
+    "name": "SSS135"
+  },
+  "description": "Run OpenAI Codex agents as background workers: spawn, message, steer, stop, resume and read them, with approvals, a live pane and wake-on-completion.",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "codexPath": {
+      "type": "string",
+      "title": "Codex binary",
+      "description": "Path to the codex CLI binary (needs `codex app-server`). When this path does not exist, `codex` is looked up on PATH.",
+      "default": "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"
+    },
+    "nodePath": {
+      "type": "string",
+      "title": "Node binary",
+      "description": "Node 18+ used to run the bridge process. When this path does not exist, `node` is looked up on PATH.",
+      "default": "/opt/homebrew/bin/node"
+    },
+    "defaultModel": {
+      "type": "string",
+      "title": "Default model",
+      "description": "Model when codex_spawn names none: luna, sol, astra, terra or a full model id.",
+      "default": "gpt-6.1-sol"
+    },
+    "defaultEffort": {
+      "type": "string",
+      "title": "Default effort",
+      "description": "Reasoning effort when codex_spawn names none.",
+      "default": "high",
+      "options": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ]
+    },
+    "defaultSandbox": {
+      "type": "string",
+      "title": "Default sandbox",
+      "description": "Sandbox when codex_spawn names none.",
+      "default": "workspace-write",
+      "options": [
+        "read-only",
+        "workspace-write",
+        "full-access"
+      ]
+    },
+    "defaultApprovals": {
+      "type": "string",
+      "title": "Default approvals",
+      "description": "auto: Codex's own reviewer decides on escalations (looser than Claude auto mode); ask: you approve each in a dialog; never: the sandbox alone decides. The full bypass, yolo, is never a user-wide default: only an explicit request or a project's .claude/codex.json sets it.",
+      "default": "auto",
+      "options": [
+        "auto",
+        "ask",
+        "never"
+      ]
+    }
+  },
+  "homepage": "https://github.com/SSS135/claude-code-codex-plugin",
+  "repository": "https://github.com/SSS135/claude-code-codex-plugin",
+  "license": "MIT"
+}
