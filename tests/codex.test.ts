@@ -2,7 +2,7 @@ import type { On, SessionMessage, TurnStepChunk, TurnStepResult } from 'claude-c
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
 
-import { agentDescription, agentSpecs, approvalAnswer, approvalOptions, bridgeTarget, configDirs, effectiveDefaults, effortFor, listText, parseHeader, permissionsFor, shortCommand, wrapperAnswer } from '../hooks/model'
+import { agentDescription, agentSpecs, aliasOf, approvalAnswer, approvalOptions, bridgeTarget, configDirs, effectiveDefaults, effortFor, listText, modelEffortError, modelFor, parseHeader, permissionsFor, shortCommand, UPDATE_HINT, wrapperAnswer } from '../hooks/model'
 import type { CodexAgent } from '../types'
 
 // A fake bridge: the relay's stdout is a queue the test pushes NDJSON into,
@@ -50,6 +50,10 @@ type Fake = {
   store: Record<string, unknown>
   /** Where each bridge fetch went: `<socketPath> <url>`. */
   targets: string[]
+  /** Transcript lines and toasts the person saw. */
+  shown: string[]
+  /** What model/list answers, newest first: [id, efforts]. */
+  models: [string, string[]][]
   clock: MockClock
 }
 
@@ -85,6 +89,11 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
     registeredAgents: [],
     store: { ...stored },
     targets: [],
+    shown: [],
+    models: [
+      ['gpt-6-luna', EFFORTS],
+      ['gpt-6.1-sol', [...EFFORTS, 'ultra']],
+    ],
     clock: mock.clock(on, { now: 1_000_000 }),
   }
   // The engine beneath the plugin.
@@ -120,7 +129,14 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
   on('session.root', () => ({ value: '/work' }))
   on('fs.exists', (_$, e) => ({ value: posixPath(e.path) in fake.files }))
   on('fs.read', (_$, e) => (posixPath(e.path) in fake.files ? { value: fake.files[posixPath(e.path)] as string } : { deny: `no file ${e.path}` }))
-  on('ui.log', () => ({ value: undefined }))
+  on('ui.log', (_$, e) => {
+    if (e.to === 'transcript') fake.shown.push(e.text)
+    return { value: undefined }
+  })
+  on('ui.toast', (_$, e) => {
+    fake.shown.push(`toast: ${e.text}`)
+    return { value: undefined }
+  })
 
   // The store, answered here so the test can read what the plugin mirrors into it.
   on('store.get', (_$, e) => ({ value: fake.store[e.key] }))
@@ -146,10 +162,7 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
     switch (rpc.method) {
       case 'model/list':
         return {
-          data: [
-            { id: 'gpt-6-luna', supportedReasoningEfforts: EFFORTS.map(reasoningEffort => ({ reasoningEffort })) },
-            { id: 'gpt-6.1-sol', supportedReasoningEfforts: [...EFFORTS, 'ultra'].map(reasoningEffort => ({ reasoningEffort })) },
-          ],
+          data: fake.models.map(([id, efforts]) => ({ id, supportedReasoningEfforts: efforts.map(reasoningEffort => ({ reasoningEffort })) })),
           nextCursor: null,
         }
       case 'thread/start':
@@ -679,6 +692,59 @@ test("Windows bridge: requests go to the daemon's loopback URL under its secret,
   for (const target of fake.targets) expect(target).toMatch(/^ http:\/\/127\.0\.0\.1:5000\/s3cret\/(rpc|wait)$/)
   const started = fake.rpcs.find(rpc => rpc.method === 'thread/start')?.params as { config: { mcp_servers: Record<string, { args: string[] }> } }
   expect(started.config.mcp_servers.claude_session?.args.slice(1)).toEqual(['http://127.0.0.1:5000/s3cret', String(agent.msgKey)])
+  done(fake)
+})
+
+test('the agent listing: sol is the default, luna for searches and easy work, astra and terra only when asked', () => {
+  const defaults = effectiveDefaults({ codexPath: 'c', nodePath: 'n', defaultEffort: undefined, defaultSandbox: 'workspace-write', defaultApprovals: 'auto' }, {})
+  expect(agentDescription('sol', defaults)).toContain('Default')
+  expect(agentDescription('sol', defaults)).toContain('gpt-6.1-sol')
+  expect(agentDescription('luna', defaults)).toContain('searches')
+  for (const alias of ['astra', 'terra']) expect(agentDescription(alias, defaults)).toContain('ONLY when the user explicitly asks')
+})
+
+test('an older Codex CLI: each alias falls back to the newest model of its family; with none the error says to update', () => {
+  // As codex-cli 0.153 lists them, newest first.
+  const old = new Map(['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5-luna'].map(id => [id, EFFORTS]))
+  expect(['luna', 'sol', 'astra', 'terra'].map(alias => modelFor(old, alias))).toEqual(['gpt-5.6-luna', 'gpt-5.6-sol', 'gpt-6-astra', 'gpt-5.6-terra'])
+  // A current CLI lists the alias's own model, even behind a newer one of the family.
+  expect(modelFor(new Map([['gpt-6.1-sol', EFFORTS], ['gpt-6-sol', EFFORTS]]), 'sol')).toBe('gpt-6.1-sol')
+  expect(modelFor(new Map([['gpt-7-sol', EFFORTS], ['gpt-6.1-sol', EFFORTS]]), 'sol')).toBe('gpt-6.1-sol')
+  // No family at all: the alias's own model, which modelEffortError refuses with the update advice.
+  const none = new Map([['gpt-5.5', EFFORTS]])
+  expect(modelFor(none, 'luna')).toBe('gpt-6-luna')
+  expect(modelEffortError(none, 'gpt-6-luna', 'max')).toContain(UPDATE_HINT)
+  expect(modelEffortError(none, 'some-model', 'max')).not.toContain(UPDATE_HINT)
+  expect(aliasOf('gpt-5.6-luna')).toBe('luna')
+  expect(aliasOf('gpt-6.1-sol')).toBe('sol')
+  expect(aliasOf('o3')).toBe('o3')
+})
+
+test('a spawn on an older Codex CLI runs the family fallback and warns once to update', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  fake.models = [['gpt-5.6-luna', EFFORTS], ['gpt-5.6-sol', [...EFFORTS, 'ultra']]]
+  await start($, fake)
+  const first = await spawn($, fake, 'x')
+  await spawn($, fake, 'y', { subagentType: 'codex:sol' })
+  expect(fake.rpcs.filter(rpc => rpc.method === 'thread/start').map(rpc => rpc.params.model)).toEqual(['gpt-5.6-luna', 'gpt-5.6-sol'])
+  expect(first.model).toBe('gpt-5.6-luna')
+  const warnings = fake.shown.filter(line => line.includes(UPDATE_HINT))
+  expect(warnings).toEqual([
+    `codex: this Codex CLI has no gpt-6-luna, so codex:luna runs gpt-5.6-luna. ${UPDATE_HINT}`,
+    `toast: codex: this Codex CLI has no gpt-6-luna, so codex:luna runs gpt-5.6-luna. ${UPDATE_HINT}`,
+  ])
+  // The listing still names the intended model.
+  expect(String(fake.registeredAgents[1]?.description)).toContain('gpt-6.1-sol')
+  done(fake)
+})
+
+test('a spawn whose alias has no model of its family on this Codex CLI is refused with the update advice', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  fake.models = [['gpt-5.5', EFFORTS]]
+  await start($, fake)
+  const refused = await $.agent.spawn(spawnInput('x'))
+  expect(refused.deny).toContain('Unknown Codex model "gpt-6-luna"')
+  expect(refused.deny).toContain(UPDATE_HINT)
   done(fake)
 })
 

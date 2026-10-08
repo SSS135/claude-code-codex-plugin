@@ -31,6 +31,10 @@ Each agent type's description in Claude's agent listing opens with when to use i
 | `codex:astra` | `gpt-6-astra` | high | Only when you ask for astra explicitly. |
 | `codex:terra` | `gpt-5.6-terra` | high | Only when you ask for terra explicitly. |
 
+In short: `codex:sol` is the default for normal tasks, `codex:luna` is for fast searches and easy mechanical tasks, and `codex:astra` and `codex:terra` run only when you explicitly ask for them.
+
+An older Codex CLI that lacks an agent type's model runs the newest model of the same family it lists instead (`codex:luna` on `gpt-5.6-luna`), and the plugin says once per load, in the transcript and a toast, that the CLI should be updated (`npm i -g @openai/codex@latest`, or update the ChatGPT app on macOS). With no model of that family, the Agent call is refused with the same advice.
+
 What happens then:
 
 - The plugin starts the Codex thread and turn itself, with the Agent call's prompt exactly as given (header lines taken off), in the Agent call's `cwd` or the session's. Nothing is relayed through a Claude model.

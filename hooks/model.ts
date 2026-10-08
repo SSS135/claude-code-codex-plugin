@@ -47,9 +47,26 @@ export const MODEL_EFFORTS: Record<string, string> = { luna: 'max', sol: 'high',
 /** The defaultEffort userConfig value (its default) that leaves effort to MODEL_EFFORTS. */
 export const PER_MODEL_EFFORT = 'per-model'
 
-export const resolveModel = (model: string): string => MODEL_ALIASES[model] ?? model
+/** The alias a model id belongs to, by its family suffix (`gpt-5.6-luna` is luna too); else the id. */
 export const aliasOf = (model: string): string =>
-  Object.entries(MODEL_ALIASES).find(([, id]) => id === model)?.[0] ?? model
+  Object.keys(MODEL_ALIASES).find(alias => model === MODEL_ALIASES[alias] || model.endsWith(`-${alias}`)) ?? model
+
+export const UPDATE_HINT = 'Update the Codex CLI: npm i -g @openai/codex@latest, or update the ChatGPT app on macOS.'
+
+/**
+ * The model a `codex:<alias>` spawn runs: the alias's own when this Codex CLI
+ * lists it, else (an older CLI) the first listed, newest, of the alias's family,
+ * else the alias's own, which modelEffortError then refuses.
+ */
+export const modelFor = (models: Map<string, string[]>, alias: string): string => {
+  const wanted = MODEL_ALIASES[alias] as string
+  if (models.has(wanted)) return wanted
+  return [...models.keys()].find(id => id.endsWith(`-${alias}`)) ?? wanted
+}
+
+/** The warning when an older Codex CLI made a spawn fall back to `used`. */
+export const fallbackWarning = (alias: string, used: string): string =>
+  `codex: this Codex CLI has no ${MODEL_ALIASES[alias]}, so codex:${alias} runs ${used}. ${UPDATE_HINT}`
 
 // ------------------------------------------------------------ text helpers
 
@@ -174,7 +191,11 @@ export const turnStartParams = (agent: CodexAgent, text: string) => ({
 /** Undefined when the pair fits; otherwise the error naming the valid choices. */
 export const modelEffortError = (models: Map<string, string[]>, model: string, effort: string): string | undefined => {
   const efforts = models.get(model)
-  if (!efforts) return `Unknown Codex model "${model}". Use luna, sol, astra, terra or one of: ${[...models.keys()].join(', ')}.`
+  if (!efforts) {
+    // An alias's own model, missing with no family fallback: the CLI predates it.
+    const hint = Object.values(MODEL_ALIASES).includes(model) ? ` This Codex CLI is too old for it. ${UPDATE_HINT}` : ''
+    return `Unknown Codex model "${model}". Use luna, sol, astra, terra or one of: ${[...models.keys()].join(', ')}.${hint}`
+  }
   if (!efforts.includes(effort)) return `Model ${model} does not take effort "${effort}". Its efforts: ${efforts.join(', ')}.`
   return undefined
 }
