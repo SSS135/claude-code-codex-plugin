@@ -19,7 +19,11 @@
 //           running turns) must outlive that.
 //   daemon: node bridge.mjs --daemon <codexPath> <dir>
 //           Owns one `codex app-server --listen stdio://` and serves HTTP on
-//           the Unix socket <dir>/s:
+//           the Unix socket <dir>/s. On Windows, where Node cannot listen on a
+//           Unix socket and the plugin's fetch refuses a named pipe, it serves
+//           on a loopback port instead and writes its address to <dir>/s:
+//           http://127.0.0.1:<port>/<secret>, every path under the secret.
+//           That address stands wherever a socket path goes below.
 //             GET  /health
 //             GET  /events           NDJSON stream (one subscriber, the relay)
 //             POST /rpc   {method, params, timeoutMs?} -> {result} | {error}
@@ -36,10 +40,11 @@
 //           directory is the bare session key) once it has seen them run no
 //           turn for LEGACY_IDLE_MS.
 
-import { spawn } from 'node:child_process'
-import { createHash } from 'node:crypto'
+import { spawn, spawnSync } from 'node:child_process'
+import { createHash, randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import http from 'node:http'
+import os from 'node:os'
 import path from 'node:path'
 import readline from 'node:readline'
 import { fileURLToPath } from 'node:url'
@@ -59,6 +64,54 @@ const SELF = fileURLToPath(import.meta.url)
 const BUILD = createHash('sha256').update(SELF).update(fs.readFileSync(SELF)).digest('hex').slice(0, 8)
 /** A daemon directory of a build before BUILD was part of it: the session key alone. */
 const isLegacyDir = name => /^[A-Za-z0-9]+$/.test(name)
+const IS_WINDOWS = process.platform === 'win32'
+
+/** Where the daemon in `dir` listens: its Unix socket, or on Windows the loopback address it wrote to <dir>/s (null before it did). */
+const addressOf = dir => {
+  const file = path.join(dir, 's')
+  if (!IS_WINDOWS) return file
+  try {
+    return fs.readFileSync(file, 'utf8') || null
+  } catch {
+    return null
+  }
+}
+
+/** Ends a process. On Windows a killed process leaves its children running, so its whole tree goes, by force: there is no SIGTERM to catch. */
+const stopTree = pid => {
+  try {
+    if (IS_WINDOWS) spawnSync('taskkill', ['/pid', String(pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true })
+    else process.kill(pid, 'SIGTERM')
+  } catch {}
+}
+
+const isAlive = pid => {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return error.code === 'EPERM'
+  }
+}
+
+/**
+ * The file and leading arguments that run `codexPath`. On Windows a bare name
+ * or npm's codex.cmd shim cannot run without a shell, so it becomes the npm
+ * package's codex.js on this node, or a codex.exe, found beside the given
+ * path or on PATH.
+ */
+const codexCommand = codexPath => {
+  if (!IS_WINDOWS || /\.exe$/i.test(codexPath)) return [codexPath, []]
+  if (/\.[cm]?js$/i.test(codexPath)) return [process.execPath, [codexPath]]
+  const dirs = path.isAbsolute(codexPath) ? [path.dirname(codexPath)] : (process.env.PATH ?? '').split(path.delimiter).filter(Boolean)
+  for (const dir of dirs) {
+    const script = path.join(dir, 'node_modules', '@openai', 'codex', 'bin', 'codex.js')
+    if (fs.existsSync(script)) return [process.execPath, [script]]
+    const exe = path.join(dir, 'codex.exe')
+    if (fs.existsSync(exe)) return [exe, []]
+  }
+  return [codexPath, []]
+}
 
 // Notifications the plugin never reads: streaming deltas and chatter.
 const NOISE = new Set([
@@ -104,8 +157,11 @@ const sendJson = (res, status, value) => {
 
 async function daemon(codexPath, dir) {
   const socketPath = path.join(dir, 's')
-  const codex = spawn(codexPath, ['app-server', '--listen', 'stdio://'], {
+  const secret = IS_WINDOWS ? randomBytes(16).toString('hex') : null
+  const [file, leading] = codexCommand(codexPath)
+  const codex = spawn(file, [...leading, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
   })
   // A codex that cannot start: say why in daemon.log (the relay reports its tail).
   codex.on('error', error => {
@@ -212,7 +268,7 @@ async function daemon(codexPath, dir) {
   }
 
   const shutdown = code => {
-    if (codex.exitCode === null && codex.signalCode === null) codex.kill('SIGTERM')
+    if (codex.exitCode === null && codex.signalCode === null) stopTree(codex.pid)
     cleanup()
     // End the relay's stream before exiting, so the relay reads an ordinary end, not a reset.
     if (subscriber) subscriber.end()
@@ -247,6 +303,11 @@ async function daemon(codexPath, dir) {
   const server = http.createServer(async (req, res) => {
     try {
       const url = new URL(req.url ?? '/', 'http://bridge')
+      // On Windows any local process or web page reaches the port: only the secret's holders get past it.
+      if (secret) {
+        if (!url.pathname.startsWith(`/${secret}/`)) return sendJson(res, 403, { error: { message: 'forbidden' } })
+        url.pathname = url.pathname.slice(secret.length + 1)
+      }
       if (url.pathname !== '/events') {
         inFlight += 1
         lastUse = Date.now()
@@ -337,13 +398,20 @@ async function daemon(codexPath, dir) {
   })
   server.requestTimeout = 0
   server.headersTimeout = 0
-  try {
-    fs.unlinkSync(socketPath)
-  } catch {}
-  server.listen(socketPath, () => {
-    fs.chmodSync(socketPath, 0o600)
-    armGrace()
-  })
+  if (secret) {
+    server.listen(0, '127.0.0.1', () => {
+      fs.writeFileSync(socketPath, `http://127.0.0.1:${server.address().port}/${secret}`)
+      armGrace()
+    })
+  } else {
+    try {
+      fs.unlinkSync(socketPath)
+    } catch {}
+    server.listen(socketPath, () => {
+      fs.chmodSync(socketPath, 0o600)
+      armGrace()
+    })
+  }
 
   // Legacy daemon directory -> since when its daemon has been seen running no turn.
   const legacyIdleSince = new Map()
@@ -351,7 +419,7 @@ async function daemon(codexPath, dir) {
     const base = path.dirname(dir)
     const now = Date.now()
     for (const name of fs.readdirSync(base).filter(isLegacyDir)) {
-      const health = await readHealth(path.join(base, name, 's'))
+      const health = await readHealth(addressOf(path.join(base, name)))
       if (!health || Object.keys(health.active ?? {}).length > 0) {
         legacyIdleSince.delete(name)
         continue
@@ -367,7 +435,7 @@ async function daemon(codexPath, dir) {
       } catch {}
       if (recorded !== String(health.pid)) continue
       process.stderr.write(`stopping idle daemon ${name} (pid ${health.pid}) of an older bridge build\n`)
-      process.kill(health.pid, 'SIGTERM')
+      stopTree(health.pid)
     }
   }
   setInterval(() => {
@@ -379,9 +447,11 @@ async function daemon(codexPath, dir) {
 
 // ---------------------------------------------------------------- relay
 
+/** `socketPath` is a daemon's address (addressOf): a Unix socket, or a loopback URL. */
 const request = (socketPath, method, urlPath, timeoutMs) =>
   new Promise((resolve, reject) => {
-    const req = http.request({ socketPath, method, path: urlPath, timeout: timeoutMs }, resolve)
+    const [url, via] = /^https?:/.test(socketPath) ? [`${socketPath}${urlPath}`, {}] : [`http://bridge${urlPath}`, { socketPath }]
+    const req = http.request(url, { ...via, method, timeout: timeoutMs }, resolve)
     req.on('timeout', () => req.destroy(new Error('timeout')))
     req.on('error', reject)
     req.end()
@@ -389,6 +459,7 @@ const request = (socketPath, method, urlPath, timeoutMs) =>
 
 /** A daemon's /health answer, or null when none answers on the socket. */
 const readHealth = async socketPath => {
+  if (!socketPath) return null
   try {
     const res = await request(socketPath, 'GET', '/health', 1000)
     res.setEncoding('utf8')
@@ -403,6 +474,12 @@ const readHealth = async socketPath => {
 const isHealthy = async socketPath => (await readHealth(socketPath)) !== null
 
 const privateBase = () => {
+  // Windows has no uid or Unix modes: the per-user temp directory is private to this user already.
+  if (IS_WINDOWS) {
+    const base = path.join(os.tmpdir(), 'cxb')
+    fs.mkdirSync(base, { recursive: true })
+    return base
+  }
   const base = `/tmp/cxb-${process.getuid()}`
   fs.mkdirSync(base, { recursive: true, mode: 0o700 })
   const stat = fs.lstatSync(base)
@@ -415,43 +492,38 @@ async function relay(codexPath, sessionKey) {
   const out = line => process.stdout.write(JSON.stringify(line) + '\n')
   process.stdout.on('error', () => process.exit(0))
   const parent = process.ppid
+  // Windows never reparents an orphan: there the parent's pid stops answering instead.
   setInterval(() => {
-    if (process.ppid !== parent) process.exit(0)
+    if (process.ppid !== parent || !isAlive(parent)) process.exit(0)
   }, 1000).unref()
   for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => process.exit(0))
 
   const key = sessionKey.replace(/[^A-Za-z0-9]/g, '').slice(0, 16) || 'default'
   const dir = path.join(privateBase(), `${key}-${BUILD}`)
-  const socketPath = path.join(dir, 's')
 
-  if (!(await isHealthy(socketPath))) {
-    fs.rmSync(dir, { recursive: true, force: true })
+  if (!(await isHealthy(addressOf(dir)))) {
+    // Retries: on Windows an exiting daemon may still hold its log open for a moment.
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 })
     fs.mkdirSync(dir, { mode: 0o700 })
-    const launcher = spawn(process.execPath, [SELF, '--launch', codexPath, dir], { detached: true, stdio: 'ignore' })
+    const launcher = spawn(process.execPath, [SELF, '--launch', codexPath, dir], { detached: true, stdio: 'ignore', windowsHide: true })
     await new Promise(resolve => launcher.on('exit', resolve))
     const daemonPid = Number(fs.readFileSync(path.join(dir, 'pid'), 'utf8'))
     const deadline = Date.now() + 30_000
-    while (!(await isHealthy(socketPath))) {
-      const isAlive = (() => {
-        try {
-          process.kill(daemonPid, 0)
-          return true
-        } catch {
-          return false
-        }
-      })()
-      if (!isAlive || Date.now() > deadline) {
+    while (!(await isHealthy(addressOf(dir)))) {
+      const isRunning = isAlive(daemonPid)
+      if (!isRunning || Date.now() > deadline) {
         let logTail = ''
         try {
           logTail = fs.readFileSync(path.join(dir, 'daemon.log'), 'utf8').slice(-2000)
         } catch {}
-        out({ type: 'fatal', message: !isAlive ? 'the daemon exited' : 'daemon did not start in 30 s', logTail })
+        out({ type: 'fatal', message: !isRunning ? 'the daemon exited' : 'daemon did not start in 30 s', logTail })
         process.exit(1)
       }
       await new Promise(resolve => setTimeout(resolve, 100))
     }
   }
 
+  const socketPath = addressOf(dir)
   const res = await request(socketPath, 'GET', '/events', 0)
   res.setEncoding('utf8')
   const lines = readline.createInterface({ input: res })
@@ -470,7 +542,7 @@ async function relay(codexPath, sessionKey) {
 
 function launch(codexPath, dir) {
   const log = fs.openSync(path.join(dir, 'daemon.log'), 'a', 0o600)
-  const daemonChild = spawn(process.execPath, [SELF, '--daemon', codexPath, dir], { detached: true, stdio: ['ignore', log, log] })
+  const daemonChild = spawn(process.execPath, [SELF, '--daemon', codexPath, dir], { detached: true, stdio: ['ignore', log, log], windowsHide: true })
   fs.writeFileSync(path.join(dir, 'pid'), String(daemonChild.pid), { mode: 0o600 })
   daemonChild.unref()
   process.exit(0)

@@ -2,7 +2,7 @@ import type { On, SessionMessage, TurnStepChunk, TurnStepResult } from 'claude-c
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
 
-import { agentDescription, agentSpecs, approvalAnswer, approvalOptions, configDirs, effectiveDefaults, effortFor, listText, parseHeader, permissionsFor, wrapperAnswer } from '../hooks/model'
+import { agentDescription, agentSpecs, approvalAnswer, approvalOptions, bridgeTarget, configDirs, effectiveDefaults, effortFor, listText, parseHeader, permissionsFor, shortCommand, wrapperAnswer } from '../hooks/model'
 import type { CodexAgent } from '../types'
 
 // A fake bridge: the relay's stdout is a queue the test pushes NDJSON into,
@@ -48,8 +48,13 @@ type Fake = {
   turnCount: number
   registeredAgents: Record<string, unknown>[]
   store: Record<string, unknown>
+  /** Where each bridge fetch went: `<socketPath> <url>`. */
+  targets: string[]
   clock: MockClock
 }
+
+/** The engine resolves a path on the host's root: on Windows '/work/x' arrives as 'C:\work\x'. */
+const posixPath = (path: string) => path.replace(/^[A-Za-z]:/, '').replaceAll('\\', '/')
 
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max']
 
@@ -79,6 +84,7 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
     waitError: null,
     registeredAgents: [],
     store: { ...stored },
+    targets: [],
     clock: mock.clock(on, { now: 1_000_000 }),
   }
   // The engine beneath the plugin.
@@ -112,8 +118,8 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
   on('session.id', () => ({ value: 'session-1' }))
   on('session.cwd', () => ({ value: '/work/app' }))
   on('session.root', () => ({ value: '/work' }))
-  on('fs.exists', (_$, e) => ({ value: e.path in fake.files }))
-  on('fs.read', (_$, e) => (e.path in fake.files ? { value: fake.files[e.path] as string } : { deny: `no file ${e.path}` }))
+  on('fs.exists', (_$, e) => ({ value: posixPath(e.path) in fake.files }))
+  on('fs.read', (_$, e) => (posixPath(e.path) in fake.files ? { value: fake.files[posixPath(e.path)] as string } : { deny: `no file ${e.path}` }))
   on('ui.log', () => ({ value: undefined }))
 
   // The store, answered here so the test can read what the plugin mirrors into it.
@@ -157,7 +163,9 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
   }
 
   on('http.fetch', (_$, e) => {
-    const path = new URL(e.url).pathname
+    fake.targets.push(`${e.init?.socketPath ?? ''} ${e.url}`)
+    // A Windows bridge's paths sit under its secret (see the Windows test).
+    const path = new URL(e.url).pathname.replace(/^\/s3cret(?=\/)/, '')
     const body = JSON.parse(e.init?.body ?? '{}') as Record<string, unknown>
     let reply: unknown = { ok: true }
     if (path === '/rpc') {
@@ -643,6 +651,35 @@ test('permissions: auto by default, yolo forces full access and refuses a contra
   expect(approvalOptions('item/fileChange/requestApproval', { proposedExecpolicyAmendment: ['x'] })).not.toContain('Allow always')
   expect(approvalAnswer('item/fileChange/requestApproval', {}, { kind: 'always' })).toEqual({ result: { decision: 'acceptForSession' } })
   expect(agentSpecs(defaults).map(spec => spec.name)).toEqual(['luna', 'sol', 'astra', 'terra'])
+})
+
+test('Windows paths: config dirs split at \\ and end at the drive; commands drop the PowerShell wrapper', () => {
+  expect(configDirs('X:\\src\\app\\lib\\', 'X:\\src')).toEqual(['X:\\src\\app\\lib', 'X:\\src\\app', 'X:\\src'])
+  expect(configDirs('X:\\elsewhere', 'X:\\src\\')).toEqual(['X:\\elsewhere', 'X:'])
+  expect(configDirs('X:\\', 'Y:\\')).toEqual(['X:'])
+  expect(configDirs('/', '/')).toEqual(['/'])
+  // As Codex 0.153 on Windows reports them.
+  const pwsh = '"C:\\\\Program Files\\\\PowerShell\\\\7\\\\pwsh.exe" -NoProfile -Command'
+  expect(shortCommand(`${pwsh} Get-Location`)).toBe('Get-Location')
+  expect(shortCommand(`${pwsh} 'Get-ChildItem -Name -Filter "*.mjs"'`)).toBe('Get-ChildItem -Name -Filter "*.mjs"')
+  expect(shortCommand(`${pwsh} "Write-Output 'it''s'"`)).toBe("Write-Output 'it''s'")
+  expect(shortCommand('C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -Command Get-Date')).toBe('Get-Date')
+  expect(shortCommand("/bin/bash -lc 'ls -la'")).toBe('ls -la')
+  expect(shortCommand('git log --grep pwsh -Command x')).toBe('git log --grep pwsh -Command x')
+  expect(bridgeTarget('/tmp/cxb-501/k/s', '/rpc')).toEqual({ url: 'http://codex/rpc', socketPath: '/tmp/cxb-501/k/s' })
+  expect(bridgeTarget('http://127.0.0.1:5000/s3cret', '/rpc')).toEqual({ url: 'http://127.0.0.1:5000/s3cret/rpc' })
+})
+
+test("Windows bridge: requests go to the daemon's loopback URL under its secret, and codex-msg gets that URL", { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
+  push(fake, { type: 'ready', socket: 'http://127.0.0.1:5000/s3cret', reattached: false, active: {} })
+  const agent = await spawn($, fake, 'x')
+  expect(fake.targets.length).toBeGreaterThan(0)
+  for (const target of fake.targets) expect(target).toMatch(/^ http:\/\/127\.0\.0\.1:5000\/s3cret\/(rpc|wait)$/)
+  const started = fake.rpcs.find(rpc => rpc.method === 'thread/start')?.params as { config: { mcp_servers: Record<string, { args: string[] }> } }
+  expect(started.config.mcp_servers.claude_session?.args.slice(1)).toEqual(['http://127.0.0.1:5000/s3cret', String(agent.msgKey)])
+  done(fake)
 })
 
 test('project config: header lines > .claude/codex.json (nearest up to the root) > userConfig', { timeoutMs: 20_000 }, async ($, on) => {

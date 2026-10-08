@@ -87,7 +87,7 @@ claude plugin install codex@codex-plugin
 - Claude Code with the hooks plugin API (function hooks, currently early access).
 - The Codex CLI with `codex app-server`. It ships inside the ChatGPT desktop app on macOS, or you can install it separately.
 - Node 18 or newer.
-- macOS or Linux, because the bridge talks over a Unix socket.
+- macOS, Linux or Windows 10/11. On Windows install the Codex CLI with `npm i -g @openai/codex` (or point `codexPath` at a `codex.exe`); Codex runs its shell commands in PowerShell there.
 
 ## Tools
 
@@ -114,7 +114,7 @@ Set these in the install screen or the plugin's config menu (`userConfig`):
 | `defaultSandbox` | `workspace-write` | read-only, workspace-write, full-access. |
 | `defaultApprovals` | `auto` | auto, ask, never. |
 
-Both path defaults are macOS paths (Apple Silicon with Homebrew). Elsewhere, either keep them and put `codex` and `node` on PATH, or set absolute paths.
+Both path defaults are macOS paths (Apple Silicon with Homebrew). Elsewhere, either keep them and put `codex` and `node` on PATH, or set absolute paths. An empty path also means PATH. On Windows npm's `codex.cmd` shim cannot run without a shell, so the bridge runs the npm package's `codex.js` with node instead, found beside a configured path or on PATH, or a `codex.exe` found there; `codexPath` may also name a `codex.exe` or `codex.js` directly.
 
 A project can set its own defaults in `.claude/codex.json`. The plugin uses the nearest one found walking up to the project root:
 
@@ -139,7 +139,7 @@ When a setting comes from several places, the prompt's header lines beat the pro
   <img src="./assets/readme/architecture.svg" width="100%" alt="The hooks module in Claude Code sends requests over HTTP on a Unix socket to a detached daemon, which runs codex app-server over stdio. The relay, bin/bridge.mjs, reads the daemon's event stream and passes it back to the hooks module as NDJSON on stdout.">
 </p>
 
-The hooks module starts `bin/bridge.mjs` as a relay (and Codex starts `bin/codex-msg` per thread, which posts to the same socket). The relay launches a detached daemon, or reattaches to one that is still running. The daemon owns `codex app-server` and serves an HTTP API on a Unix socket under `/tmp/cxb-<uid>/` (mode 0700, owned by your user). The module sends requests over that socket, and the relay streams the daemon's events back to it as NDJSON on stdout.
+The hooks module starts `bin/bridge.mjs` as a relay (and Codex starts `bin/codex-msg` per thread, which posts to the same socket). The relay launches a detached daemon, or reattaches to one that is still running. The daemon owns `codex app-server` and serves an HTTP API on a Unix socket under `/tmp/cxb-<uid>/` (mode 0700, owned by your user). On Windows, where Node cannot listen on a Unix socket and the plugin API refuses a named pipe, it serves on a random `127.0.0.1` port instead, every path under a random 128-bit secret, and keeps that address in `%TEMP%\cxb\`. The module sends requests over that socket, and the relay streams the daemon's events back to it as NDJSON on stdout.
 
 The bridge exists because the plugin API cannot write to a child process's stdin once it has spawned it, and `codex app-server` speaks JSON-RPC over stdio. The daemon runs detached so that Codex turns keep running through a plugin reload. After a reload the module reattaches, and the job list is restored from the plugin store.
 
@@ -162,6 +162,7 @@ Processes end with the work they serve:
 - The plugin API does not tell a tool row whether ctrl+o is expanding it, so the text a `codex_*` call returned is not drawn under its row; `codex_result` shows a job's result.
 - The running-jobs line under the prompt is drawn on the terminal only.
 - Resuming a thread right after Claude Code restarts can take about 20 seconds while Codex reloads it.
+- On Windows, which has no SIGTERM, the daemon stops Codex with its whole process tree by force (`taskkill /T /F`), so Codex runs none of its own cleanup on the way out.
 - The hooks plugin API is early access and may change between Claude Code releases.
 
 ## Development

@@ -2,7 +2,7 @@
 // codex-msg: the MCP server that lets a Codex job message the Claude session
 // that runs it.
 //
-//   node codex-msg <socket> <key>
+//   node codex-msg <socket> <key>      (<socket>: on Windows the bridge's loopback URL)
 //
 // The plugin names it in the Codex thread's config (mcp_servers.claude_session),
 // so codex app-server starts it outside the job's sandbox: Codex's read-only
@@ -35,8 +35,11 @@ const write = message => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', .
 const post = text =>
   new Promise(resolve => {
     const body = JSON.stringify({ key, text })
+    // On Windows the bridge's address is a loopback URL rather than a socket (see bin/bridge.mjs).
+    const [url, via] = /^https?:/.test(socketPath) ? [`${socketPath}/msg`, {}] : ['http://bridge/msg', { socketPath }]
     const req = http.request(
-      { socketPath, method: 'POST', path: '/msg', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } },
+      url,
+      { ...via, method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } },
       res => {
         let answer = ''
         res.setEncoding('utf8')

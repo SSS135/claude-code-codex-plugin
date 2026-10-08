@@ -26,6 +26,10 @@ export type BridgeEvent =
 /** A failure to show the model as the tool's error. */
 export class CodexError extends Error {}
 
+/** Where $.http.fetch sends a bridge endpoint: over the daemon's Unix socket, or on Windows to its loopback URL, which carries the daemon's secret (bin/bridge.mjs). */
+export const bridgeTarget = (socket: string, endpoint: string): { url: string; socketPath?: string } =>
+  /^https?:/.test(socket) ? { url: `${socket}${endpoint}` } : { url: `http://codex${endpoint}`, socketPath: socket }
+
 export const PREFIX = 'mcp__codex__'
 export const SANDBOXES: CodexSandbox[] = ['read-only', 'workspace-write', 'full-access']
 export const APPROVALS: CodexApprovals[] = ['auto', 'ask', 'never', 'yolo']
@@ -196,8 +200,11 @@ export const finalMessage = (items: readonly Item[]): string | null => {
   return final?.text ?? null
 }
 
+/** Codex on Windows: `"C:\...\pwsh.exe" -NoProfile -Command <script>`, the script quoted when it has spaces. */
+const POWERSHELL = /^(?:"[^"]*[\\/]|[^"\s]*[\\/])?"?(?:pwsh|powershell)(?:\.exe)?"? (?:-\w+ )*?-Command (?:'(.*)'|"(.*)"|(.*))$/is
+
 export const shortCommand = (command: string): string =>
-  clip(command.replace(/^\/bin\/(ba|z)?sh -lc '(.*)'$/s, '$2'), 160)
+  clip(command.replace(/^\/bin\/(ba|z)?sh -lc '(.*)'$/s, '$2').replace(POWERSHELL, '$1$2$3'), 160)
 
 const changeKind = (kind: unknown) =>
   typeof kind === 'string' ? kind : typeof kind === 'object' && kind !== null ? String((kind as { type?: string }).type ?? 'edit') : 'edit'
@@ -407,15 +414,16 @@ export function parseProjectConfig(text: string, path: string): Partial<Defaults
   return out
 }
 
-/** The directories from `cwd` up to `root` (or up to / when cwd is not under root). */
+/** The directories from `cwd` up to `root` (or up to / when cwd is not under root); Windows paths split at \ too and end at the drive, `X:`. */
 export function configDirs(cwd: string, root: string): string[] {
   const dirs: string[] = []
-  let dir = cwd.replace(/\/+$/, '') || '/'
+  const top = root.replace(/[\\/]+$/, '') || '/'
+  let dir = cwd.replace(/[\\/]+$/, '') || '/'
   for (;;) {
     dirs.push(dir)
-    if (dir === root || dir === '/') return dirs
-    const up = dir.slice(0, dir.lastIndexOf('/')) || '/'
-    dir = up
+    const cut = Math.max(dir.lastIndexOf('/'), dir.lastIndexOf('\\'))
+    if (dir === top || dir === '/' || cut < 0) return dirs
+    dir = dir.slice(0, cut) || '/'
   }
 }
 
@@ -511,7 +519,7 @@ export function agentDescription(alias: string, defaults: Defaults): string {
     'Codex gets your prompt verbatim, sees nothing of this conversation, and its final message is the result. Always runs in the background.',
     'Optional header lines at the top of the prompt, stripped before Codex sees it:',
     `"effort: ${effortsOf(alias)}";`,
-    `"sandbox: read-only|workspace-write|full-access" (OS-enforced; workspace-write writes only in the cwd plus /tmp; default ${defaults.sandbox});`,
+    `"sandbox: read-only|workspace-write|full-access" (OS-enforced; workspace-write writes only in the cwd plus the temp directory; default ${defaults.sandbox});`,
     `"approvals: auto|ask|never|yolo" (default ${defaults.approvals}; auto: Codex's own reviewer decides escalations, looser than Claude's auto mode; ask: the user approves each; never: the sandbox alone decides; yolo: no sandbox and no approvals, ONLY when the user explicitly asked for it).`,
     `Project defaults: ${PROJECT_CONFIG}.`,
     'Codex may message you mid-task as this agent. SendMessage to it steers the running Codex turn, or starts a new turn on the same thread once it finished; TaskStop interrupts it.',

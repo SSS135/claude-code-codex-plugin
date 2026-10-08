@@ -35,6 +35,7 @@ import {
   permissionsFor,
   PROJECT_CONFIG,
   type BridgeEvent,
+  bridgeTarget,
   byThread,
   clip,
   CodexError,
@@ -172,9 +173,9 @@ function newSocket(): Socket {
   return { promise, resolve, reject }
 }
 
-/** The configured binary when it is on disk, else its bare name, which the spawn finds on PATH. */
+/** The configured binary when it is on disk, else (an empty setting too) its bare name, which the spawn finds on PATH. */
 async function resolveBinary($: Engine, configured: string, name: string): Promise<string> {
-  return (await $.fs.exists(configured)) ? configured : name
+  return configured.trim() !== '' && (await $.fs.exists(configured)) ? configured : name
 }
 
 /** Starts the relay, unless it runs; its events reach `onEvent` in order until the daemon exits (the session ended, or it sat idle). */
@@ -240,12 +241,12 @@ async function bridgeSocket($: Engine): Promise<string> {
 }
 
 async function post($: Engine, endpoint: string, body: unknown): Promise<Record<string, unknown>> {
-  const socketPath = await bridgeSocket($)
-  const response = await $.http.fetch(`http://codex${endpoint}`, {
+  const { url, socketPath } = bridgeTarget(await bridgeSocket($), endpoint)
+  const response = await $.http.fetch(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
-    socketPath,
+    ...(socketPath ? { socketPath } : {}),
   })
   const parsed = JSON.parse(response.text) as Record<string, unknown>
   const error = parsed.error as { message?: string } | undefined
