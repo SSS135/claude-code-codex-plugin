@@ -339,7 +339,7 @@ async function ensureLoaded($: Engine, agent: CodexAgent): Promise<void> {
   } catch (error) {
     if (error instanceof CodexError && error.message.includes('active writer')) {
       throw new CodexError(
-        `${agent.name}'s thread is still held by another Codex process: a previous bridge's (it exits about 20 s after its Claude session ends or the plugin reloads onto another version) or another live session's. Try again shortly.`,
+        `${agent.name}'s thread is still held by another Codex process: a previous bridge's (it exits about 20 s after its Claude session ends, and after a reload onto another plugin version once it runs no turn) or another live session's. Try again shortly.`,
       )
     }
     throw error
@@ -547,9 +547,16 @@ async function awaitJob($: Engine, agentId: string | undefined, signal: AbortSig
       answer = await waitTurn($, agent.threadId, Math.min(left, POLL_SLICE_MS), agent.msgKey)
     } catch (error) {
       if (signal.aborted) throw error
-      // The bridge is gone: the job cannot finish, so it ends here with the reason.
+      // The bridge is gone (its daemon stopped or reset the wait): the turn cannot be followed, so the job
+      // ends interrupted with the reason; its thread is intact, and a SendMessage starts a new turn on it.
       const now = await $.clock.now()
-      await patchAgent($, agentId, () => ({ status: 'failed', currentTurnId: null, error: String(error instanceof Error ? error.message : error), turnEndedAt: now }))
+      await patchAgent($, agentId, () => ({
+        status: 'interrupted',
+        currentTurnId: null,
+        lastTurnStatus: 'interrupted',
+        error: `the Codex bridge was lost (${errorText(error)}); a SendMessage to its agent starts a new turn on the thread`,
+        turnEndedAt: now,
+      }))
       continue
     }
     if (answer.status === 'message') {

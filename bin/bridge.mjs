@@ -7,7 +7,10 @@
 //           daemon for this Claude session and this build of the bridge (the
 //           daemon's directory is <sessionKey>-<BUILD>, so a reload onto another
 //           plugin version or path starts a new daemon instead of driving an old
-//           one), then copies its event stream to stdout as NDJSON. First line:
+//           one), then copies its event stream to stdout as NDJSON. Only while
+//           the session's daemon of another build runs turns does it drive that
+//           one instead, until it is idle; it then stops it and exits, so no
+//           reload loses a turn. First line:
 //           {"type":"ready","socket",...}. It exits when its parent goes away,
 //           stdout breaks or the daemon exits; the plugin killing it on reload is
 //           expected and harmless.
@@ -54,6 +57,7 @@ const IDLE_MS = 10 * 60_000
 const IDLE_CHECK_MS = 60_000
 /** Half the idle window, so a daemon about to idle out itself still stops an idle legacy one. */
 const LEGACY_IDLE_MS = IDLE_MS / 2
+const DRAIN_CHECK_MS = 5_000
 const BUFFER_CAP = 5_000
 const MAILBOX_CAP = 50
 const MESSAGE_CAP = 20_000
@@ -428,14 +432,7 @@ async function daemon(codexPath, dir) {
       legacyIdleSince.set(name, since)
       if (now - since < LEGACY_IDLE_MS) continue
       legacyIdleSince.delete(name)
-      // The pid the daemon reports must be the one its launcher recorded.
-      let recorded = null
-      try {
-        recorded = fs.readFileSync(path.join(base, name, 'pid'), 'utf8').trim()
-      } catch {}
-      if (recorded !== String(health.pid)) continue
-      process.stderr.write(`stopping idle daemon ${name} (pid ${health.pid}) of an older bridge build\n`)
-      stopTree(health.pid)
+      if (stopDaemon(path.join(base, name), health)) process.stderr.write(`stopped idle daemon ${name} (pid ${health.pid}) of an older bridge build\n`)
     }
   }
   setInterval(() => {
@@ -473,6 +470,31 @@ const readHealth = async socketPath => {
 
 const isHealthy = async socketPath => (await readHealth(socketPath)) !== null
 
+const isBusy = health => Object.keys(health?.active ?? {}).length > 0
+
+/** Stops the daemon in `dir` that answered `health`, when the pid it reports is the one its launcher recorded; whether it did. */
+const stopDaemon = (dir, health) => {
+  let recorded = null
+  try {
+    recorded = fs.readFileSync(path.join(dir, 'pid'), 'utf8').trim()
+  } catch {}
+  if (recorded !== String(health.pid)) return false
+  stopTree(health.pid)
+  // A daemon stopped by force (Windows) cleans up nothing itself.
+  fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 })
+  return true
+}
+
+/** This session's live daemon of another bridge build (a plugin reload onto another version or path, or a legacy one): `{dir, health}`, or null. */
+const otherDaemon = async (base, key) => {
+  for (const name of fs.readdirSync(base)) {
+    if ((name !== key && !name.startsWith(`${key}-`)) || name === `${key}-${BUILD}`) continue
+    const health = await readHealth(addressOf(path.join(base, name)))
+    if (health) return { dir: path.join(base, name), health }
+  }
+  return null
+}
+
 const privateBase = () => {
   // Windows has no uid or Unix modes: the per-user temp directory is private to this user already.
   if (IS_WINDOWS) {
@@ -488,6 +510,22 @@ const privateBase = () => {
   return base
 }
 
+/**
+ * Drives another build's daemon until it has run no turn for two checks in a
+ * row, then stops it and exits: the plugin's next request starts this build's
+ * daemon, which resumes the threads.
+ */
+const drain = other => {
+  let quiet = 0
+  setInterval(async () => {
+    const health = await readHealth(addressOf(other.dir))
+    quiet = isBusy(health) ? 0 : quiet + 1
+    if (health && quiet < 2) return
+    if (health) stopDaemon(other.dir, health)
+    process.exit(0)
+  }, DRAIN_CHECK_MS)
+}
+
 async function relay(codexPath, sessionKey) {
   const out = line => process.stdout.write(JSON.stringify(line) + '\n')
   process.stdout.on('error', () => process.exit(0))
@@ -499,9 +537,16 @@ async function relay(codexPath, sessionKey) {
   for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => process.exit(0))
 
   const key = sessionKey.replace(/[^A-Za-z0-9]/g, '').slice(0, 16) || 'default'
-  const dir = path.join(privateBase(), `${key}-${BUILD}`)
+  const base = privateBase()
+  const dir = path.join(base, `${key}-${BUILD}`)
 
-  if (!(await isHealthy(addressOf(dir)))) {
+  const other = (await isHealthy(addressOf(dir))) ? null : await otherDaemon(base, key)
+  // A reload onto another build while turns run on the old build's daemon: drive that one, so no turn is lost.
+  const target = isBusy(other?.health) ? other.dir : dir
+  if (target !== dir) drain(other)
+  else if (!(await isHealthy(addressOf(dir)))) {
+    // An idle one would only hold threads this build's daemon must resume.
+    if (other) stopDaemon(other.dir, other.health)
     // Retries: on Windows an exiting daemon may still hold its log open for a moment.
     fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 })
     fs.mkdirSync(dir, { mode: 0o700 })
@@ -523,7 +568,7 @@ async function relay(codexPath, sessionKey) {
     }
   }
 
-  const socketPath = addressOf(dir)
+  const socketPath = addressOf(target)
   const res = await request(socketPath, 'GET', '/events', 0)
   res.setEncoding('utf8')
   const lines = readline.createInterface({ input: res })

@@ -441,9 +441,12 @@ test('a failed or lost Codex turn ends the wrapper with the reason', { timeoutMs
   const fake = fakeBridge(on)
   await start($, fake)
   await spawn($, fake)
-  fake.waitError = 'the codex bridge stopped'
-  expect(await awaitCall($, 'a1').then(ran => ran.result)).toBe('Codex failed: the codex bridge stopped')
-  expect(await finalOf($, 'a1', 1)).toBe('Codex failed: the codex bridge stopped')
+  // A daemon stopped mid-wait (#3: ECONNRESET): interrupted, resumable by SendMessage, not failed.
+  fake.waitError = 'ECONNRESET'
+  const lost = 'Codex turn interrupted: the Codex bridge was lost (ECONNRESET); a SendMessage to its agent starts a new turn on the thread'
+  expect(await awaitCall($, 'a1').then(ran => ran.result)).toBe(lost)
+  expect(await finalOf($, 'a1', 1)).toBe(lost)
+  expect((await agentsOf(fake)).a1).toMatchObject({ status: 'interrupted', currentTurnId: null })
 
   // A turn that did not start: the wrapper still runs, and ends with why.
   fake.waitError = null
