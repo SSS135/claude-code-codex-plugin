@@ -221,11 +221,52 @@ export const finalMessage = (items: readonly Item[]): string | null => {
   return final?.text ?? null
 }
 
-/** Codex on Windows: `"C:\...\pwsh.exe" -NoProfile -Command <script>`, the script quoted when it has spaces. */
-const POWERSHELL = /^(?:"[^"]*[\\/]|[^"\s]*[\\/])?"?(?:pwsh|powershell)(?:\.exe)?"? (?:-\w+ )*?-Command (?:'(.*)'|"(.*)"|(.*))$/is
+/** The words of a POSIX-shell-quoted command line ('…' literal, "…" and bare \ escaping); null when a quote is open. */
+function shellWords(line: string): string[] | null {
+  const words: string[] = []
+  let word: string | null = null
+  for (let i = 0; i < line.length; i += 1) {
+    const c = line[i] as string
+    if (c === ' ' || c === '\t' || c === '\n') {
+      if (word !== null) words.push(word)
+      word = null
+      continue
+    }
+    word ??= ''
+    if (c === "'") {
+      const end = line.indexOf("'", i + 1)
+      if (end < 0) return null
+      word += line.slice(i + 1, end)
+      i = end
+    } else if (c === '"') {
+      for (i += 1; i < line.length && line[i] !== '"'; i += 1) {
+        if (line[i] === '\\' && '"\\$`\n'.includes(line[i + 1] ?? 'x')) i += 1
+        word += line[i]
+      }
+      if (i >= line.length) return null
+    } else if (c === '\\' && i + 1 < line.length) {
+      i += 1
+      word += line[i]
+    } else word += c
+  }
+  if (word !== null) words.push(word)
+  return words
+}
 
-export const shortCommand = (command: string): string =>
-  clip(command.replace(/^\/bin\/(ba|z)?sh -lc '(.*)'$/s, '$2').replace(POWERSHELL, '$1$2$3'), 160)
+const SHELL = /(?:^|[\\/])(?:ba|z)?sh$|(?:pwsh|powershell)(?:\.exe)?$/i
+
+/**
+ * The script of a command Codex reports as a shell running it, else the command:
+ * Codex quotes the argv POSIX-style, `/bin/zsh -lc '<script>'` on macOS and
+ * Linux, `"C:\\...\\pwsh.exe" -Command '<script>'` on Windows (pieces of the
+ * script in '…' and "…" by turns).
+ */
+export const shortCommand = (command: string): string => {
+  const words = shellWords(command)
+  const flag = words?.findIndex((word, i) => i > 0 && /^-(?:l?c|command)$/i.test(word)) ?? -1
+  const script = words && flag > 0 && flag === words.length - 2 && SHELL.test(words[0] as string) ? (words[flag + 1] as string) : command
+  return clip(script, 160)
+}
 
 const changeKind = (kind: unknown) =>
   typeof kind === 'string' ? kind : typeof kind === 'object' && kind !== null ? String((kind as { type?: string }).type ?? 'edit') : 'edit'

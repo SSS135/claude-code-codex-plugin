@@ -678,7 +678,18 @@ test('Windows paths: config dirs split at \\ and end at the drive; commands drop
   const pwsh = '"C:\\\\Program Files\\\\PowerShell\\\\7\\\\pwsh.exe" -NoProfile -Command'
   expect(shortCommand(`${pwsh} Get-Location`)).toBe('Get-Location')
   expect(shortCommand(`${pwsh} 'Get-ChildItem -Name -Filter "*.mjs"'`)).toBe('Get-ChildItem -Name -Filter "*.mjs"')
-  expect(shortCommand(`${pwsh} "Write-Output 'it''s'"`)).toBe("Write-Output 'it''s'")
+  expect(shortCommand(`${pwsh} "Write-Output 'it''s a \\"test\\"'"`)).toBe(`Write-Output 'it''s a "test"'`)
+  // As Codex 0.161 on Windows reports them, verbatim: the script quoted POSIX-style, '…' and "…" by turns.
+  const pwsh161 = String.raw`"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command`
+  expect(shortCommand(String.raw`${pwsh161} '$files = Get-ChildItem -Name -Filter '"'*.mjs'; \"count: "'$($files.Count)"'`)).toBe(
+    `$files = Get-ChildItem -Name -Filter '*.mjs'; "count: $($files.Count)"`,
+  )
+  expect(shortCommand(String.raw`${pwsh161} '$env:PYTHONIOENCODING='"'utf-8'; Write-Output "'$env:PYTHONIOENCODING'`)).toBe(
+    `$env:PYTHONIOENCODING='utf-8'; Write-Output $env:PYTHONIOENCODING`,
+  )
+  expect(shortCommand(String.raw`${pwsh161} "Write-Output 'it''s'"`)).toBe("Write-Output 'it''s'")
+  expect(shortCommand("/bin/zsh -lc 'echo '\\''hi'\\'''")).toBe("echo 'hi'")
+  expect(shortCommand("echo 'unclosed")).toBe("echo 'unclosed")
   expect(shortCommand('C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -Command Get-Date')).toBe('Get-Date')
   expect(shortCommand("/bin/bash -lc 'ls -la'")).toBe('ls -la')
   expect(shortCommand('git log --grep pwsh -Command x')).toBe('git log --grep pwsh -Command x')
