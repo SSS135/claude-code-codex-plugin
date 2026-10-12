@@ -14,7 +14,7 @@ A Claude Code plugin that runs OpenAI Codex (luna, sol, astra, terra) as native 
   <img src="./assets/readme/flow.svg" width="100%" alt="Four steps: Claude starts a codex:luna background agent and moves on; Codex works in its own sandbox while the native task list shows progress; escalations go to a Claude Code dialog in ask mode or to Codex's reviewer in auto mode; the result arrives as a native task notification and SendMessage continues the thread.">
 </p>
 
-The plugin registers four agent types, one per Codex model: `codex:luna`, `codex:sol`, `codex:astra` and `codex:terra`. Claude uses them like `general-purpose`, so you can ask in plain words, for example "have a Codex agent fix the flaky retry test". Claude turns that into an Agent call like this:
+The plugin registers four agent types, one per Codex model family: `codex:luna`, `codex:sol`, `codex:astra` and `codex:terra`. Claude uses them like `general-purpose`, so you can ask in plain words, for example "have a Codex agent fix the flaky retry test". Claude turns that into an Agent call like this:
 
 ```json
 { "subagent_type": "codex:sol", "description": "Fix flaky retry test", "prompt": "effort: medium\nFix the flaky test in retry.test.ts and run it." }
@@ -26,14 +26,14 @@ Each agent type's description in Claude's agent listing opens with when to use i
 
 | Agent type | Model | Default effort | Use it for |
 | --- | --- | --- | --- |
-| `codex:sol` | `gpt-6.1-sol` | high | Normal tasks: implementation, debugging, analysis, review, anything needing judgement. The default. |
-| `codex:luna` | `gpt-6-luna` | max | Simple mechanical work and searches: find/grep/list, bulk renames, boilerplate, straightforward well-specified edits, data gathering. Cheap and fast. |
-| `codex:astra` | `gpt-6-astra` | high | Only when you ask for astra explicitly. |
-| `codex:terra` | `gpt-5.6-terra` | high | Only when you ask for terra explicitly. |
+| `codex:sol` | Newest Sol model | high | Normal tasks: implementation, debugging, analysis, review, anything needing judgement. The default. |
+| `codex:luna` | Newest Luna model | max | Simple mechanical work and searches: find/grep/list, bulk renames, boilerplate, straightforward well-specified edits, data gathering. Cheap and fast. |
+| `codex:astra` | Newest Astra model | high | Only when you ask for astra explicitly. |
+| `codex:terra` | Newest Terra model | high | Only when you ask for terra explicitly. |
 
 In short: `codex:sol` is the default for normal tasks, `codex:luna` is for fast searches and easy mechanical tasks, and `codex:astra` and `codex:terra` run only when you explicitly ask for them.
 
-An older Codex CLI that lacks an agent type's model runs the newest model of the same family it lists instead (`codex:luna` on `gpt-5.6-luna`), and the plugin says once per load, in the transcript and a toast, that the CLI should be updated (`npm i -g @openai/codex@latest`, or update the ChatGPT app on macOS). With no model of that family, the Agent call is refused with the same advice.
+Each agent runs the newest model of its family listed by the Codex CLI, comparing numeric versions regardless of list order. With no model of that family, the Agent call is refused with advice to update the CLI (`npm i -g @openai/codex@latest`, or update the ChatGPT app on macOS). Runtime status and job listings show the actual model id chosen.
 
 What happens then:
 
@@ -126,7 +126,7 @@ A project can set its own defaults in `.claude/codex.json`. The plugin uses the 
 { "effort": "medium", "sandbox": "workspace-write", "approvals": "ask" }
 ```
 
-When a setting comes from several places, the prompt's header lines beat the project's `.claude/codex.json`, which beats `userConfig`, which beats the built-in defaults. For effort, the built-in default is per model (luna max, the others high); an `effort` in `.claude/codex.json`, or a `defaultEffort` other than `per-model`, replaces it for every model. The model comes from the agent type: `codex:luna` is `gpt-6-luna` (fast, cheap), `codex:sol` is `gpt-6.1-sol` (strongest, the default for normal work), `codex:astra` is `gpt-6-astra`, and `codex:terra` is `gpt-5.6-terra`.
+When a setting comes from several places, the prompt's header lines beat the project's `.claude/codex.json`, which beats `userConfig`, which beats the built-in defaults. For effort, the built-in default is per model (luna max, the others high); an `effort` in `.claude/codex.json`, or a `defaultEffort` other than `per-model`, replaces it for every model. The model family comes from the agent type, which runs its newest listed model: `codex:luna` uses Luna (fast, cheap), `codex:sol` uses Sol (the default for normal work), `codex:astra` uses Astra, and `codex:terra` uses Terra.
 
 ## Approval modes
 

@@ -52,7 +52,7 @@ type Fake = {
   targets: string[]
   /** Transcript lines and toasts the person saw. */
   shown: string[]
-  /** What model/list answers, newest first: [id, efforts]. */
+  /** What model/list answers: [id, efforts], in any order. */
   models: [string, string[]][]
   clock: MockClock
 }
@@ -310,8 +310,7 @@ test('registers one native agent type per model alias, run on haiku with codex_a
     expect(spec).toMatchObject({ tools: ['mcp__codex__codex_await', 'SendMessage', 'SubagentHandback'], model: 'haiku', background: true, omitClaudeMd: true })
   }
   const luna = String(fake.registeredAgents[0]?.description)
-  expect(luna).toContain('gpt-6-luna')
-  expect(luna).toContain('gpt-6-luna, effort medium.')
+  expect(luna).toContain('the newest Luna model, effort medium.')
   expect(luna).toContain('effort: low|medium|high|xhigh|max"')
   expect(String(fake.registeredAgents[1]?.description)).toContain('|ultra')
   done(fake)
@@ -712,43 +711,73 @@ test("Windows bridge: requests go to the daemon's loopback URL under its secret,
 test('the agent listing: sol is the default, luna for searches and easy work, astra and terra only when asked', () => {
   const defaults = effectiveDefaults({ codexPath: 'c', nodePath: 'n', defaultEffort: undefined, defaultSandbox: 'workspace-write', defaultApprovals: 'auto' }, {})
   expect(agentDescription('sol', defaults)).toContain('Default')
-  expect(agentDescription('sol', defaults)).toContain('gpt-6.1-sol')
+  expect(agentDescription('sol', defaults)).toContain('the newest Sol model, effort high.')
   expect(agentDescription('luna', defaults)).toContain('searches')
   for (const alias of ['astra', 'terra']) expect(agentDescription(alias, defaults)).toContain('ONLY when the user explicitly asks')
+  for (const alias of ['luna', 'sol', 'astra', 'terra']) {
+    const description = agentDescription(alias, defaults)
+    expect(description).toContain(`the newest ${alias[0]?.toUpperCase()}${alias.slice(1)} model`)
+    expect(description).not.toMatch(/gpt-|\b\d+(?:\.\d+)*\b/)
+  }
 })
 
-test('an older Codex CLI: each alias falls back to the newest model of its family; with none the error says to update', () => {
-  // As codex-cli 0.153 lists them, newest first.
-  const old = new Map(['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5-luna'].map(id => [id, EFFORTS]))
+test('each alias selects the newest numeric version of its family in any list order; with none the error says to update', () => {
+  const old = new Map(['gpt-5.5-luna', 'gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'].map(id => [id, EFFORTS]))
   expect(['luna', 'sol', 'astra', 'terra'].map(alias => modelFor(old, alias))).toEqual(['gpt-5.6-luna', 'gpt-5.6-sol', 'gpt-6-astra', 'gpt-5.6-terra'])
-  // A current CLI lists the alias's own model, even behind a newer one of the family.
-  expect(modelFor(new Map([['gpt-6.1-sol', EFFORTS], ['gpt-6-sol', EFFORTS]]), 'sol')).toBe('gpt-6.1-sol')
-  expect(modelFor(new Map([['gpt-7-sol', EFFORTS], ['gpt-6.1-sol', EFFORTS]]), 'sol')).toBe('gpt-6.1-sol')
-  // No family at all: the alias's own model, which modelEffortError refuses with the update advice.
+  for (const ids of [
+    ['gpt-6-sol', 'gpt-6.1-sol', 'gpt-5.6-sol'],
+    ['gpt-6.1-sol', 'gpt-5.6-sol', 'gpt-6-sol'],
+  ]) expect(modelFor(new Map(ids.map(id => [id, EFFORTS])), 'sol')).toBe('gpt-6.1-sol')
+  for (const alias of ['luna', 'sol', 'astra', 'terra']) {
+    for (const versions of [['6.1', '7', '5.6', '6'], ['7', '6', '6.1', '5.6'], ['5.6', '6', '7', '6.1']]) {
+      const models = new Map(versions.map(version => [`gpt-${version}-${alias}`, EFFORTS]))
+      models.set('gpt-99-other', EFFORTS)
+      models.set(`gpt-99-${alias}-preview`, EFFORTS)
+      expect(modelFor(models, alias)).toBe(`gpt-7-${alias}`)
+    }
+  }
+  // Numeric components, not lexical order or a decimal number.
+  expect(modelFor(new Map(['gpt-9-sol', 'gpt-10-sol'].map(id => [id, EFFORTS])), 'sol')).toBe('gpt-10-sol')
+  expect(modelFor(new Map(['gpt-6.9-sol', 'gpt-6.10-sol'].map(id => [id, EFFORTS])), 'sol')).toBe('gpt-6.10-sol')
+  expect(modelFor(new Map(['gpt-6.1-sol', 'gpt-6.1.2-sol'].map(id => [id, EFFORTS])), 'sol')).toBe('gpt-6.1.2-sol')
+  // No family at all: the fallback id, which modelEffortError refuses with the update advice.
   const none = new Map([['gpt-5.5', EFFORTS]])
   expect(modelFor(none, 'luna')).toBe('gpt-6-luna')
+  expect(modelFor(new Map(), 'sol')).toBe('gpt-6.1-sol')
   expect(modelEffortError(none, 'gpt-6-luna', 'max')).toContain(UPDATE_HINT)
   expect(modelEffortError(none, 'some-model', 'max')).not.toContain(UPDATE_HINT)
   expect(aliasOf('gpt-5.6-luna')).toBe('luna')
   expect(aliasOf('gpt-6.1-sol')).toBe('sol')
+  expect(aliasOf('gpt-7-sol')).toBe('sol')
   expect(aliasOf('o3')).toBe('o3')
 })
 
-test('a spawn on an older Codex CLI runs the family fallback and warns once to update', { timeoutMs: 20_000 }, async ($, on) => {
+test('a spawn runs the newest listed family model without a pinned-model warning and shows its real id', { timeoutMs: 20_000 }, async ($, on) => {
   const fake = fakeBridge(on)
-  fake.models = [['gpt-5.6-luna', EFFORTS], ['gpt-5.6-sol', [...EFFORTS, 'ultra']]]
+  fake.models = [
+    ['gpt-6-luna', EFFORTS], ['gpt-5.6-luna', EFFORTS], ['gpt-7-luna', EFFORTS],
+    ['gpt-6.1-sol', [...EFFORTS, 'ultra']], ['gpt-7-sol', [...EFFORTS, 'ultra']], ['gpt-6-sol', EFFORTS],
+  ]
   await start($, fake)
   const first = await spawn($, fake, 'x')
   await spawn($, fake, 'y', { subagentType: 'codex:sol' })
-  expect(fake.rpcs.filter(rpc => rpc.method === 'thread/start').map(rpc => rpc.params.model)).toEqual(['gpt-5.6-luna', 'gpt-5.6-sol'])
-  expect(first.model).toBe('gpt-5.6-luna')
+  expect(fake.rpcs.filter(rpc => rpc.method === 'thread/start').map(rpc => rpc.params.model)).toEqual(['gpt-7-luna', 'gpt-7-sol'])
+  expect(fake.rpcs.filter(rpc => rpc.method === 'turn/start').map(rpc => rpc.params.model)).toEqual(['gpt-7-luna', 'gpt-7-sol'])
+  expect(first.model).toBe('gpt-7-luna')
   const warnings = fake.shown.filter(line => line.includes(UPDATE_HINT))
-  expect(warnings).toEqual([
-    `codex: this Codex CLI has no gpt-6-luna, so codex:luna runs gpt-5.6-luna. ${UPDATE_HINT}`,
-    `toast: codex: this Codex CLI has no gpt-6-luna, so codex:luna runs gpt-5.6-luna. ${UPDATE_HINT}`,
-  ])
-  // The listing still names the intended model.
-  expect(String(fake.registeredAgents[1]?.description)).toContain('gpt-6.1-sol')
+  expect(warnings).toEqual([])
+  expect(String((await $.tool.call({ tool: 'mcp__codex__codex_list' } as never)).result)).toContain('[gpt-7-luna/max,')
+  expect(String(fake.registeredAgents[1]?.description)).toContain('the newest Sol model')
+  done(fake)
+})
+
+test('a spawn runs the newest available model even when only older family versions are listed, without a warning', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  fake.models = [['gpt-5.5-luna', EFFORTS], ['gpt-5.6-luna', EFFORTS]]
+  await start($, fake)
+  const agent = await spawn($, fake, 'x')
+  expect(agent.model).toBe('gpt-5.6-luna')
+  expect(fake.shown.filter(line => line.includes(UPDATE_HINT))).toEqual([])
   done(fake)
 })
 
@@ -759,6 +788,8 @@ test('a spawn whose alias has no model of its family on this Codex CLI is refuse
   const refused = await $.agent.spawn(spawnInput('x'))
   expect(refused.deny).toContain('Unknown Codex model "gpt-6-luna"')
   expect(refused.deny).toContain(UPDATE_HINT)
+  expect(fake.spawned).toEqual([])
+  expect(fake.rpcs.filter(rpc => rpc.method === 'thread/start')).toEqual([])
   done(fake)
 })
 
@@ -786,9 +817,9 @@ test('effort: per-model built-ins (luna max, others high) under header > project
   await start($, fake)
   const descriptions = fake.registeredAgents.map(spec => String(spec.description))
   expect(descriptions[0]).toMatch(/^For simple mechanical work and searches/)
-  expect(descriptions[0]).toContain('gpt-6-luna, effort max.')
+  expect(descriptions[0]).toContain('the newest Luna model, effort max.')
   expect(descriptions[1]).toMatch(/^Default Codex agent for normal tasks/)
-  expect(descriptions[1]).toContain('gpt-6.1-sol, effort high.')
+  expect(descriptions[1]).toContain('the newest Sol model, effort high.')
   expect(descriptions[2]).toMatch(/^Use ONLY when the user explicitly asks for astra/)
   expect(descriptions[3]).toMatch(/^Use ONLY when the user explicitly asks for terra/)
   // No effort set anywhere: each model's own.
@@ -807,7 +838,7 @@ test('effort: per-model built-ins (luna max, others high) under header > project
 test('effort: a userConfig defaultEffort replaces the per-model built-ins, below the project', { options: { defaultEffort: 'medium' }, timeoutMs: 20_000 }, async ($, on) => {
   const fake = fakeBridge(on)
   await start($, fake)
-  expect(String(fake.registeredAgents[0]?.description)).toContain('gpt-6-luna, effort medium.')
+  expect(String(fake.registeredAgents[0]?.description)).toContain('the newest Luna model, effort medium.')
   await spawn($, fake, 'x')
   fake.files['/work/.claude/codex.json'] = JSON.stringify({ effort: 'low' })
   await spawn($, fake, 'y')
@@ -815,7 +846,7 @@ test('effort: a userConfig defaultEffort replaces the per-model built-ins, below
   const settings = { codexPath: 'c', nodePath: 'n', defaultEffort: undefined, defaultSandbox: 'workspace-write' as const, defaultApprovals: 'auto' as const }
   const builtIn = effectiveDefaults(settings, {})
   expect(['luna', 'sol', 'astra', 'terra'].map(alias => effortFor(builtIn, alias))).toEqual(['max', 'high', 'high', 'high'])
-  expect(agentDescription('terra', builtIn)).toContain('gpt-5.6-terra, effort high.')
+  expect(agentDescription('terra', builtIn)).toContain('the newest Terra model, effort high.')
   done(fake)
 })
 

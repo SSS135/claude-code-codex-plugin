@@ -54,19 +54,23 @@ export const aliasOf = (model: string): string =>
 export const UPDATE_HINT = 'Update the Codex CLI: npm i -g @openai/codex@latest, or update the ChatGPT app on macOS.'
 
 /**
- * The model a `codex:<alias>` spawn runs: the alias's own when this Codex CLI
- * lists it, else (an older CLI) the first listed, newest, of the alias's family,
- * else the alias's own, which modelEffortError then refuses.
+ * The newest numeric version of the alias's family, regardless of list order.
+ * With no family listed, use the fallback id, which modelEffortError refuses.
  */
 export const modelFor = (models: Map<string, string[]>, alias: string): string => {
-  const wanted = MODEL_ALIASES[alias] as string
-  if (models.has(wanted)) return wanted
-  return [...models.keys()].find(id => id.endsWith(`-${alias}`)) ?? wanted
+  const family = [...models.keys()].filter(id => id.endsWith(`-${alias}`))
+  const version = (id: string): number[] => id.match(/^gpt-(\d+(?:\.\d+)*)-/)?.[1]?.split('.').map(Number) ?? []
+  family.sort((a, b) => {
+    const av = version(a)
+    const bv = version(b)
+    for (let i = 0; i < Math.max(av.length, bv.length); i++) {
+      const difference = (bv[i] ?? 0) - (av[i] ?? 0)
+      if (difference) return difference
+    }
+    return 0
+  })
+  return family[0] ?? (MODEL_ALIASES[alias] as string)
 }
-
-/** The warning when an older Codex CLI made a spawn fall back to `used`. */
-export const fallbackWarning = (alias: string, used: string): string =>
-  `codex: this Codex CLI has no ${MODEL_ALIASES[alias]}, so codex:${alias} runs ${used}. ${UPDATE_HINT}`
 
 // ------------------------------------------------------------ text helpers
 
@@ -192,8 +196,7 @@ export const turnStartParams = (agent: CodexAgent, text: string) => ({
 export const modelEffortError = (models: Map<string, string[]>, model: string, effort: string): string | undefined => {
   const efforts = models.get(model)
   if (!efforts) {
-    // An alias's own model, missing with no family fallback: the CLI predates it.
-    const hint = Object.values(MODEL_ALIASES).includes(model) ? ` This Codex CLI is too old for it. ${UPDATE_HINT}` : ''
+    const hint = Object.values(MODEL_ALIASES).includes(model) ? ` This Codex CLI lists no model of the ${aliasOf(model)} family. ${UPDATE_HINT}` : ''
     return `Unknown Codex model "${model}". Use luna, sol, astra, terra or one of: ${[...models.keys()].join(', ')}.${hint}`
   }
   if (!efforts.includes(effort)) return `Model ${model} does not take effort "${effort}". Its efforts: ${efforts.join(', ')}.`
@@ -575,9 +578,9 @@ const effortsOf = (alias: string): string => (alias === 'luna' ? 'low|medium|hig
 
 /** The listing line the main model reads for `codex:<alias>`; `defaults` are the effective ones at session start. */
 export function agentDescription(alias: string, defaults: Defaults): string {
-  const model = MODEL_ALIASES[alias] as string
+  const family = alias.charAt(0).toUpperCase() + alias.slice(1)
   return [
-    `${WHEN_TO_USE[alias]} OpenAI Codex on ${model}, effort ${effortFor(defaults, alias)}.`,
+    `${WHEN_TO_USE[alias]} OpenAI Codex on the newest ${family} model, effort ${effortFor(defaults, alias)}.`,
     'Codex gets your prompt verbatim, sees nothing of this conversation, and its final message is the result. Always runs in the background.',
     'Optional header lines at the top of the prompt, stripped before Codex sees it:',
     `"effort: ${effortsOf(alias)}";`,

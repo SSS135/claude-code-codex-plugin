@@ -58,8 +58,6 @@ import {
   effortFor,
   PER_MODEL_EFFORT,
   PREFIX,
-  fallbackWarning,
-  MODEL_ALIASES,
   modelFor,
   resultText,
   sandboxMode,
@@ -118,8 +116,6 @@ let nodeBinary = 'node'
 /** Subagents seen at turn.step that are not codex:* agents. */
 const foreignAgents = new Set<string>()
 let models: Map<string, string[]> | null = null
-/** Whether this load already warned that the Codex CLI is too old for an alias's model. */
-let hasWarnedOldCli = false
 let askChain: Promise<unknown> = Promise.resolve()
 
 // ------------------------------------------------------------ registry
@@ -778,11 +774,6 @@ export const register: Register = (on, options) => {
       const { sandbox, approvals } = permissionsFor(header, defaults)
       const error = modelEffortError(listed, model, effort)
       if (error) return { deny: `codex: ${error}` }
-      if (model !== MODEL_ALIASES[alias] && !hasWarnedOldCli) {
-        hasWarnedOldCli = true
-        $.ui.log(fallbackWarning(alias, model))
-        $.ui.toast(fallbackWarning(alias, model), { timeoutMs: 10_000 })
-      }
       input = {
         description: taskLabel(e),
         // Made unique as the job is recorded (putAgent), so two spawns at once never share one.
