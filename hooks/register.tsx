@@ -92,7 +92,8 @@ const STORE_KEY = 'agents'
 const DOT = '●'
 const RESULT_MARK = '  ⎿  '
 /** Under the 30 s after which $.http.fetch gives up on an answer. */
-const POLL_SLICE_MS = 25_000
+const POLL_SLICE_MS = 20_000
+const RPC_TIMEOUT_MS = 25_000
 /** How long one codex_await call blocks before the wrapper's loop calls it again. */
 const AWAIT_MS = 3_600_000
 /** A short wait between reads of the registry; it counts against the hook's 10 s budget. */
@@ -104,6 +105,9 @@ const SETTLE_BUDGET_MS = 5_000
 // in-flight wait, dialog and the bridge relay along with it.
 type Socket = { promise: Promise<string>; resolve: (path: string) => void; reject: (error: Error) => void }
 let socket: Socket | null = null
+let registryAddress: string | null = null
+let recovery: { reattached: boolean; active: Record<string, string> } | null = null
+let spawnsInFlight = 0
 let isBridgeRunning = false
 /** The userConfig the bridge starts with; set when the module registers. */
 let bridgeSettings: Settings | null = null
@@ -120,8 +124,10 @@ let askChain: Promise<unknown> = Promise.resolve()
 
 // ------------------------------------------------------------ registry
 
-async function afterWrite($: Engine, agents: Record<string, CodexAgent>): Promise<void> {
-  await $.store.set(STORE_KEY, agents)
+async function afterWrite($: Engine, agents: Record<string, CodexAgent>, agent: CodexAgent): Promise<void> {
+  await post($, '/registry/write', { agent })
+  // A bounded compatibility snapshot; the separate agent files are authoritative.
+  await $.store.set(STORE_KEY, trim(agents))
 }
 
 /** Records a new job, its name made unique among the jobs at that moment; resolves the job as written. */
@@ -129,9 +135,9 @@ async function putAgent($: Engine, agent: CodexAgent): Promise<CodexAgent> {
   let written = agent
   const agents = await update($, agentsAtom, all => {
     written = sanitize({ ...agent, name: uniqueName(all, agent.name) })
-    return trim({ ...all, [agent.id]: written })
+    return { ...all, [agent.id]: written }
   })
-  await afterWrite($, agents)
+  await afterWrite($, agents, written)
   return written
 }
 
@@ -146,18 +152,17 @@ async function patchAgent(
   const agents = await update($, agentsAtom, all => {
     const agent = all[id]
     if (!agent) return all
-    written = sanitize({ ...agent, ...change(agent), updatedAt: now })
+    written = sanitize({ ...agent, ...change(agent), updatedAt: Math.max(now, agent.updatedAt + 1) })
     return { ...all, [id]: written }
   })
-  if (written) await afterWrite($, agents)
+  if (written) await afterWrite($, agents, written)
   return written
 }
 
 /** Fills $.state from the store after a restart; after a reload $.state is the fresher copy. */
 async function loadFromStore($: Engine): Promise<void> {
   const stored = ((await $.store.get(STORE_KEY)) ?? {}) as Record<string, CodexAgent>
-  const agents = await update($, agentsAtom, live => ({ ...stored, ...live }))
-  await afterWrite($, agents)
+  await update($, agentsAtom, live => ({ ...stored, ...live }))
 }
 
 // ------------------------------------------------------------ bridge
@@ -202,11 +207,12 @@ async function startBridge($: Engine): Promise<void> {
       $.ui.log(`codex bridge: unreadable line ${clip(line, 200)}`, { to: 'debug' })
       return
     }
-    if (event.type === 'ready') current.resolve(event.socket)
     if (event.type === 'fatal') current.reject(new CodexError(`codex bridge failed: ${event.message}`))
     try {
       await onEvent($, event)
+      if (event.type === 'ready') current.resolve(event.socket)
     } catch (error) {
+      if (event.type === 'ready') current.reject(new CodexError(`codex recovery failed: ${errorText(error)}`))
       $.ui.log(`codex: handling ${clip(line, 120)} failed: ${String(error)}`, { to: 'debug' })
     }
   }
@@ -229,6 +235,8 @@ async function startBridge($: Engine): Promise<void> {
       loadedThreads.clear()
       current.reject(new CodexError('the codex bridge stopped'))
       if (socket === current) socket = null
+      registryAddress = null
+      recovery = null
     }
   })()
 }
@@ -241,7 +249,12 @@ async function bridgeSocket($: Engine): Promise<string> {
 }
 
 async function post($: Engine, endpoint: string, body: unknown): Promise<Record<string, unknown>> {
-  const { url, socketPath } = bridgeTarget(await bridgeSocket($), endpoint)
+  const address = await bridgeSocket($)
+  return postAt($, endpoint.startsWith('/registry/') ? registryAddress ?? address : address, endpoint, body)
+}
+
+async function postAt($: Engine, address: string, endpoint: string, body: unknown): Promise<Record<string, unknown>> {
+  const { url, socketPath } = bridgeTarget(address, endpoint)
   const response = await $.http.fetch(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -257,7 +270,7 @@ async function post($: Engine, endpoint: string, body: unknown): Promise<Record<
 /** One JSON-RPC call to codex app-server; resolves its `result`. */
 async function rpc<T>($: Engine, method: string, params: unknown): Promise<T> {
   // The bridge answers with a timeout error before $.http.fetch's own 30 s cap.
-  return (await post($, '/rpc', { method, params, timeoutMs: POLL_SLICE_MS })).result as T
+  return (await post($, '/rpc', { method, params, timeoutMs: RPC_TIMEOUT_MS })).result as T
 }
 
 type WaitAnswer =
@@ -447,10 +460,61 @@ async function isCodexType($: Engine, agentId: string): Promise<boolean> {
 
 /** The Codex job a SendMessage recipient names: an agentId, or the name the Agent call gave. */
 async function recipient($: Engine, to: string): Promise<CodexAgent | undefined> {
+  const info = (await $.agent.list()).find(agent => agent.id === to || agent.name === to)
+  if (!(await read($, agentsAtom))[to] && (!info || aliasOfType(info.type) === undefined)) return undefined
+  await reconcileAgents($)
   const agents = await read($, agentsAtom)
   if (agents[to]) return agents[to]
-  const info = (await $.agent.list()).find(agent => agent.name === to)
   return info ? agents[info.id] : undefined
+}
+
+const missingThread = (id: string) => `No saved Codex thread for agent ${id}. Its job record is missing; start a new codex:* agent. Do not retry codex_await.`
+
+/** Native IDs remain authoritative when Claude restores agents under a different session ID. */
+async function reconcileAgents($: Engine, address?: string, ref?: string): Promise<void> {
+  const sessionId = await $.session.id()
+  const native = (await $.agent.list()).filter(agent => aliasOfType(agent.type) !== undefined)
+  const bridge = address ?? await bridgeSocket($)
+  const target = registryAddress ?? bridge
+  const disk = (await postAt($, target, '/registry/read', { sessionId, ids: native.map(agent => agent.id), ref })).agents as Record<string, CodexAgent>
+  const now = await $.clock.now()
+  const missing: Record<string, CodexAgent> = {}
+  const held = await read($, agentsAtom)
+  for (const info of native) {
+    if (held[info.id] || disk[info.id] || spawnsInFlight > 0) continue
+    const alias = aliasOfType(info.type) as string
+    missing[info.id] = {
+      ...(await newAgent($, info.id, '', {
+        name: info.description || info.name || info.id, description: info.description,
+        model: modelFor(new Map(), alias), effort: 'unknown', sandbox: 'read-only', approvals: 'never',
+        cwd: await $.session.cwd(), msgKey: '',
+      })),
+      status: 'failed', error: missingThread(info.id), activity: 'missing job record', lastTurnStatus: 'failed',
+    }
+  }
+  const nativeIds = new Set(native.map(agent => agent.id))
+  let changed: string[] = []
+  const agents = await update($, agentsAtom, live => {
+    changed = Object.keys(missing)
+    const all = { ...missing, ...live }
+    for (const [id, agent] of Object.entries(disk)) {
+      if (!all[id]?.threadId || agent.updatedAt > (all[id]?.updatedAt ?? -1)) all[id] = agent
+    }
+    for (const id of nativeIds) {
+      const agent = all[id]
+      if (agent && agent.sessionId !== sessionId) {
+        all[id] = { ...agent, sessionId, updatedAt: Math.max(now, agent.updatedAt + 1) }
+        if (isLive(agent) && recovery && !recovery.reattached && !recovery.active[agent.threadId]) {
+          all[id] = { ...all[id]!, status: 'interrupted', currentTurnId: null, lastTurnStatus: 'interrupted',
+            error: 'the turn was lost when the Codex process restarted; a SendMessage to its agent starts a new turn on the thread' }
+        }
+        changed.push(id)
+      }
+    }
+    return all
+  })
+  for (const id of changed) await postAt($, target, '/registry/write', { agent: agents[id] })
+  if (changed.length) await $.store.set(STORE_KEY, trim(agents))
 }
 
 /** Records how the turn the bridge reported ended, if the registry has not yet. */
@@ -510,6 +574,8 @@ const messagesText = (count: number) => `Codex sent ${count === 1 ? 'a message' 
  */
 async function awaitJob($: Engine, agentId: string | undefined, signal: AbortSignal): Promise<string> {
   if (agentId === undefined) throw new CodexError('codex_await serves codex:* agents only')
+  if (!(await read($, agentsAtom))[agentId] && !(await isCodexType($, agentId))) throw new CodexError('codex_await serves codex:* agents only')
+  await reconcileAgents($)
   const startedAt = await $.clock.now()
   const deadline = startedAt + AWAIT_MS
   let settling = 0
@@ -519,8 +585,8 @@ async function awaitJob($: Engine, agentId: string | undefined, signal: AbortSig
       // A message sent just before the turn ended still goes out, ahead of the result;
       // with the bridge gone there is none to read, and the result goes alone.
       try {
-        const last = (await post($, '/wait', { threadId: agent.threadId, msgKey: agent.msgKey, timeoutMs: 1 })) as unknown as WaitAnswer
-        if (last.status === 'message') await queueMessages($, agentId, last.messages)
+        const last = agent.threadId ? (await post($, '/wait', { threadId: agent.threadId, msgKey: agent.msgKey, timeoutMs: 1 })) as unknown as WaitAnswer : null
+        if (last?.status === 'message') await queueMessages($, agentId, last.messages)
       } catch (error) {
         $.ui.log(`codex: reading ${agent.name}'s last messages failed: ${errorText(error)}`, { to: 'debug' })
       }
@@ -543,6 +609,8 @@ async function awaitJob($: Engine, agentId: string | undefined, signal: AbortSig
       answer = await waitTurn($, agent.threadId, Math.min(left, POLL_SLICE_MS), agent.msgKey)
     } catch (error) {
       if (signal.aborted) throw error
+      // A host HTTP timeout alone does not mean the Codex process died.
+      if (/no complete answer within 30000ms/.test(errorText(error))) continue
       // The bridge is gone (its daemon stopped or reset the wait): the turn cannot be followed, so the job
       // ends interrupted with the reason; its thread is intact, and a SendMessage starts a new turn on it.
       const now = await $.clock.now()
@@ -652,29 +720,37 @@ async function onRequest($: Engine, id: number | string, method: string, params:
 }
 
 /** After the bridge (re)starts: settle agents whose turn did not survive. */
-async function onReady($: Engine, reattached: boolean, active: Record<string, string>): Promise<void> {
-  for (const agent of Object.values(await read($, agentsAtom))) {
-    if (!isLive(agent)) continue
+async function onReady($: Engine, address: string, reattached: boolean, active: Record<string, string>): Promise<void> {
+  // A hot reload or an in-process session switch need not fire session.start.
+  await loadFromStore($)
+  await reconcileAgents($, address)
+  const sessionId = await $.session.id()
+  const now = await $.clock.now()
+  const agents = await update($, agentsAtom, all => Object.fromEntries(Object.entries(all).map(([id, agent]) => {
+    if (agent.sessionId !== sessionId || !isLive(agent)) return [id, agent]
     const turnId = active[agent.threadId]
     if (turnId) {
       loadedThreads.add(agent.threadId)
-      await patchAgent($, agent.id, () => ({ status: 'running', currentTurnId: turnId }))
-    } else if (!reattached) {
-      // A reattached daemon replays the turn's end from its buffer; a new one never saw it.
-      await patchAgent($, agent.id, () => ({
-        status: 'interrupted',
-        currentTurnId: null,
-        lastTurnStatus: 'interrupted',
-        error: 'the turn was lost when the Codex process restarted; a SendMessage to its agent starts a new turn on the thread',
-      }))
+      return [id, { ...agent, status: 'running', currentTurnId: turnId, updatedAt: Math.max(now, agent.updatedAt + 1) }]
     }
+    // A reattached daemon replays the turn's end from its buffer; a new one never saw it.
+    return [id, reattached ? agent : {
+      ...agent, status: 'interrupted', currentTurnId: null, lastTurnStatus: 'interrupted', updatedAt: Math.max(now, agent.updatedAt + 1),
+      error: 'the turn was lost when the Codex process restarted; a SendMessage to its agent starts a new turn on the thread',
+    }]
+  })))
+  for (const agent of Object.values(agents)) {
+    if (agent.sessionId === sessionId) await postAt($, registryAddress ?? address, '/registry/write', { agent })
   }
+  await $.store.set(STORE_KEY, trim(agents))
 }
 
 async function onEvent($: Engine, event: BridgeEvent): Promise<void> {
   switch (event.type) {
     case 'ready':
-      await onReady($, event.reattached, event.active)
+      registryAddress = event.registry ?? event.socket
+      recovery = { reattached: event.reattached, active: event.active }
+      await onReady($, event.socket, event.reattached, event.active)
       return
     case 'notification':
       await onNotification($, event.method, event.params)
@@ -687,8 +763,9 @@ async function onEvent($: Engine, event: BridgeEvent): Promise<void> {
       return
     case 'exit':
       $.ui.log(`codex app-server exited (${event.code ?? event.signal}). ${event.stderrTail.slice(-3).join(' | ')}`)
+      const sessionId = await $.session.id()
       for (const agent of Object.values(await read($, agentsAtom))) {
-        if (isLive(agent)) {
+        if (agent.sessionId === sessionId && isLive(agent)) {
           await patchAgent($, agent.id, () => ({ status: 'failed', currentTurnId: null, error: 'codex app-server exited' }))
         }
       }
@@ -717,6 +794,7 @@ const TOOL_NAMES: readonly ToolName[] = ['codex_list', 'codex_result', 'codex_aw
 /** Serves codex_list (this session's jobs) and codex_result (any job); a CodexError becomes the call's error text. */
 async function runTool($: Engine, name: 'codex_list' | 'codex_result', e: unknown): Promise<string> {
   const args = e as Record<string, unknown>
+  await reconcileAgents($, undefined, textArg(args.id))
   if (name === 'codex_list') return listText(sorted(await read($, agentsAtom)), await $.session.id(), await $.clock.now())
   const ref = textArg(args.id)
   if (!ref) throw new CodexError('id is required')
@@ -791,20 +869,25 @@ export const register: Register = (on, options) => {
     } catch (error) {
       return { deny: `codex: ${errorText(error)}` }
     }
-    const spawned = await next({ ...e, background: true })
-    if (spawned.agentId === undefined) {
-      void releaseThread($, threadId)
-      return spawned
-    }
-    const agent = await putAgent($, await newAgent($, spawned.agentId, threadId, input))
+    spawnsInFlight += 1
     try {
-      await startTurn($, agent, body)
-    } catch (error) {
-      // The subagent runs: it ends at once with this reason as its answer.
-      await patchAgent($, agent.id, () => ({ status: 'failed', error: `the Codex turn did not start: ${errorText(error)}` }))
-      void releaseThread($, threadId)
+      const spawned = await next({ ...e, background: true })
+      if (spawned.agentId === undefined) {
+        void releaseThread($, threadId)
+        return spawned
+      }
+      const agent = await putAgent($, await newAgent($, spawned.agentId, threadId, input))
+      try {
+        await startTurn($, agent, body)
+      } catch (error) {
+        // The subagent runs: it ends at once with this reason as its answer.
+        await patchAgent($, agent.id, () => ({ status: 'failed', error: `the Codex turn did not start: ${errorText(error)}` }))
+        void releaseThread($, threadId)
+      }
+      return spawned
+    } finally {
+      spawnsInFlight -= 1
     }
-    return spawned
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'codex: the Codex job did not start (the hook failed or ran out of time)' }))
 
   // The codex:* subagent's loop: every model request is answered here and no
@@ -813,11 +896,13 @@ export const register: Register = (on, options) => {
   // turn ended, the answer is the Codex final message, verbatim.
   on('turn.step', async function* ($, e, next) {
     if (e.agentId === undefined || foreignAgents.has(e.agentId)) return yield* next(e)
-    const agent = (await read($, agentsAtom))[e.agentId]
+    let agent = (await read($, agentsAtom))[e.agentId]
     if (!agent && !(await isCodexType($, e.agentId))) {
       foreignAgents.add(e.agentId)
       return yield* next(e)
     }
+    await reconcileAgents($)
+    agent = (await read($, agentsAtom))[e.agentId]
     const message = agent?.outbox[0]
     if (agent && message !== undefined) {
       // A codex-msg message goes to the main session as this agent's own SendMessage, verbatim.
@@ -842,9 +927,14 @@ export const register: Register = (on, options) => {
   on('session.send', async ($, e, next) => {
     const agent = await recipient($, e.to)
     if (!agent) return next(e)
+    if (!agent.threadId) return { isDelivered: false as const, reason: missingThread(agent.id) }
     try {
       await sendMessage($, agent, e.text)
     } catch (error) {
+      await patchAgent($, agent.id, () => ({
+        ...(agent.status === 'running' ? {} : { status: 'failed' as const, currentTurnId: null }),
+        error: `the Codex message did not start or resume a turn: ${errorText(error)}`,
+      }))
       return { isDelivered: false as const, reason: `Codex did not take the message: ${errorText(error)}` }
     }
     return next(e)
@@ -942,7 +1032,8 @@ export const register: Register = (on, options) => {
   // Running agents ride at the end of the hint line under the prompt, where native background
   // tasks show; nothing is added while none runs.
   on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
-    const tail = runningTail(Object.values(await read($, agentsAtom)))
+    const sessionId = await $.session.id()
+    const tail = runningTail(Object.values(await read($, agentsAtom)).filter(agent => agent.sessionId === sessionId))
     if (!tail) return next(e)
     return next({ ...e, props: { ...e.props, tail: e.props.tail ? `${e.props.tail} · ${tail}` : tail } })
   })

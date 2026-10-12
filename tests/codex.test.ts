@@ -48,6 +48,7 @@ type Fake = {
   turnCount: number
   registeredAgents: Record<string, unknown>[]
   store: Record<string, unknown>
+  disk: Record<string, CodexAgent>
   /** Where each bridge fetch went: `<socketPath> <url>`. */
   targets: string[]
   /** Transcript lines and toasts the person saw. */
@@ -62,7 +63,7 @@ const posixPath = (path: string) => path.replace(/^[A-Za-z]:/, '').replaceAll('\
 
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max']
 
-function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<string, string> = {}): Fake {
+function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<string, string> = {}, disk: Record<string, CodexAgent> = {}): Fake {
   const fake: Fake = {
     argv: [],
     queue: [],
@@ -88,6 +89,7 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
     waitError: null,
     registeredAgents: [],
     store: { ...stored },
+    disk: JSON.parse(JSON.stringify(disk)),
     targets: [],
     shown: [],
     models: [
@@ -181,6 +183,14 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
     const path = new URL(e.url).pathname.replace(/^\/s3cret(?=\/)/, '')
     const body = JSON.parse(e.init?.body ?? '{}') as Record<string, unknown>
     let reply: unknown = { ok: true }
+    if (path === '/registry/read') {
+      const ids = (body.ids ?? []) as string[]
+      reply = { agents: Object.fromEntries(Object.values(fake.disk).filter(agent => agent.sessionId === body.sessionId || ids.includes(agent.id) || agent.id === body.ref || agent.name === body.ref).map(agent => [agent.id, agent])) }
+    }
+    if (path === '/registry/write') {
+      const agent = body.agent as CodexAgent
+      if (!fake.disk[agent.id] || fake.disk[agent.id]!.updatedAt <= agent.updatedAt) fake.disk[agent.id] = JSON.parse(JSON.stringify(agent))
+    }
     if (path === '/rpc') {
       const rpc = { method: String(body.method), params: (body.params ?? {}) as Record<string, unknown> }
       fake.rpcs.push(rpc)
@@ -413,7 +423,7 @@ test('the wrapper loop: codex_await while Codex runs, then the Codex final messa
   const awaited = await awaitCall($, 'a1')
   expect(awaited.result).toBe(final)
   // Three slices, then the read of any message sent as the turn ended.
-  expect(fake.waits.map(wait => wait.timeoutMs)).toEqual([25_000, 25_000, 25_000, 1])
+  expect(fake.waits.map(wait => wait.timeoutMs)).toEqual([20_000, 20_000, 20_000, 1])
   expect((await agentsOf(fake)).a1).toMatchObject({ status: 'idle', lastMessage: final })
 
   // The report goes back through SubagentHandback, verbatim.
@@ -702,7 +712,7 @@ test("Windows bridge: requests go to the daemon's loopback URL under its secret,
   push(fake, { type: 'ready', socket: 'http://127.0.0.1:5000/s3cret', reattached: false, active: {} })
   const agent = await spawn($, fake, 'x')
   expect(fake.targets.length).toBeGreaterThan(0)
-  for (const target of fake.targets) expect(target).toMatch(/^ http:\/\/127\.0\.0\.1:5000\/s3cret\/(rpc|wait)$/)
+  for (const target of fake.targets) expect(target).toMatch(/^ http:\/\/127\.0\.0\.1:5000\/s3cret\/(rpc|wait|registry\/(read|write))$/)
   const started = fake.rpcs.find(rpc => rpc.method === 'thread/start')?.params as { config: { mcp_servers: Record<string, { args: string[] }> } }
   expect(started.config.mcp_servers.claude_session?.args.slice(1)).toEqual(['http://127.0.0.1:5000/s3cret', String(agent.msgKey)])
   done(fake)
@@ -854,7 +864,7 @@ test('after a reload the registry comes back from the store and live turns reatt
   const base = {
     threadId: 'th-old', model: 'gpt-6-luna', effort: 'low', sandbox: 'workspace-write', approvals: 'ask', cwd: '/work',
     currentTurnId: 'turn-9', lastTurnId: null, lastTurnStatus: null, lastMessage: '', activity: 'x', lastCommand: '',
-    tokens: 0, error: null, digest: [], startedAt: 1, updatedAt: 1, turnStartedAt: 1, turnEndedAt: 0, sessionId: 's',
+    tokens: 0, error: null, digest: [], startedAt: 1, updatedAt: 1, turnStartedAt: 1, turnEndedAt: 0, sessionId: 'session-1',
   }
   const fake = fakeBridge(on, {
     agents: {
@@ -872,6 +882,122 @@ test('after a reload the registry comes back from the store and live turns reatt
   await send($, 'bbb222', 'continue')
   expect(fake.rpcs.map(rpc => rpc.method)).toEqual(['thread/resume', 'turn/start'])
   expect(fake.rpcs[0]?.params).toMatchObject({ threadId: 'th-lost', sandbox: 'workspace-write', approvalPolicy: 'on-request' })
+  done(fake)
+})
+
+const savedAgent = (id: string, extra: Partial<CodexAgent> = {}): CodexAgent => ({
+  id, name: `Saved ${id}`, description: 'saved work', threadId: `th-${id}`, model: 'gpt-6.1-sol',
+  effort: 'high', sandbox: 'full-access', approvals: 'ask', cwd: '/work', status: 'running',
+  currentTurnId: 'old-turn', lastTurnId: null, lastTurnStatus: null, lastMessage: 'previous result',
+  activity: 'working', msgKey: `key-${id}`, outbox: [], tokens: 123, error: null, digest: [],
+  startedAt: 1, updatedAt: 2, turnStartedAt: 1, turnEndedAt: 0, sessionId: 'old-session', ...extra,
+})
+
+test('restart with an empty store restores native jobs from disk across session IDs, then resumes the real Codex thread before delivery', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on, {}, {}, { a1: savedAgent('a1'), elsewhere: savedAgent('elsewhere') })
+  fake.agentList.push({ id: 'a1', type: 'codex:sol', name: 'helper' })
+  // New relay, older daemon: persistence is served separately from Codex RPCs.
+  await start($, fake, { registry: 'http://127.0.0.1:5001/s3cret' })
+  const listed = String((await $.tool.call({ tool: 'mcp__codex__codex_list' } as never)).result)
+  expect(listed).toContain('a1 Saved a1 [gpt-6.1-sol/high, full-access, approvals ask] interrupted')
+  expect(listed).not.toContain('elsewhere')
+  expect(fake.disk.elsewhere?.status).toBe('running')
+  expect(fake.disk.a1?.sessionId).toBe('session-1')
+  expect(String((await $.tool.call({ tool: 'mcp__codex__codex_result', id: 'a1' } as never)).result)).toContain('previous result')
+  expect(await send($, 'helper', 'continue the saved work')).toEqual({ isDelivered: true })
+  expect(fake.rpcs.map(rpc => rpc.method)).toEqual(['thread/resume', 'turn/start'])
+  expect(fake.rpcs[0]?.params).toMatchObject({ threadId: 'th-a1', model: 'gpt-6.1-sol', sandbox: 'danger-full-access', approvalPolicy: 'on-request' })
+  expect(fake.rpcs[1]?.params).toMatchObject({ threadId: 'th-a1', input: [{ text: 'continue the saved work' }], sandboxPolicy: { type: 'dangerFullAccess' } })
+  expect(fake.delivered).toEqual([{ to: 'helper', text: 'continue the saved work' }])
+  expect(fake.targets.filter(target => target.includes('/registry/')).every(target => target.startsWith(' http://127.0.0.1:5001/'))).toBe(true)
+  fake.waitQueue = [completed('turn-1', 'RESUMED RESULT')]
+  expect((await awaitCall($, 'a1')).result).toBe('RESUMED RESULT')
+  expect(await finalOf($, 'a1')).toBe('RESUMED RESULT')
+  expect(fake.modelSteps).toBe(0)
+  done(fake)
+})
+
+test('restored native jobs with missing records show failed, refuse SendMessage, and end the wrapper without repeated awaits', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake)
+  // Native agents may be restored after session.start, as after compaction.
+  fake.agentList.push({ id: 'lost', type: 'codex:sol', name: 'helper' })
+  const listed = String((await $.tool.call({ tool: 'mcp__codex__codex_list' } as never)).result)
+  expect(listed).toContain('lost')
+  expect(listed).toContain('] failed')
+  const result = String((await $.tool.call({ tool: 'mcp__codex__codex_result', id: 'lost' } as never)).result)
+  expect(result).toContain('No saved Codex thread for agent lost')
+  expect(await send($, 'helper', 'continue')).toMatchObject({ isDelivered: false, reason: 'No saved Codex thread for agent lost. Its job record is missing; start a new codex:* agent. Do not retry codex_await.' })
+  expect(fake.delivered).toEqual([])
+  expect((await awaitCall($, 'lost')).result).toContain('Codex failed: No saved Codex thread')
+  expect(await finalOf($, 'lost')).toContain('Codex failed: No saved Codex thread')
+  expect(fake.waits).toEqual([])
+  expect(fake.rpcs).toEqual([])
+  expect(fake.modelSteps).toBe(0)
+  done(fake)
+})
+
+test('a persisted thread that Codex cannot resume fails before the Claude wrapper is restarted', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on, {}, {}, { a1: savedAgent('a1') })
+  fake.agentList.push({ id: 'a1', type: 'codex:sol' })
+  await start($, fake)
+  fake.rpcErrors['thread/resume'] = 'thread not found'
+  expect(await send($, 'a1', 'continue')).toMatchObject({ isDelivered: false, reason: 'Codex did not take the message: thread not found' })
+  expect(fake.rpcs.map(rpc => rpc.method)).toEqual(['thread/resume'])
+  expect(fake.delivered).toEqual([])
+  expect((await agentsOf(fake)).a1).toMatchObject({ status: 'failed', currentTurnId: null })
+  expect(await finalOf($, 'a1')).toContain('thread not found')
+  done(fake)
+})
+
+test('a native agent restored after bridge startup is still listed as interrupted and resumes its saved thread', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on, {}, {}, { late: savedAgent('late') })
+  await start($, fake)
+  // Wait for startup before the engine restores its native agent rows.
+  await $.tool.call({ tool: 'mcp__codex__codex_list' } as never)
+  fake.agentList.push({ id: 'late', type: 'codex:sol' })
+  expect(String((await $.tool.call({ tool: 'mcp__codex__codex_list' } as never)).result)).toContain('] interrupted')
+  expect(await send($, 'late', 'continue')).toEqual({ isDelivered: true })
+  expect(fake.rpcs.map(rpc => rpc.method)).toEqual(['thread/resume', 'turn/start'])
+  done(fake)
+})
+
+test('a lazy bridge start migrates legacy records even when session.start did not fire', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on, { agents: { a1: savedAgent('a1') } })
+  fake.agentList.push({ id: 'a1', type: 'codex:sol' })
+  push(fake, { type: 'ready', socket: '/tmp/cxb-test/s', reattached: false, active: {} })
+  expect(await send($, 'a1', 'continue')).toEqual({ isDelivered: true })
+  expect(fake.disk.a1?.threadId).toBe('th-a1')
+  expect(fake.rpcs.map(rpc => rpc.method)).toEqual(['thread/resume', 'turn/start'])
+  done(fake)
+})
+
+test('an HTTP wait timeout does not lose a long-running Codex turn', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake)
+  await spawn($, fake)
+  fake.waitQueue = [
+    { error: { message: '$.http.fetch aborted: no complete answer within 30000ms' } },
+    { status: 'timeout' },
+    completed('turn-1', 'LONG TURN DONE'),
+  ]
+  expect((await awaitCall($, 'a1')).result).toBe('LONG TURN DONE')
+  expect(fake.waits.map(wait => wait.timeoutMs)).toEqual([20_000, 20_000, 20_000, 1])
+  expect((await agentsOf(fake)).a1).toMatchObject({ status: 'idle', lastTurnStatus: 'completed', error: null })
+  done(fake)
+})
+
+test('a refused message does not discard a still-running turn or prevent TaskStop', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake)
+  await spawn($, fake)
+  fake.rpcErrors['turn/steer'] = 'steer refused'
+  fake.rpcErrors['turn/start'] = 'thread busy'
+  expect(await send($, 'a1', 'continue')).toMatchObject({ isDelivered: false })
+  expect((await agentsOf(fake)).a1).toMatchObject({ status: 'running', currentTurnId: 'turn-1' })
+  expect(fake.delivered).toEqual([])
+  await $.turn.complete({ answer: '', durationMs: 5, isAborted: true, turnId: 't-a1', agentId: 'a1', reason: 'aborted' })
+  expect(fake.rpcs.find(rpc => rpc.method === 'turn/interrupt')?.params).toMatchObject({ threadId: 'th-1', turnId: 'turn-1' })
   done(fake)
 })
 
@@ -952,7 +1078,7 @@ test('codex_list and codex_result read the jobs', { timeoutMs: 20_000 }, async (
   done(fake)
 })
 
-test("codex_list shows this session's latest 10 jobs, newest first; codex_result reads any job", { timeoutMs: 20_000 }, async ($, on) => {
+test("codex_list shows every session job, newest first; codex_result reads any job", { timeoutMs: 20_000 }, async ($, on) => {
   const base = {
     model: 'gpt-6-luna', effort: 'low', sandbox: 'workspace-write', approvals: 'auto', cwd: '/work', status: 'idle',
     currentTurnId: null, lastTurnId: 'turn-1', lastTurnStatus: 'completed', lastMessage: 'OLD RESULT', activity: 'completed', msgKey: 'k', outbox: [],
@@ -965,10 +1091,10 @@ test("codex_list shows this session's latest 10 jobs, newest first; codex_result
   const fake = fakeBridge(on, { agents })
   await start($, fake, { reattached: true })
   const listed = String((await $.tool.call({ tool: 'mcp__codex__codex_list' } as never)).result).split('\n')
-  expect(listed).toHaveLength(11)
+  expect(listed).toHaveLength(12)
   expect(listed[0]).toMatch(/^j12 job 12 \[gpt-6-luna\/low, workspace-write, approvals auto\] idle 0s, 0 tok: completed$/)
   expect(listed[9]).toMatch(/^j3 job 3 /)
-  expect(listed[10]).toBe('2 older (codex_result still reads them by id).')
+  expect(listed[11]).toMatch(/^j1 job 1 /)
   expect(String((await $.tool.call({ tool: 'mcp__codex__codex_result', id: 'other' } as never)).result)).toContain('Final message:\nOLD RESULT')
   expect(listText([], 'session-1', 0)).toContain('No Codex agents in this session')
   done(fake)

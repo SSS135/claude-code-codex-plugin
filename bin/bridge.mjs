@@ -51,6 +51,7 @@ import os from 'node:os'
 import path from 'node:path'
 import readline from 'node:readline'
 import { fileURLToPath } from 'node:url'
+import { serveRegistry } from './registry.mjs'
 
 const GRACE_MS = 20_000
 const IDLE_MS = 10 * 60_000
@@ -358,7 +359,9 @@ async function daemon(codexPath, dir) {
         return sendJson(res, 200, { ok: true })
       }
       if (url.pathname === '/wait') {
-        const { threadId, msgKey, timeoutMs = 600_000 } = body
+        const { threadId, msgKey } = body
+        // The hook host aborts HTTP at 30 s. Bound even legacy callers' waits.
+        const timeoutMs = Math.max(1, Math.min(Number(body.timeoutMs) || 20_000, 20_000))
         // Messages first: a job may send one and end its turn before the next poll.
         if (msgKey && mailboxes.get(msgKey)?.length) return sendJson(res, 200, { status: 'message', messages: drainMail(msgKey) })
         if (!active.has(threadId)) return sendJson(res, 200, { status: 'idle', turn: lastTurn.get(threadId) ?? null })
@@ -535,6 +538,7 @@ async function relay(codexPath, sessionKey) {
     if (process.ppid !== parent || !isAlive(parent)) process.exit(0)
   }, 1000).unref()
   for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => process.exit(0))
+  const registry = await serveRegistry()
 
   const key = sessionKey.replace(/[^A-Za-z0-9]/g, '').slice(0, 16) || 'default'
   const base = privateBase()
@@ -577,7 +581,7 @@ async function relay(codexPath, sessionKey) {
     if (first) {
       first = false
       const hello = JSON.parse(line)
-      out({ type: 'ready', socket: socketPath, reattached: hello.reattached, active: hello.active })
+      out({ type: 'ready', socket: socketPath, registry: registry.address, reattached: hello.reattached, active: hello.active })
       continue
     }
     process.stdout.write(line + '\n')

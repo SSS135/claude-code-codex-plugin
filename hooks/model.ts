@@ -17,7 +17,7 @@ export type Settings = {
 }
 
 export type BridgeEvent =
-  | { type: 'ready'; socket: string; reattached: boolean; active: Record<string, string> }
+  | { type: 'ready'; socket: string; registry?: string; reattached: boolean; active: Record<string, string> }
   | { type: 'notification'; method: string; params: Record<string, unknown> }
   | { type: 'request'; id: number | string; method: string; params: Record<string, unknown> }
   | { type: 'exit'; code: number | null; signal: string | null; stderrTail: string[] }
@@ -598,6 +598,7 @@ export const WRAPPER_PROMPT = [
   'When it returns a message from Codex for the main session, send exactly that text with SendMessage to "main", then call it again.',
   `When it returns the result, deliver exactly that text, nothing added, removed or reworded: with ${HANDBACK_TOOL} when you have that tool, else as your reply.`,
   'Never do the task yourself and never call any other tool.',
+  'If codex_await fails, report its error and stop. Never retry a missing job or diagnose the tool yourself.',
 ].join(' ')
 
 export const agentSpecs = (defaults: Defaults): AgentSpec[] =>
@@ -649,17 +650,11 @@ export function describeAgent(agent: CodexAgent, now: number): string {
   return `${agent.id} ${agent.name} [${agent.model}/${agent.effort}, ${agent.sandbox}, approvals ${agent.approvals}] ${agent.status}${time ? ` ${time}` : ''}, ${formatTokens(agent.tokens)}: ${clip(firstLine(doing), 100)}`
 }
 
-/** How many of a session's jobs codex_list shows. */
-export const LIST_LIMIT = 10
-
-/** codex_list: the session's jobs, newest first (`agents` sorted so), the latest LIST_LIMIT of them. */
+/** codex_list: all of the session's jobs, newest first (`agents` sorted so). */
 export function listText(agents: readonly CodexAgent[], sessionId: string, now: number): string {
   const mine = agents.filter(agent => agent.sessionId === sessionId)
   if (mine.length === 0) return 'No Codex agents in this session. The Agent tool starts one with subagent_type codex:luna, codex:sol, codex:astra or codex:terra.'
-  const lines = mine.slice(0, LIST_LIMIT).map(agent => describeAgent(agent, now))
-  const older = mine.length - LIST_LIMIT
-  if (older > 0) lines.push(`${older} older (codex_result still reads them by id).`)
-  return lines.join('\n')
+  return mine.map(agent => describeAgent(agent, now)).join('\n')
 }
 
 export function resultText(agent: CodexAgent, full: boolean, now: number): string {
@@ -728,7 +723,7 @@ const ID_PARAM = { type: 'string', description: "The agent id (the codex:* agent
 export const TOOL_SPECS: ToolSpec[] = [
   {
     name: 'codex_list',
-    description: `List this session's Codex jobs (codex:* agents), newest first, the latest ${LIST_LIMIT}: model, status and what each is doing.`,
+    description: "List all this session's Codex jobs (codex:* agents), including restored, interrupted and missing jobs, newest first: model, status and what each is doing.",
     inputSchema: { type: 'object', properties: {} },
   },
   {

@@ -99,10 +99,12 @@ Besides the agent types, Claude sees two tools as `mcp__codex__<name>`:
 
 | Tool | Parameters | What it does |
 | --- | --- | --- |
-| `codex_list` | none | Lists this session's Codex jobs, newest first and at most the latest 10, with model, status, tokens and current activity. |
+| `codex_list` | none | Lists every Codex job of this session, newest first, including restored, interrupted and missing jobs, with model, status, tokens and current activity. |
 | `codex_result` | `id`, `full` | Status and final message. With `full=true` it adds the turn digest: commands with exit codes, file changes and messages. |
 
-`id` is the agent's agentId or the job's name (its description, as `codex_list` shows it); `codex_result` reads any job the plugin still holds, including older ones and other sessions'. A third tool, `codex_await`, serves the wrapper agents alone and refuses any other caller.
+`id` is the agent's agentId or the job's name (its description, as `codex_list` shows it); `codex_result` reads saved jobs, including older ones and other sessions'. The list reconciles saved jobs with Claude's native agent IDs, so a restored agent is still included when Claude's session ID changes. A third tool, `codex_await`, serves the wrapper agents alone and refuses any other caller.
+
+Jobs are saved separately under `~/.claude/plugins/codex-agents/` (`CLAUDE_CONFIG_DIR/plugins/codex-agents/` when set), outside temporary task folders and versioned plugin installs. After a process restart, a running job is shown as interrupted; `SendMessage` loads its saved Codex thread with `thread/resume` and starts a new turn before resuming the wrapper. If its saved record or thread is missing, the message is refused with a clear reason and the wrapper stops instead of retrying `codex_await`. Records already lost by older versions cannot be reconstructed automatically.
 
 In the transcript each call is one row like a native one, for example `● Codex(list)` over `⎿  2 agents · 1 running`. While jobs run they are also named at the end of the hint line under the prompt (`codex: Fix flaky retry test (luna)`); the native task list (↓ to manage) shows and stops them.
 
@@ -145,7 +147,7 @@ When a setting comes from several places, the prompt's header lines beat the pro
 
 The hooks module starts `bin/bridge.mjs` as a relay (and Codex starts `bin/codex-msg` per thread, which posts to the same socket). The relay launches a detached daemon, or reattaches to one that is still running. The daemon owns `codex app-server` and serves an HTTP API on a Unix socket under `/tmp/cxb-<uid>/` (mode 0700, owned by your user). On Windows, where Node cannot listen on a Unix socket and the plugin API refuses a named pipe, it serves on a random `127.0.0.1` port instead, every path under a random 128-bit secret, and keeps that address in `%TEMP%\cxb\`. The module sends requests over that socket, and the relay streams the daemon's events back to it as NDJSON on stdout.
 
-The bridge exists because the plugin API cannot write to a child process's stdin once it has spawned it, and `codex app-server` speaks JSON-RPC over stdio. The daemon runs detached so that Codex turns keep running through a plugin reload. After a reload the module reattaches, and the job list is restored from the plugin store.
+The bridge exists because the plugin API cannot write to a child process's stdin once it has spawned it, and `codex app-server` speaks JSON-RPC over stdio. The daemon runs detached so that Codex turns keep running through a plugin reload. The relay also serves the durable agent registry over a separate loopback address under a random secret, including when it reattaches to an older daemon. Existing plugin-store records are migrated on startup; new writes replace only the changed agent's file atomically, so independent sessions cannot replace each other's records. HTTP waits use slices of at most 20 seconds, below the hook host's 30-second limit; that limit alone does not mark a running Codex turn as lost.
 
 Processes end with the work they serve:
 
@@ -174,6 +176,7 @@ Processes end with the work they serve:
 ```
 claude plugin validate .
 claude plugin test .
+node --test tests/registry.test.mjs
 claude --plugin-dir .
 ```
 
