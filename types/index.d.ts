@@ -29,6 +29,8 @@ export type CodexAgent = {
   activity: string
   tokens: number
   error: string | null
+  /** The latest non-terminal Codex error (a retry, a failed compaction, work after a reported end); the job runs on. */
+  warning?: string | null
   /** The key bin/codex-msg names this job by (in the thread's developer instructions). */
   msgKey: string
   /** codex-msg messages read from the bridge and not yet passed on to the main session. */

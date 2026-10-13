@@ -62,6 +62,12 @@ const DRAIN_CHECK_MS = 5_000
 const BUFFER_CAP = 5_000
 const MAILBOX_CAP = 50
 const MESSAGE_CAP = 20_000
+/**
+ * How long a failed turn/completed is held back. Codex has reported a turn failed
+ * ("Selected model is at capacity", "Error running remote compact task") and then
+ * kept working on the thread; work on it within this window drops the failure.
+ */
+const FAILED_HOLD_MS = Number(process.env.CODEX_BRIDGE_FAILED_HOLD_MS) || 30_000
 /** What a codex-msg delivery hands a waiting /wait. */
 const MAIL = Symbol('mail')
 const SELF = fileURLToPath(import.meta.url)
@@ -184,6 +190,7 @@ async function daemon(codexPath, dir) {
   const outstanding = new Map() // server request id -> event
   const active = new Map() // threadId -> running turnId
   const lastTurn = new Map() // threadId -> last completed turn
+  const failedHolds = new Map() // threadId -> timer of a failed turn/completed held back
   const waiters = new Map() // threadId -> Set<(value) => void>
   const mailboxes = new Map() // codex-msg key -> texts not yet read
   const mailWaiters = new Map() // codex-msg key -> Set<(value) => void>
@@ -244,15 +251,30 @@ async function daemon(codexPath, dir) {
       return
     }
     const { method, params = {} } = message
-    if (method === 'turn/started' && params.turn?.id) active.set(params.threadId, params.turn.id)
-    if (method === 'turn/completed' && params.turn) {
-      active.delete(params.threadId)
-      lastTurn.set(params.threadId, params.turn)
-      lastUse = Date.now()
+    const isTurnEnd = method === 'turn/completed' && params.turn
+    if ((isTurnEnd || method === 'turn/started' || method.startsWith('item/')) && failedHolds.has(params.threadId)) {
+      clearTimeout(failedHolds.get(params.threadId))
+      failedHolds.delete(params.threadId)
     }
+    if (method === 'turn/started' && params.turn?.id) active.set(params.threadId, params.turn.id)
+    // Work after the thread's turn ended: follow it as a running turn again.
+    if (method.startsWith('item/') && typeof params.turnId === 'string' && !active.has(params.threadId)) active.set(params.threadId, params.turnId)
     if (method === 'serverRequest/resolved' && params.requestId !== undefined) outstanding.delete(params.requestId)
-    if (!isNoise(method)) emit({ type: 'notification', method, params })
-    if (method === 'turn/completed' && params.turn) settleWaiters(params.threadId, { status: 'completed', turn: params.turn })
+    if (isTurnEnd && params.turn.status === 'failed') {
+      failedHolds.set(params.threadId, setTimeout(() => {
+        failedHolds.delete(params.threadId)
+        endTurn(params)
+      }, FAILED_HOLD_MS))
+    } else if (isTurnEnd) endTurn(params)
+    else if (!isNoise(method)) emit({ type: 'notification', method, params })
+  }
+
+  const endTurn = params => {
+    active.delete(params.threadId)
+    lastTurn.set(params.threadId, params.turn)
+    lastUse = Date.now()
+    emit({ type: 'notification', method: 'turn/completed', params })
+    settleWaiters(params.threadId, { status: 'completed', turn: params.turn })
   }
 
   readline.createInterface({ input: codex.stdout }).on('line', line => {

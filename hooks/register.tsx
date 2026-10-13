@@ -427,6 +427,7 @@ function startTurn($: Engine, agent: CodexAgent, text: string): Promise<CodexAge
       // turn/started may already have landed with the same id
       currentTurnId: started.turn.id,
       error: null,
+      warning: null,
       activity: current.currentTurnId === started.turn.id ? current.activity : 'thinking',
       turnStartedAt: now,
     }))
@@ -638,6 +639,15 @@ async function onNotification($: Engine, method: string, params: Record<string, 
   const agent = byThread(await read($, agentsAtom), params.threadId)
   if (!agent) return
   const turn = params.turn as Record<string, unknown> | undefined
+  if (method.startsWith('item/') && typeof params.turnId === 'string' && !isLive(agent)) {
+    // The thread still works after its job was settled: the job runs again.
+    const turnId = params.turnId
+    await patchAgent($, agent.id, current => isLive(current) ? {} : {
+      status: 'running', currentTurnId: turnId,
+      warning: `Codex kept working after its turn was reported ${current.lastTurnStatus ?? current.status}${current.error ? `: ${current.error}` : ''}`,
+      error: null,
+    })
+  }
   switch (method) {
     case 'turn/started': {
       const now = await $.clock.now()
@@ -668,8 +678,10 @@ async function onNotification($: Engine, method: string, params: Record<string, 
       return
     }
     case 'error': {
-      const error = params.error as { message?: string } | undefined
-      if (params.willRetry !== true) await patchAgent($, agent.id, () => ({ error: error?.message ?? 'error' }))
+      // Never terminal: only turn/completed ends a turn (Codex retries, or works on after a failed compaction).
+      const message = (params.error as { message?: string } | undefined)?.message ?? 'error'
+      const warning = params.willRetry === true ? `${message} (retrying)` : message
+      await patchAgent($, agent.id, current => ({ warning, digest: [...current.digest, `warning: ${clip(firstLine(warning), 200)}`] }))
       return
     }
     case 'turn/completed': {
@@ -679,8 +691,8 @@ async function onNotification($: Engine, method: string, params: Record<string, 
       await patchAgent($, agent.id, current =>
         current.currentTurnId === null || current.currentTurnId === turn.id ? afterTurn(current, turn, now) : {},
       )
-      // Never hold the event loop on the release.
-      void releaseThread($, params.threadId)
+      // Never hold the event loop on the release. A failed turn's thread stays subscribed: Codex may work on.
+      if (turn.status !== 'failed') void releaseThread($, params.threadId)
       return
     }
   }

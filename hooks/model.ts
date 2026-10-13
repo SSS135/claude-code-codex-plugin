@@ -647,7 +647,7 @@ export function wrapperAnswer(agent: CodexAgent): string {
 export function describeAgent(agent: CodexAgent, now: number): string {
   const time = timeOf(agent, now)
   const doing = isLive(agent) ? agent.activity : (agent.lastTurnStatus ?? agent.status)
-  return `${agent.id} ${agent.name} [${agent.model}/${agent.effort}, ${agent.sandbox}, approvals ${agent.approvals}] ${agent.status}${time ? ` ${time}` : ''}, ${formatTokens(agent.tokens)}: ${clip(firstLine(doing), 100)}`
+  return `${agent.id} ${agent.name} [${agent.model}/${agent.effort}, ${agent.sandbox}, approvals ${agent.approvals}] ${agent.status}${time ? ` ${time}` : ''}, ${formatTokens(agent.tokens)}: ${clip(firstLine(doing), 100)}${agent.warning ? ` (warning: ${clip(firstLine(agent.warning), 120)})` : ''}`
 }
 
 /** codex_list: all of the session's jobs, newest first (`agents` sorted so). */

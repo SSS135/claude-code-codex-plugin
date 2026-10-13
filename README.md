@@ -38,7 +38,7 @@ Each agent runs the newest model of its family listed by the Codex CLI, comparin
 What happens then:
 
 - The plugin starts the Codex thread and turn itself, with the Agent call's prompt exactly as given (header lines taken off), in the Agent call's `cwd` or the session's. Nothing is relayed through a Claude model.
-- The agent the engine starts for it is a thin wrapper. Every model request of its loop is answered by the plugin (a `turn.step` hook): while Codex works, the wrapper calls the plugin's `codex_await` tool, and once the Codex turn ends, it hands back the Codex final message, verbatim. Where the engine requires a background subagent to report through `SubagentHandback` (auto mode), that call carries it; where the engine does not offer that tool, the failed call is followed by the message as the final text. No Claude model runs for it, so it costs no Claude tokens.
+- The agent the engine starts for it is a thin wrapper. Every model request of its loop is answered by the plugin (a `turn.step` hook): while Codex works, the wrapper calls the plugin's `codex_await` tool, and once the Codex turn ends, it hands back the Codex final message, verbatim. Codex `error` notifications (model capacity, retries, a failed compaction) are warnings shown by `codex_list` and `codex_result`, not an end; a failed turn end counts only when the thread does no more work for 30 s. Where the engine requires a background subagent to report through `SubagentHandback` (auto mode), that call carries it; where the engine does not offer that tool, the failed call is followed by the message as the final text. No Claude model runs for it, so it costs no Claude tokens.
 - The wrapper is a real background subagent: it is in the task list ("↓ to manage"), and its finish row and the notification Claude reads are the engine's own.
 - `SendMessage` to the agent (by its agentId, or the `name` the Agent call gave) goes to Codex first: it steers the running turn, or, once the agent finished, starts a new turn on the same Codex thread and resumes the agent, which then notifies again. If Codex refuses the message, `SendMessage` reports it as not delivered.
 - Codex can message the session mid-task (see Messages from Codex below), and a `SendMessage` reply reaches its running turn.
@@ -176,7 +176,7 @@ Processes end with the work they serve:
 ```
 claude plugin validate .
 claude plugin test .
-node --test tests/registry.test.mjs
+node --test tests/registry.test.mjs tests/bridge.test.mjs
 claude --plugin-dir .
 ```
 

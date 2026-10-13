@@ -1078,6 +1078,47 @@ test('codex_list and codex_result read the jobs', { timeoutMs: 20_000 }, async (
   done(fake)
 })
 
+const CAPACITY = 'Selected model is at capacity. Please try a different model.'
+const finished = (text: string) => note('turn/completed', { threadId: 'th-1', turn: { id: 'turn-1', status: 'completed', items: [{ type: 'agentMessage', text, phase: 'final_answer' }] } })
+
+test('a model-capacity error is a warning: the job runs on to its real end', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake)
+  await spawn($, fake)
+  push(fake, note('error', { threadId: 'th-1', turnId: 'turn-1', willRetry: false, error: { message: CAPACITY } }))
+  push(fake, note('item/started', { threadId: 'th-1', turnId: 'turn-1', item: { type: 'commandExecution', command: 'blender -b' } }))
+  await until(fake, async () => (await agentsOf(fake)).a1?.warning === CAPACITY, 'the warning')
+  expect((await agentsOf(fake)).a1).toMatchObject({ status: 'running', error: null })
+  expect(String((await $.tool.call({ tool: 'mcp__codex__codex_list' } as never)).result)).toContain(`running 0s, 0 tok: $ blender -b (warning: ${CAPACITY})`)
+  expect((await step($, 'a1')).chunks[0]).toMatchObject({ kind: 'tool', name: 'mcp__codex__codex_await' })
+  push(fake, finished('DONE'))
+  await until(fake, async () => (await agentsOf(fake)).a1?.status === 'idle', 'idle')
+  expect(await finalOf($, 'a1', 1)).toBe('DONE')
+  done(fake)
+})
+
+test('a failed compaction, even a reported failed turn, does not end a job whose thread works on', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake)
+  await spawn($, fake)
+  const compact = `Error running remote compact task: ${CAPACITY}`
+  push(fake, note('error', { threadId: 'th-1', turnId: 'turn-1', willRetry: false, error: { message: compact } }))
+  push(fake, note('item/completed', { threadId: 'th-1', turnId: 'turn-1', item: { type: 'agentMessage', text: 'compaction failed, going on', phase: 'commentary' } }))
+  await until(fake, async () => (await agentsOf(fake)).a1?.warning === compact, 'the warning')
+  expect((await agentsOf(fake)).a1).toMatchObject({ status: 'running', error: null })
+  // Liveness: work after a reported failure revives the job; its thread stays subscribed.
+  push(fake, note('turn/completed', { threadId: 'th-1', turn: { id: 'turn-1', status: 'failed', error: { message: compact }, items: [] } }))
+  await until(fake, async () => (await agentsOf(fake)).a1?.status === 'failed', 'failed')
+  push(fake, note('item/started', { threadId: 'th-1', turnId: 'turn-1', item: { type: 'commandExecution', command: 'blender -b' } }))
+  await until(fake, async () => (await agentsOf(fake)).a1?.status === 'running', 'running again')
+  expect((await agentsOf(fake)).a1).toMatchObject({ currentTurnId: 'turn-1', error: null, warning: `Codex kept working after its turn was reported failed: ${compact}` })
+  expect(releases(fake)).toEqual([])
+  push(fake, finished('DONE'))
+  await until(fake, async () => (await agentsOf(fake)).a1?.status === 'idle', 'idle')
+  expect(await finalOf($, 'a1')).toBe('DONE')
+  done(fake)
+})
+
 test("codex_list shows every session job, newest first; codex_result reads any job", { timeoutMs: 20_000 }, async ($, on) => {
   const base = {
     model: 'gpt-6-luna', effort: 'low', sandbox: 'workspace-write', approvals: 'auto', cwd: '/work', status: 'idle',
