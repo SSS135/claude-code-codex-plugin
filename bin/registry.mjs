@@ -5,6 +5,8 @@ import os from 'node:os'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import http from 'node:http'
+import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads'
+import { fileURLToPath } from 'node:url'
 
 export const registryDir = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'plugins', 'codex-agents')
 
@@ -60,6 +62,27 @@ export function writeAgent(agent, dir = registryDir) {
 
 /** The new relay serves persistence even when it reattaches to an older daemon. */
 export async function serveRegistry(dir = registryDir) {
+  // The HTTP server runs on its own thread: the bridge's main thread blocks in a synchronous
+  // stdout write whenever the host stops draining the pipe, and the host drains it only after
+  // its registry calls return. A main-thread server would deadlock that cycle.
+  const worker = new Worker(fileURLToPath(import.meta.url), { workerData: { dir } })
+  const address = await new Promise((resolve, reject) => {
+    worker.once('message', resolve)
+    worker.once('error', reject)
+  })
+  worker.unref()
+  const server = {
+    listening: true,
+    closeAllConnections() {},
+    close(done) {
+      server.listening = false
+      worker.terminate().then(() => done?.())
+    },
+  }
+  return { server, address }
+}
+
+async function listenRegistry(dir) {
   const secret = randomUUID().replaceAll('-', '')
   const server = http.createServer(async (req, res) => {
     const reply = (status, value) => {
@@ -91,4 +114,9 @@ export async function serveRegistry(dir = registryDir) {
     server.listen(0, '127.0.0.1', resolve)
   })
   return { server, address: `http://127.0.0.1:${server.address().port}/${secret}` }
+}
+
+if (!isMainThread && workerData?.dir) {
+  const { server, address } = await listenRegistry(workerData.dir)
+  parentPort.postMessage(address)
 }

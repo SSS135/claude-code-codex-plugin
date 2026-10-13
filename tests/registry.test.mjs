@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { spawn } from 'node:child_process'
 import { readAgents, serveRegistry, writeAgent } from '../bin/registry.mjs'
 
 test('separate sessions persist independently, survive registry-server restart, and retain stale records', async () => {
@@ -54,6 +55,39 @@ test('separate sessions persist independently, survive registry-server restart, 
       server.closeAllConnections()
       await new Promise(resolve => server.close(resolve))
     }
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('registry answers while the main thread is blocked and under concurrent large writes', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-registry-test-'))
+  const registry = await serveRegistry(dir)
+  const agent = id => ({
+    id, name: id, threadId: `t-${id}`, sessionId: 's', updatedAt: 10, status: 'running',
+    model: 'm', effort: 'high', cwd: '/w', lastMessage: 'x'.repeat(500_000), activity: '',
+    startedAt: 1, turnStartedAt: 1, turnEndedAt: 0, tokens: 0, digest: [], outbox: [],
+    sandbox: 'workspace-write', approvals: 'ask', currentTurnId: null, lastTurnId: null, lastTurnStatus: null, error: null,
+  })
+  try {
+    const post = (endpoint, body) => fetch(`${registry.address}/registry/${endpoint}`, { method: 'POST', body: JSON.stringify(body), signal: AbortSignal.timeout(10_000) })
+    // A separate process asks while this thread is blocked, as the host does while the bridge sits in a synchronous stdout write.
+    const client = spawn(process.execPath, ['-e', `
+      const t = Date.now()
+      fetch(process.argv[1] + '/registry/read', { method: 'POST', body: '{"sessionId":"s"}' }).then(r => r.text()).then(() => console.log(Date.now() - t))
+    `, registry.address], { stdio: ['ignore', 'pipe', 'inherit'] })
+    const closed = new Promise(resolve => client.once('close', resolve))
+    let answered = ''
+    client.stdout.on('data', chunk => { answered += chunk })
+    await new Promise(resolve => setTimeout(resolve, 100))
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1500)
+    await closed
+    assert.ok(Number(answered) < 1000, `the client waited ${answered} ms for this blocked thread`)
+    const writes = Array.from({ length: 10 }, (_, i) => post('write', { agent: agent(`a${i}`) }))
+    assert.ok((await Promise.all(writes)).every(res => res.status === 200))
+    const read = await (await post('read', { sessionId: 's' })).json()
+    assert.equal(Object.keys(read.agents).length, 10)
+  } finally {
+    await new Promise(resolve => registry.server.close(resolve))
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
