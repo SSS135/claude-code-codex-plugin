@@ -2,7 +2,7 @@ import type { On, SessionMessage, TurnStepChunk, TurnStepResult } from 'claude-c
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
 
-import { agentDescription, agentSpecs, aliasOf, approvalAnswer, approvalOptions, bridgeTarget, configDirs, effectiveDefaults, effortFor, listText, modelEffortError, modelFor, parseHeader, permissionsFor, shortCommand, UPDATE_HINT, wrapperAnswer } from '../hooks/model'
+import { agentDescription, agentSpecs, aliasOf, approvalAnswer, approvalOptions, bridgeTarget, codexVersionError, configDirs, effectiveDefaults, effortFor, listText, MIN_CODEX_VERSION, modelEffortError, modelFor, nodeOptionPreloads, parseHeader, permissionsFor, shortCommand, UPDATE_HINT, withoutPreloads, wrapperAnswer } from '../hooks/model'
 import type { CodexAgent } from '../types'
 
 // A fake bridge: the relay's stdout is a queue the test pushes NDJSON into,
@@ -14,8 +14,15 @@ type Rpc = { method: string; params: Record<string, unknown> }
 
 type Fake = {
   argv: readonly string[]
-  queue: string[]
+  /** The environment each bridge spawn set over the host's, in order. */
+  spawnEnvs: (Record<string, string> | undefined)[]
+  /** What the relay writes: stdout text, or a stderr piece. */
+  queue: (string | { stderr: string })[]
   closed: boolean
+  /** How the relay ends once closed. */
+  exitCode: number
+  /** The host's environment, as $.env.get reads it. */
+  env: Record<string, string>
   wake: () => void
   rpcs: Rpc[]
   /** Methods whose next call the fake app-server answers with this error. */
@@ -66,8 +73,11 @@ const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max']
 function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<string, string> = {}, disk: Record<string, CodexAgent> = {}): Fake {
   const fake: Fake = {
     argv: [],
+    spawnEnvs: [],
     queue: [],
     closed: false,
+    exitCode: 0,
+    env: {},
     wake: () => undefined,
     rpcs: [],
     rpcErrors: {},
@@ -147,15 +157,21 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
     return { value: undefined }
   })
 
+  on('env.get', (_$, e) => ({ value: fake.env[e.name] }))
   on('process.spawn', async function* (_$, e) {
     fake.argv = e.argv
+    fake.spawnEnvs.push(e.env ? { ...e.env } : undefined)
     for (;;) {
       const text = fake.queue.shift()
+      if (typeof text === 'object') {
+        yield { stream: 'stderr' as const, text: text.stderr }
+        continue
+      }
       if (text !== undefined) {
         yield { stream: 'stdout' as const, text }
         continue
       }
-      if (fake.closed) return { value: { code: 0, signal: null } }
+      if (fake.closed) return { value: { code: fake.exitCode, signal: null } }
       await new Promise<void>(resolve => (fake.wake = resolve))
     }
   })
@@ -1156,5 +1172,88 @@ test('running agents show beside the prompt hint, and nothing once none runs', {
   await ui.redraw()
   expect(linesOf((await ui.drawn()) as Node)).toBe('? for shortcuts|')
   await ui.unmount()
+  done(fake)
+})
+
+test('NODE_OPTIONS: preloads of missing absolute files are found and left out, everything else is kept', () => {
+  const options = '--require=/gone/restore.cjs --max-old-space-size=4096 -r /kept.cjs --import "file:///gone/a b.mjs" -r ts-node/register'
+  expect(nodeOptionPreloads(options)).toEqual(['/gone/restore.cjs', '/kept.cjs', '/gone/a b.mjs'])
+  expect(withoutPreloads(options, new Set(['/gone/restore.cjs', '/gone/a b.mjs']))).toBe('--max-old-space-size=4096 -r /kept.cjs -r ts-node/register')
+  expect(withoutPreloads('--require "/x y/a.cjs" --inspect', new Set())).toBe('--require "/x y/a.cjs" --inspect')
+})
+
+test("the bridge runs without NODE_OPTIONS preloads whose file is gone, which would stop node before it starts", async ($, on) => {
+  const fake = fakeBridge(on, {}, { '/kept.cjs': '' })
+  fake.env.NODE_OPTIONS = '--require=/var/folders/T/cmux-claude-node-options/restore-node-options.cjs --max-old-space-size=4096 -r /kept.cjs'
+  await start($, fake)
+  expect(fake.spawnEnvs).toEqual([{ NODE_OPTIONS: '--max-old-space-size=4096 -r /kept.cjs' }])
+  done(fake)
+})
+
+test('NODE_OPTIONS whose preloads are all on disk leaves the bridge the host environment', async ($, on) => {
+  const fake = fakeBridge(on, {}, { '/kept.cjs': '' })
+  fake.env.NODE_OPTIONS = '-r /kept.cjs'
+  await start($, fake)
+  expect(fake.spawnEnvs).toEqual([undefined])
+  done(fake)
+})
+
+test('a bridge that stops before it is ready refuses the spawn with why and what to do; the next call starts it again', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  // As a stale NODE_OPTIONS preload ends node: stderr, then exit code 1, no ready line.
+  fake.queue.push({ stderr: "Error: Cannot find module '/tmp/restore.cjs'\nRequire stack:\n- internal/preload\n" })
+  fake.exitCode = 1
+  fake.closed = true
+  const refused = await $.agent.spawn(spawnInput('sleep 20'))
+  expect(refused.deny).toContain('the codex bridge stopped before it was ready (exit code 1)')
+  expect(refused.deny).toContain("Cannot find module '/tmp/restore.cjs'")
+  expect(refused.deny).toContain('The next codex call or Agent spawn starts the bridge again')
+  expect(fake.spawnEnvs.length).toBe(1)
+
+  // The cause is gone: the next spawn starts a new relay, with no restart of Claude Code.
+  fake.closed = false
+  fake.exitCode = 0
+  push(fake, { type: 'ready', socket: '/tmp/cxb-test/s', reattached: false, active: {} })
+  const spawned = await $.agent.spawn(spawnInput('sleep 20'))
+  expect(spawned.deny).toBeUndefined()
+  expect(fake.spawnEnvs.length).toBe(2)
+  expect(fake.rpcs.map(rpc => rpc.method)).toContain('turn/start')
+  done(fake)
+})
+
+test("a relay's fatal line refuses the spawn with its message and the daemon log's tail", { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  push(fake, { type: 'fatal', message: 'cannot run the Codex CLI /nope/codex (spawnSync /nope/codex ENOENT). Install or update it', logTail: '' })
+  fake.closed = true
+  const refused = await $.agent.spawn(spawnInput('sleep 20'))
+  expect(refused.deny).toContain('codex bridge failed: cannot run the Codex CLI /nope/codex')
+})
+
+test('the Codex CLI version: older than the minimum is refused with the found and needed versions and the fix; newer or unknown passes', () => {
+  expect(codexVersionError('codex-cli 0.150.3')).toBe(`the Codex CLI is 0.150.3, older than ${MIN_CODEX_VERSION}, the oldest this plugin runs on. ${UPDATE_HINT}`)
+  expect(codexVersionError('codex-cli 0.162.0-alpha.2')).toBeUndefined()
+  expect(codexVersionError(`codex-cli ${MIN_CODEX_VERSION}-alpha.1`)).toBeUndefined()
+  expect(codexVersionError('codex-cli 1.0.0')).toBeUndefined()
+  expect(codexVersionError(undefined)).toBeUndefined()
+  expect(codexVersionError('codex (dev build)')).toBeUndefined()
+})
+
+test('an outdated Codex CLI refuses each codex:* spawn before any thread starts; codex_list still reads jobs and warns', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake, { codexVersion: 'codex-cli 0.150.3' })
+  const refused = await $.agent.spawn(spawnInput('sleep 20'))
+  expect(refused.deny).toBe(`codex: the Codex CLI is 0.150.3, older than ${MIN_CODEX_VERSION}, the oldest this plugin runs on. ${UPDATE_HINT}`)
+  expect(fake.spawned).toEqual([])
+  expect(fake.rpcs).toEqual([])
+  const listed = String((await $.tool.call({ tool: 'mcp__codex__codex_list' } as never)).result)
+  expect(listed).toContain('Warning: the Codex CLI is 0.150.3')
+  done(fake)
+})
+
+test('a current Codex CLI version lets the spawn run', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake, { codexVersion: 'codex-cli 0.162.0-alpha.2' })
+  await spawn($, fake)
+  expect(fake.rpcs.map(rpc => rpc.method)).toContain('turn/start')
   done(fake)
 })

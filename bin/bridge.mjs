@@ -10,8 +10,9 @@
 //           one), then copies its event stream to stdout as NDJSON. Only while
 //           the session's daemon of another build runs turns does it drive that
 //           one instead, until it is idle; it then stops it and exits, so no
-//           reload loses a turn. First line:
-//           {"type":"ready","socket",...}. It exits when its parent goes away,
+//           reload loses a turn. It first runs `codex --version` (a CLI that
+//           does not run is a fatal line saying what to do). First line:
+//           {"type":"ready","socket",...,"codexVersion"}. It exits when its parent goes away,
 //           stdout breaks or the daemon exits; the plugin killing it on reload is
 //           expected and harmless.
 //   launch: node bridge.mjs --launch <codexPath> <dir>
@@ -469,6 +470,21 @@ async function daemon(codexPath, dir) {
 
 // ---------------------------------------------------------------- relay
 
+/**
+ * `codex --version`'s output, which the plugin checks against the oldest CLI it
+ * runs on; null when it printed nothing. Throws, saying what to do, when the
+ * CLI does not run at all.
+ */
+const codexVersion = codexPath => {
+  const [file, leading] = codexCommand(codexPath)
+  const ran = spawnSync(file, [...leading, '--version'], { encoding: 'utf8', timeout: 15_000, windowsHide: true })
+  if (ran.error || ran.status !== 0) {
+    const why = ran.error?.message ?? `exit code ${ran.status ?? ran.signal}: ${(ran.stderr || ran.stdout || '').trim().split('\n').slice(-3).join(' | ')}`
+    throw new Error(`cannot run the Codex CLI ${codexPath} (${why}). Install or update it (npm i -g @openai/codex@latest, or update the ChatGPT app on macOS), or set the plugin's codexPath.`)
+  }
+  return ran.stdout.trim() || null
+}
+
 /** `socketPath` is a daemon's address (addressOf): a Unix socket, or a loopback URL. */
 const request = (socketPath, method, urlPath, timeoutMs) =>
   new Promise((resolve, reject) => {
@@ -553,6 +569,8 @@ const drain = other => {
 
 async function relay(codexPath, sessionKey) {
   const out = line => process.stdout.write(JSON.stringify(line) + '\n')
+  // Exits once the line is written: a pipe's write may still be pending (macOS), and the plugin shows this reason.
+  const fail = (message, logTail) => new Promise(() => process.stdout.write(JSON.stringify({ type: 'fatal', message, logTail }) + '\n', () => process.exit(1)))
   process.stdout.on('error', () => process.exit(0))
   const parent = process.ppid
   // Windows never reparents an orphan: there the parent's pid stops answering instead.
@@ -560,6 +578,12 @@ async function relay(codexPath, sessionKey) {
     if (process.ppid !== parent || !isAlive(parent)) process.exit(0)
   }, 1000).unref()
   for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => process.exit(0))
+  let version
+  try {
+    version = codexVersion(codexPath)
+  } catch (error) {
+    await fail(error.message, '')
+  }
   const registry = await serveRegistry()
 
   const key = sessionKey.replace(/[^A-Za-z0-9]/g, '').slice(0, 16) || 'default'
@@ -587,8 +611,7 @@ async function relay(codexPath, sessionKey) {
         try {
           logTail = fs.readFileSync(path.join(dir, 'daemon.log'), 'utf8').slice(-2000)
         } catch {}
-        out({ type: 'fatal', message: !isRunning ? 'the daemon exited' : 'daemon did not start in 30 s', logTail })
-        process.exit(1)
+        await fail(!isRunning ? 'the daemon exited' : 'daemon did not start in 30 s', logTail)
       }
       await new Promise(resolve => setTimeout(resolve, 100))
     }
@@ -603,7 +626,7 @@ async function relay(codexPath, sessionKey) {
     if (first) {
       first = false
       const hello = JSON.parse(line)
-      out({ type: 'ready', socket: socketPath, registry: registry.address, reattached: hello.reattached, active: hello.active })
+      out({ type: 'ready', socket: socketPath, registry: registry.address, reattached: hello.reattached, active: hello.active, codexVersion: version })
       continue
     }
     process.stdout.write(line + '\n')

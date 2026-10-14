@@ -22,8 +22,8 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
 `
 
 const call = (address, method, urlPath, body) => new Promise((resolve, reject) => {
-  const target = address.startsWith('http') ? new URL(address + urlPath) : { socketPath: address, path: urlPath }
-  const req = http.request(target, { method }, res => {
+  // http.request(url, options) takes a URL first; a Unix socket goes in the options alone.
+  const req = http.request(...(address.startsWith('http') ? [new URL(address + urlPath), { method }] : [{ socketPath: address, path: urlPath, method }]), res => {
     let data = ''
     res.on('data', chunk => (data += chunk))
     res.on('end', () => resolve(JSON.parse(data)))
@@ -85,4 +85,16 @@ test('a failed turn end is held back and dropped when the thread works on; a rea
     await new Promise(resolve => setTimeout(resolve, 300))
     fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 })
   }
+})
+
+test('a relay whose Codex CLI does not run says so and what to do in its first line, then exits 1', async () => {
+  const relay = spawn(process.execPath, [BRIDGE, path.join(os.tmpdir(), 'no-such-codex-cli'), 'relaytest'], { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true })
+  let stdout = ''
+  relay.stdout.on('data', chunk => (stdout += chunk))
+  const code = await new Promise(resolve => relay.on('exit', resolve))
+  const first = JSON.parse(stdout.split('\n')[0])
+  assert.equal(code, 1)
+  assert.equal(first.type, 'fatal')
+  assert.match(first.message, /cannot run the Codex CLI .*no-such-codex-cli/)
+  assert.match(first.message, /npm i -g @openai\/codex@latest/)
 })

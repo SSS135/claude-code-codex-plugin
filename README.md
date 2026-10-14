@@ -89,7 +89,7 @@ claude plugin install codex@codex-plugin
 ### Requirements
 
 - Claude Code with the hooks plugin API (function hooks, currently early access).
-- The Codex CLI with `codex app-server`. It ships inside the ChatGPT desktop app on macOS, or you can install it separately.
+- The Codex CLI 0.160.0 or newer, with `codex app-server`. An older one refuses each codex:* spawn with the version found and how to update. It ships inside the ChatGPT desktop app on macOS, or you can install it separately.
 - Node 18 or newer.
 - macOS, Linux or Windows 10/11. On Windows install the Codex CLI with `npm i -g @openai/codex` (or point `codexPath` at a `codex.exe`); Codex runs its shell commands in PowerShell there.
 
@@ -148,6 +148,8 @@ When a setting comes from several places, the prompt's header lines beat the pro
 The hooks module starts `bin/bridge.mjs` as a relay (and Codex starts `bin/codex-msg` per thread, which posts to the same socket). The relay launches a detached daemon, or reattaches to one that is still running. The daemon owns `codex app-server` and serves an HTTP API on a Unix socket under `/tmp/cxb-<uid>/` (mode 0700, owned by your user). On Windows, where Node cannot listen on a Unix socket and the plugin API refuses a named pipe, it serves on a random `127.0.0.1` port instead, every path under a random 128-bit secret, and keeps that address in `%TEMP%\cxb\`. The module sends requests over that socket, and the relay streams the daemon's events back to it as NDJSON on stdout.
 
 The bridge exists because the plugin API cannot write to a child process's stdin once it has spawned it, and `codex app-server` speaks JSON-RPC over stdio. The daemon runs detached so that Codex turns keep running through a plugin reload. The relay also serves the durable agent registry over a separate loopback address under a random secret, including when it reattaches to an older daemon. Existing plugin-store records are migrated on startup; new writes replace only the changed agent's file atomically, so independent sessions cannot replace each other's records. HTTP waits use slices of at most 20 seconds, below the hook host's 30-second limit; that limit alone does not mark a running Codex turn as lost.
+
+The relay starts with the session and again on the next codex call or codex:* spawn after it stopped (the daemon sat idle, crashed, or a plugin reload ended the relay), so a stopped bridge never needs a restart of Claude Code. When it cannot start, the call or spawn is refused with how it ended, the last lines it wrote to stderr and what to do. It runs with `NODE_OPTIONS` minus preloads (`--require`, `--import`, `--loader`) of files no longer on disk: some terminals preload a file of their own there and delete it later, which would stop every node before it runs a line.
 
 Processes end with the work they serve:
 

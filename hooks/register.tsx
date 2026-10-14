@@ -35,8 +35,10 @@ import {
   permissionsFor,
   PROJECT_CONFIG,
   type BridgeEvent,
+  bridgeStopReason,
   bridgeTarget,
   byThread,
+  codexVersionError,
   clip,
   CodexError,
   describeAgent,
@@ -55,6 +57,8 @@ import {
   itemStarted,
   LineBuffer,
   modelEffortError,
+  nodeOptionPreloads,
+  withoutPreloads,
   effortFor,
   PER_MODEL_EFFORT,
   PREFIX,
@@ -120,6 +124,8 @@ let nodeBinary = 'node'
 /** Subagents seen at turn.step that are not codex:* agents. */
 const foreignAgents = new Set<string>()
 let models: Map<string, string[]> | null = null
+/** `codex --version` as the running bridge's relay read it; undefined from a relay that does not report it. */
+let codexVersion: string | null | undefined
 let askChain: Promise<unknown> = Promise.resolve()
 
 // ------------------------------------------------------------ registry
@@ -183,6 +189,24 @@ async function resolveBinary($: Engine, configured: string, name: string): Promi
   return configured.trim() !== '' && (await $.fs.exists(configured)) ? configured : name
 }
 
+/** How many of the relay's last stderr lines a failed start reports. */
+const STDERR_TAIL = 20
+
+/**
+ * The environment the bridge runs under: NODE_OPTIONS without preloads of files
+ * no longer on disk, or node exits before the bridge runs a line. Undefined when
+ * nothing needs changing.
+ */
+async function bridgeEnv($: Engine): Promise<Record<string, string> | undefined> {
+  const options = await $.env.get('NODE_OPTIONS')
+  if (!options) return undefined
+  const missing = new Set<string>()
+  for (const file of nodeOptionPreloads(options)) if (!(await $.fs.exists(file))) missing.add(file)
+  if (missing.size === 0) return undefined
+  $.ui.log(`codex bridge: NODE_OPTIONS preloads missing files, left out for the bridge: ${[...missing].join(', ')}`, { to: 'debug' })
+  return { NODE_OPTIONS: withoutPreloads(options, missing) }
+}
+
 /** Starts the relay, unless it runs; its events reach `onEvent` in order until the daemon exits (the session ended, or it sat idle). */
 async function startBridge($: Engine): Promise<void> {
   if (isBridgeRunning) return
@@ -198,6 +222,7 @@ async function startBridge($: Engine): Promise<void> {
   nodeBinary = node
   const codex = await resolveBinary($, settings.codexPath, 'codex')
   const argv = [node, `${$.plugin.root}/bin/bridge.mjs`, codex, key]
+  const env = await bridgeEnv($)
 
   const handle = async (line: string) => {
     let event: BridgeEvent
@@ -207,7 +232,10 @@ async function startBridge($: Engine): Promise<void> {
       $.ui.log(`codex bridge: unreadable line ${clip(line, 200)}`, { to: 'debug' })
       return
     }
-    if (event.type === 'fatal') current.reject(new CodexError(`codex bridge failed: ${event.message}`))
+    if (event.type === 'fatal') {
+      const tail = event.logTail.trim().split('\n').slice(-6).join(' | ')
+      current.reject(new CodexError(`codex bridge failed: ${event.message}${tail ? ` (${clip(tail, 1200)})` : ''}`))
+    }
     try {
       await onEvent($, event)
       if (event.type === 'ready') current.resolve(event.socket)
@@ -219,24 +247,42 @@ async function startBridge($: Engine): Promise<void> {
 
   void (async () => {
     const lines = new LineBuffer()
+    const stderr = new LineBuffer()
+    const stderrTail: string[] = []
+    let ended = 'it exited'
     try {
-      for await (const chunk of $.process.spawn({ argv })) {
+      const stream = $.process.spawn({ argv, ...(env ? { env } : {}) })
+      for (;;) {
+        const next = await stream.next()
+        if (next.done) {
+          const result = next.value
+          if (result) ended = result.signal ? `signal ${result.signal}` : `exit code ${result.code}`
+          break
+        }
+        const chunk = next.value
         if (chunk.stream === 'stderr') {
           $.ui.log(`codex bridge: ${chunk.text.trimEnd()}`, { to: 'debug' })
+          stderrTail.push(...stderr.push(chunk.text))
+          stderrTail.splice(0, Math.max(0, stderrTail.length - STDERR_TAIL))
           continue
         }
         for (const line of lines.push(chunk.text)) await handle(line)
       }
       for (const line of lines.rest()) await handle(line)
     } catch (error) {
+      ended = `it did not run: ${errorText(error)}`
       $.ui.log(`codex bridge stopped: ${String(error)}`)
     } finally {
       isBridgeRunning = false
       loadedThreads.clear()
-      current.reject(new CodexError('the codex bridge stopped'))
+      // Settles a start still waiting for `ready` with the reason; one that was ready is unaffected.
+      current.reject(new CodexError(bridgeStopReason(ended, [...stderrTail, ...stderr.rest()])))
       if (socket === current) socket = null
       registryAddress = null
       recovery = null
+      codexVersion = undefined
+      // The next bridge may run an updated Codex CLI with other models.
+      models = null
     }
   })()
 }
@@ -760,6 +806,7 @@ async function onReady($: Engine, address: string, reattached: boolean, active: 
 async function onEvent($: Engine, event: BridgeEvent): Promise<void> {
   switch (event.type) {
     case 'ready':
+      codexVersion = event.codexVersion
       registryAddress = event.registry ?? event.socket
       recovery = { reattached: event.reattached, active: event.active }
       await onReady($, event.socket, event.reattached, event.active)
@@ -807,12 +854,15 @@ const TOOL_NAMES: readonly ToolName[] = ['codex_list', 'codex_result', 'codex_aw
 async function runTool($: Engine, name: 'codex_list' | 'codex_result', e: unknown): Promise<string> {
   const args = e as Record<string, unknown>
   await reconcileAgents($, undefined, textArg(args.id))
-  if (name === 'codex_list') return listText(sorted(await read($, agentsAtom)), await $.session.id(), await $.clock.now())
+  // Saved jobs stay readable on an outdated CLI; the warning says new ones will be refused.
+  const outdated = codexVersionError(codexVersion)
+  const warning = outdated ? `\n\nWarning: ${outdated} New codex:* agents are refused until then.` : ''
+  if (name === 'codex_list') return listText(sorted(await read($, agentsAtom)), await $.session.id(), await $.clock.now()) + warning
   const ref = textArg(args.id)
   if (!ref) throw new CodexError('id is required')
   const agent = findIn(await read($, agentsAtom), ref)
   if (!agent) throw new CodexError(`No Codex agent "${ref}". codex_list shows them.`)
-  return resultText(agent, args.full === true, await $.clock.now())
+  return resultText(agent, args.full === true, await $.clock.now()) + warning
 }
 
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error))
@@ -858,6 +908,10 @@ export const register: Register = (on, options) => {
       body = header.body
       if (body.trim() === '') return { deny: 'codex: the prompt is empty once its header lines are taken off' }
       const defaults = effectiveDefaults(settings, await projectConfig($))
+      // A bridge that is down starts here again, or the refusal says why it did not; its relay has read `codex --version`.
+      await bridgeSocket($)
+      const outdated = codexVersionError(codexVersion)
+      if (outdated) return { deny: `codex: ${outdated}` }
       const listed = await listModels($)
       const model = modelFor(listed, alias)
       const effort = header.effort ?? effortFor(defaults, alias)

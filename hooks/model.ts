@@ -17,7 +17,7 @@ export type Settings = {
 }
 
 export type BridgeEvent =
-  | { type: 'ready'; socket: string; registry?: string; reattached: boolean; active: Record<string, string> }
+  | { type: 'ready'; socket: string; registry?: string; reattached: boolean; active: Record<string, string>; codexVersion?: string | null }
   | { type: 'notification'; method: string; params: Record<string, unknown> }
   | { type: 'request'; id: number | string; method: string; params: Record<string, unknown> }
   | { type: 'exit'; code: number | null; signal: string | null; stderrTail: string[] }
@@ -52,6 +52,100 @@ export const aliasOf = (model: string): string =>
   Object.keys(MODEL_ALIASES).find(alias => model === MODEL_ALIASES[alias] || model.endsWith(`-${alias}`)) ?? model
 
 export const UPDATE_HINT = 'Update the Codex CLI: npm i -g @openai/codex@latest, or update the ChatGPT app on macOS.'
+
+/** The oldest Codex CLI this plugin runs on (its app-server API, and MCP servers outside the job's sandbox). */
+export const MIN_CODEX_VERSION = '0.160.0'
+
+const versionParts = (version: string): number[] => version.split('-')[0]!.split('.').map(Number)
+
+/** The x.y.z in `codex --version`'s output (`codex-cli 0.162.0-alpha.2`), or null. */
+export const parseCodexVersion = (text: string | null | undefined): string | null =>
+  text?.match(/\b(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)\b/)?.[1] ?? null
+
+/**
+ * Undefined when the Codex CLI the bridge found is new enough, or its version is
+ * unknown (an older relay, or output with no version); otherwise the refusal. A
+ * prerelease of the minimum counts as the minimum.
+ */
+export const codexVersionError = (reported: string | null | undefined): string | undefined => {
+  const found = parseCodexVersion(reported)
+  if (found === null) return undefined
+  const have = versionParts(found)
+  const need = versionParts(MIN_CODEX_VERSION)
+  for (let i = 0; i < need.length; i++) {
+    const difference = (have[i] ?? 0) - (need[i] ?? 0)
+    if (difference > 0) return undefined
+    if (difference < 0) return `the Codex CLI is ${found}, older than ${MIN_CODEX_VERSION}, the oldest this plugin runs on. ${UPDATE_HINT}`
+  }
+  return undefined
+}
+
+/** NODE_OPTIONS flags whose value is a file node loads before any script. */
+const PRELOAD_FLAGS = ['--require', '-r', '--import', '--loader', '--experimental-loader']
+
+/** NODE_OPTIONS split as node splits it: on spaces, a double-quoted run kept whole. */
+const nodeOptionTokens = (value: string): string[] =>
+  [...value.matchAll(/"((?:[^"\\]|\\.)*)"|(\S+)/g)].map(match => match[1] !== undefined ? match[1].replace(/\\(.)/g, '$1') : match[2]!)
+
+/** A preload's file on disk: an absolute path or a file: URL; a package name or relative path is node's to resolve. */
+const preloadFile = (value: string): string | null => {
+  if (value.startsWith('file:')) {
+    try {
+      return decodeURIComponent(new URL(value).pathname).replace(/^\/([A-Za-z]:)/, '$1')
+    } catch {
+      return null
+    }
+  }
+  return value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value) ? value : null
+}
+
+type Preload = { tokens: number; file: string | null }
+
+/** Each token of NODE_OPTIONS, with the file it preloads when it is a preload flag (the flag and a separate value both count). */
+const parsePreloads = (tokens: string[]): Preload[] => {
+  const parsed: Preload[] = []
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i]!
+    const flag = PRELOAD_FLAGS.find(name => token.startsWith(`${name}=`))
+    if (flag) parsed.push({ tokens: 1, file: preloadFile(token.slice(flag.length + 1)) })
+    else if (PRELOAD_FLAGS.includes(token) && i + 1 < tokens.length) {
+      parsed.push({ tokens: 2, file: preloadFile(tokens[i + 1]!) })
+      i += 1
+    } else parsed.push({ tokens: 1, file: null })
+  }
+  return parsed
+}
+
+/** The files NODE_OPTIONS preloads by absolute path, which the plugin checks are on disk. */
+export const nodeOptionPreloads = (value: string): string[] =>
+  parsePreloads(nodeOptionTokens(value)).flatMap(one => (one.file === null ? [] : [one.file]))
+
+/**
+ * NODE_OPTIONS without its preloads of the given missing files. A terminal or tool
+ * may preload a file of its own through NODE_OPTIONS and delete it later (cmux's
+ * restore-node-options.cjs); every node started after that exits before running
+ * a line, and the bridge with it.
+ */
+export const withoutPreloads = (value: string, missing: ReadonlySet<string>): string => {
+  const tokens = nodeOptionTokens(value)
+  const kept: string[] = []
+  let at = 0
+  for (const one of parsePreloads(tokens)) {
+    if (one.file === null || !missing.has(one.file)) kept.push(...tokens.slice(at, at + one.tokens))
+    at += one.tokens
+  }
+  return kept.map(token => (/[\s"]/.test(token) ? `"${token.replace(/(["\\])/g, '\\$1')}"` : token)).join(' ')
+}
+
+/** What to do about a bridge that would not start; every codex call tries again. */
+export const BRIDGE_ADVICE =
+  'The next codex call or Agent spawn starts the bridge again. If this repeats, check the plugin\'s nodePath and codexPath settings (and NODE_OPTIONS), then /reload-plugins.'
+
+/** Why the bridge stopped before it was ready: how it ended and the last lines it wrote to stderr. */
+export const bridgeStopReason = (ended: string, stderrTail: readonly string[]): string => {
+  const tail = stderrTail.map(line => line.trim()).filter(Boolean).slice(-6).join(' | ')
+  return `the codex bridge stopped before it was ready (${ended})${tail ? `: ${clip(tail, 1200)}` : ''}. ${BRIDGE_ADVICE}`
+}
 
 /**
  * The newest numeric version of the alias's family, regardless of list order.
