@@ -99,8 +99,10 @@ Besides the agent types, Claude sees two tools as `mcp__codex__<name>`:
 
 | Tool | Parameters | What it does |
 | --- | --- | --- |
-| `codex_list` | none | Lists every Codex job of this session, newest first, including restored, interrupted and missing jobs, with model, status, tokens and current activity. |
+| `codex_list` | `all` | Lists active jobs and jobs finished within the last 30 minutes, newest first, with model, status, tokens and current activity. With `all: true`, lists the full session history, including restored, interrupted and missing jobs. |
 | `codex_result` | `id`, `full` | Status and final message. With `full=true` it adds the turn digest: commands with exit codes, file changes and messages. |
+
+Since 0.2.9, the default list reports how many older finished jobs it hides, including when no active or recently finished jobs remain. `codex_list` with `all: true` lists them; `codex_result` and `SendMessage` still reach any of them.
 
 `id` is the agent's agentId or the job's name (its description, as `codex_list` shows it); `codex_result` reads saved jobs, including older ones and other sessions'. The list reconciles saved jobs with Claude's native agent IDs, so a restored agent is still included when Claude's session ID changes. A third tool, `codex_await`, serves the wrapper agents alone and refuses any other caller.
 

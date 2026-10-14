@@ -744,11 +744,17 @@ export function describeAgent(agent: CodexAgent, now: number): string {
   return `${agent.id} ${agent.name} [${agent.model}/${agent.effort}, ${agent.sandbox}, approvals ${agent.approvals}] ${agent.status}${time ? ` ${time}` : ''}, ${formatTokens(agent.tokens)}: ${clip(firstLine(doing), 100)}${agent.warning ? ` (warning: ${clip(firstLine(agent.warning), 120)})` : ''}`
 }
 
-/** codex_list: all of the session's jobs, newest first (`agents` sorted so). */
-export function listText(agents: readonly CodexAgent[], sessionId: string, now: number): string {
+const RECENT_FINISHED_MS = 30 * 60_000
+
+/** codex_list: active and recently finished session jobs, or all with `all`, newest first (`agents` sorted so). */
+export function listText(agents: readonly CodexAgent[], sessionId: string, now: number, all = false): string {
   const mine = agents.filter(agent => agent.sessionId === sessionId)
   if (mine.length === 0) return 'No Codex agents in this session. The Agent tool starts one with subagent_type codex:luna, codex:sol, codex:astra or codex:terra.'
-  return mine.map(agent => describeAgent(agent, now)).join('\n')
+  const shown = all ? mine : mine.filter(agent => isLive(agent) || agent.turnEndedAt >= now - RECENT_FINISHED_MS)
+  const hidden = mine.length - shown.length
+  const notice = `${hidden} older finished jobs hidden; codex_list with all: true lists them. codex_result and SendMessage still reach any of them.`
+  if (shown.length === 0) return `No active or recently finished Codex jobs in this session; ${notice}`
+  return [...shown.map(agent => describeAgent(agent, now)), ...(hidden > 0 ? [notice] : [])].join('\n')
 }
 
 export function resultText(agent: CodexAgent, full: boolean, now: number): string {
@@ -817,8 +823,8 @@ const ID_PARAM = { type: 'string', description: "The agent id (the codex:* agent
 export const TOOL_SPECS: ToolSpec[] = [
   {
     name: 'codex_list',
-    description: "List all this session's Codex jobs (codex:* agents), including restored, interrupted and missing jobs, newest first: model, status and what each is doing.",
-    inputSchema: { type: 'object', properties: {} },
+    description: "List this session's active Codex jobs (codex:* agents) and jobs finished within the last 30 minutes, newest first: model, status and what each is doing. With all=true, list the full history, including restored, interrupted and missing jobs. codex_result and SendMessage still reach hidden jobs.",
+    inputSchema: { type: 'object', properties: { all: { type: 'boolean', description: 'List the full session history, including older finished jobs (default false).' } } },
   },
   {
     name: 'codex_result',

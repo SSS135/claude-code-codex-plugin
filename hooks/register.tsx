@@ -536,7 +536,7 @@ async function reconcileAgents($: Engine, address?: string, ref?: string): Promi
         model: modelFor(new Map(), alias), effort: 'unknown', sandbox: 'read-only', approvals: 'never',
         cwd: await $.session.cwd(), msgKey: '',
       })),
-      status: 'failed', error: missingThread(info.id), activity: 'missing job record', lastTurnStatus: 'failed',
+      status: 'failed', error: missingThread(info.id), activity: 'missing job record', lastTurnStatus: 'failed', turnEndedAt: now,
     }
   }
   const nativeIds = new Set(native.map(agent => agent.id))
@@ -552,7 +552,7 @@ async function reconcileAgents($: Engine, address?: string, ref?: string): Promi
       if (agent && agent.sessionId !== sessionId) {
         all[id] = { ...agent, sessionId, updatedAt: Math.max(now, agent.updatedAt + 1) }
         if (isLive(agent) && recovery && !recovery.reattached && !recovery.active[agent.threadId]) {
-          all[id] = { ...all[id]!, status: 'interrupted', currentTurnId: null, lastTurnStatus: 'interrupted',
+          all[id] = { ...all[id]!, status: 'interrupted', currentTurnId: null, lastTurnStatus: 'interrupted', turnEndedAt: now,
             error: 'the turn was lost when the Codex process restarted; a SendMessage to its agent starts a new turn on the thread' }
         }
         changed.push(id)
@@ -793,7 +793,7 @@ async function onReady($: Engine, address: string, reattached: boolean, active: 
     }
     // A reattached daemon replays the turn's end from its buffer; a new one never saw it.
     return [id, reattached ? agent : {
-      ...agent, status: 'interrupted', currentTurnId: null, lastTurnStatus: 'interrupted', updatedAt: Math.max(now, agent.updatedAt + 1),
+      ...agent, status: 'interrupted', currentTurnId: null, lastTurnStatus: 'interrupted', turnEndedAt: now, updatedAt: Math.max(now, agent.updatedAt + 1),
       error: 'the turn was lost when the Codex process restarted; a SendMessage to its agent starts a new turn on the thread',
     }]
   })))
@@ -823,9 +823,10 @@ async function onEvent($: Engine, event: BridgeEvent): Promise<void> {
     case 'exit':
       $.ui.log(`codex app-server exited (${event.code ?? event.signal}). ${event.stderrTail.slice(-3).join(' | ')}`)
       const sessionId = await $.session.id()
+      const now = await $.clock.now()
       for (const agent of Object.values(await read($, agentsAtom))) {
         if (agent.sessionId === sessionId && isLive(agent)) {
-          await patchAgent($, agent.id, () => ({ status: 'failed', currentTurnId: null, error: 'codex app-server exited' }))
+          await patchAgent($, agent.id, () => ({ status: 'failed', currentTurnId: null, error: 'codex app-server exited', turnEndedAt: now }))
         }
       }
       return
@@ -857,7 +858,7 @@ async function runTool($: Engine, name: 'codex_list' | 'codex_result', e: unknow
   // Saved jobs stay readable on an outdated CLI; the warning says new ones will be refused.
   const outdated = codexVersionError(codexVersion)
   const warning = outdated ? `\n\nWarning: ${outdated} New codex:* agents are refused until then.` : ''
-  if (name === 'codex_list') return listText(sorted(await read($, agentsAtom)), await $.session.id(), await $.clock.now()) + warning
+  if (name === 'codex_list') return listText(sorted(await read($, agentsAtom)), await $.session.id(), await $.clock.now(), args.all === true) + warning
   const ref = textArg(args.id)
   if (!ref) throw new CodexError('id is required')
   const agent = findIn(await read($, agentsAtom), ref)
@@ -947,7 +948,8 @@ export const register: Register = (on, options) => {
         await startTurn($, agent, body)
       } catch (error) {
         // The subagent runs: it ends at once with this reason as its answer.
-        await patchAgent($, agent.id, () => ({ status: 'failed', error: `the Codex turn did not start: ${errorText(error)}` }))
+        const now = await $.clock.now()
+        await patchAgent($, agent.id, () => ({ status: 'failed', error: `the Codex turn did not start: ${errorText(error)}`, turnEndedAt: now }))
         void releaseThread($, threadId)
       }
       return spawned
@@ -997,8 +999,9 @@ export const register: Register = (on, options) => {
     try {
       await sendMessage($, agent, e.text)
     } catch (error) {
+      const now = await $.clock.now()
       await patchAgent($, agent.id, () => ({
-        ...(agent.status === 'running' ? {} : { status: 'failed' as const, currentTurnId: null }),
+        ...(agent.status === 'running' ? {} : { status: 'failed' as const, currentTurnId: null, turnEndedAt: now }),
         error: `the Codex message did not start or resume a turn: ${errorText(error)}`,
       }))
       return { isDelivered: false as const, reason: `Codex did not take the message: ${errorText(error)}` }

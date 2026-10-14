@@ -2,7 +2,7 @@ import type { On, SessionMessage, TurnStepChunk, TurnStepResult } from 'claude-c
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
 
-import { agentDescription, agentSpecs, aliasOf, approvalAnswer, approvalOptions, bridgeTarget, codexVersionError, configDirs, effectiveDefaults, effortFor, listText, MIN_CODEX_VERSION, modelEffortError, modelFor, nodeOptionPreloads, parseHeader, permissionsFor, shortCommand, UPDATE_HINT, withoutPreloads, wrapperAnswer } from '../hooks/model'
+import { agentDescription, agentSpecs, aliasOf, approvalAnswer, approvalOptions, bridgeTarget, codexVersionError, configDirs, effectiveDefaults, effortFor, listText, MIN_CODEX_VERSION, modelEffortError, modelFor, nodeOptionPreloads, parseHeader, permissionsFor, shortCommand, TOOL_SPECS, UPDATE_HINT, withoutPreloads, wrapperAnswer } from '../hooks/model'
 import type { CodexAgent } from '../types'
 
 // A fake bridge: the relay's stdout is a queue the test pushes NDJSON into,
@@ -70,7 +70,7 @@ const posixPath = (path: string) => path.replace(/^[A-Za-z]:/, '').replaceAll('\
 
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max']
 
-function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<string, string> = {}, disk: Record<string, CodexAgent> = {}): Fake {
+function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<string, string> = {}, disk: Record<string, CodexAgent> = {}, now = 1_000_000): Fake {
   const fake: Fake = {
     argv: [],
     spawnEnvs: [],
@@ -106,7 +106,7 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
       ['gpt-6-luna', EFFORTS],
       ['gpt-6.1-sol', [...EFFORTS, 'ultra']],
     ],
-    clock: mock.clock(on, { now: 1_000_000 }),
+    clock: mock.clock(on, { now }),
   }
   // The engine beneath the plugin.
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
@@ -910,7 +910,7 @@ const savedAgent = (id: string, extra: Partial<CodexAgent> = {}): CodexAgent => 
 })
 
 test('restart with an empty store restores native jobs from disk across session IDs, then resumes the real Codex thread before delivery', { timeoutMs: 20_000 }, async ($, on) => {
-  const fake = fakeBridge(on, {}, {}, { a1: savedAgent('a1'), elsewhere: savedAgent('elsewhere') })
+  const fake = fakeBridge(on, {}, {}, { a1: savedAgent('a1'), elsewhere: savedAgent('elsewhere') }, LIST_NOW)
   fake.agentList.push({ id: 'a1', type: 'codex:sol', name: 'helper' })
   // New relay, older daemon: persistence is served separately from Codex RPCs.
   await start($, fake, { registry: 'http://127.0.0.1:5001/s3cret' })
@@ -919,6 +919,7 @@ test('restart with an empty store restores native jobs from disk across session 
   expect(listed).not.toContain('elsewhere')
   expect(fake.disk.elsewhere?.status).toBe('running')
   expect(fake.disk.a1?.sessionId).toBe('session-1')
+  expect(fake.disk.a1?.turnEndedAt).toBe(LIST_NOW)
   expect(String((await $.tool.call({ tool: 'mcp__codex__codex_result', id: 'a1' } as never)).result)).toContain('previous result')
   expect(await send($, 'helper', 'continue the saved work')).toEqual({ isDelivered: true })
   expect(fake.rpcs.map(rpc => rpc.method)).toEqual(['thread/resume', 'turn/start'])
@@ -934,13 +935,14 @@ test('restart with an empty store restores native jobs from disk across session 
 })
 
 test('restored native jobs with missing records show failed, refuse SendMessage, and end the wrapper without repeated awaits', { timeoutMs: 20_000 }, async ($, on) => {
-  const fake = fakeBridge(on)
+  const fake = fakeBridge(on, {}, {}, {}, LIST_NOW)
   await start($, fake)
   // Native agents may be restored after session.start, as after compaction.
   fake.agentList.push({ id: 'lost', type: 'codex:sol', name: 'helper' })
   const listed = String((await $.tool.call({ tool: 'mcp__codex__codex_list' } as never)).result)
   expect(listed).toContain('lost')
   expect(listed).toContain('] failed')
+  expect(fake.disk.lost?.turnEndedAt).toBe(LIST_NOW)
   const result = String((await $.tool.call({ tool: 'mcp__codex__codex_result', id: 'lost' } as never)).result)
   expect(result).toContain('No saved Codex thread for agent lost')
   expect(await send($, 'helper', 'continue')).toMatchObject({ isDelivered: false, reason: 'No saved Codex thread for agent lost. Its job record is missing; start a new codex:* agent. Do not retry codex_await.' })
@@ -1135,25 +1137,95 @@ test('a failed compaction, even a reported failed turn, does not end a job whose
   done(fake)
 })
 
-test("codex_list shows every session job, newest first; codex_result reads any job", { timeoutMs: 20_000 }, async ($, on) => {
-  const base = {
-    model: 'gpt-6-luna', effort: 'low', sandbox: 'workspace-write', approvals: 'auto', cwd: '/work', status: 'idle',
-    currentTurnId: null, lastTurnId: 'turn-1', lastTurnStatus: 'completed', lastMessage: 'OLD RESULT', activity: 'completed', msgKey: 'k', outbox: [],
-    tokens: 0, error: null, digest: [], updatedAt: 1, turnStartedAt: 1, turnEndedAt: 2, description: '',
+const LIST_NOW = 3_600_000
+const LIST_CUTOFF = LIST_NOW - 30 * 60_000
+const listAgent = (id: string, extra: Partial<CodexAgent> = {}): CodexAgent => savedAgent(id, {
+  sessionId: 'session-1', status: 'idle', currentTurnId: null, lastTurnStatus: 'completed',
+  lastMessage: 'OLD RESULT', turnEndedAt: LIST_NOW, ...extra,
+})
+
+const HIDDEN_NOTICE = 'older finished jobs hidden; codex_list with all: true lists them. codex_result and SendMessage still reach any of them.'
+
+test('codex_list defaults to active and recently finished jobs of this session', () => {
+  const agents = [
+    listAgent('starting', { status: 'starting', turnEndedAt: 0 }),
+    listAgent('running', { status: 'running', turnEndedAt: 1 }),
+    listAgent('completed'),
+    listAgent('failed', { status: 'failed', lastTurnStatus: 'failed' }),
+    listAgent('interrupted', { status: 'interrupted', lastTurnStatus: 'interrupted' }),
+    listAgent('old-completed', { turnEndedAt: 1 }),
+    listAgent('old-failed', { status: 'failed', turnEndedAt: 1 }),
+    listAgent('old-interrupted', { status: 'interrupted', turnEndedAt: 1 }),
+    listAgent('elsewhere', { sessionId: 'session-0' }),
+  ]
+  const listed = listText(agents, 'session-1', LIST_NOW)
+  expect(listed.split('\n').slice(0, -1).map(line => line.split(' ')[0])).toEqual(['starting', 'running', 'completed', 'failed', 'interrupted'])
+  expect(listed.endsWith(`3 ${HIDDEN_NOTICE}`)).toBe(true)
+})
+
+test('codex_list uses the turn end time and includes the exact 30-minute boundary', () => {
+  const agents = [
+    listAgent('recent', { startedAt: 1, turnEndedAt: LIST_CUTOFF + 1 }),
+    listAgent('boundary', { turnEndedAt: LIST_CUTOFF }),
+    listAgent('older', { startedAt: LIST_NOW, updatedAt: LIST_NOW, turnEndedAt: LIST_CUTOFF - 1 }),
+  ]
+  const listed = listText(agents, 'session-1', LIST_NOW)
+  expect(listed.split('\n').map(line => line.split(' ')[0])).toEqual(['recent', 'boundary', '1'])
+  expect(listText([agents[1]!], 'session-1', LIST_NOW + 1)).toContain('No active or recently finished Codex jobs')
+})
+
+test('codex_list all=true includes older finished jobs but only this session', () => {
+  const agents = [listAgent('old', { turnEndedAt: 1 }), listAgent('elsewhere', { sessionId: 'session-0' })]
+  const listed = listText(agents, 'session-1', LIST_NOW, true)
+  expect(listed).toMatch(/^old Saved old /)
+  expect(listed.split('\n')).toHaveLength(1)
+  expect(listed).not.toContain('hidden')
+  expect(listed).not.toContain('elsewhere')
+})
+
+test('codex_list ends with the hidden count only when jobs are hidden', () => {
+  const agents = [listAgent('recent'), listAgent('old', { turnEndedAt: 1 })]
+  expect(listText(agents, 'session-1', LIST_NOW).split('\n').at(-1)).toBe(`1 ${HIDDEN_NOTICE}`)
+  expect(listText([agents[0]!], 'session-1', LIST_NOW)).not.toContain('hidden')
+  expect(listText(agents, 'session-1', LIST_NOW, true)).not.toContain('hidden')
+})
+
+test('codex_list distinguishes an empty default list from a session with no jobs', () => {
+  const listed = listText([listAgent('old', { turnEndedAt: 1 })], 'session-1', LIST_NOW)
+  expect(listed).toBe(`No active or recently finished Codex jobs in this session; 1 ${HIDDEN_NOTICE}`)
+  expect(listed.split('\n')).toHaveLength(1)
+  expect(listText([], 'session-1', LIST_NOW)).toContain('No Codex agents in this session')
+  expect(listText([listAgent('elsewhere', { sessionId: 'session-0' })], 'session-1', LIST_NOW, true)).toContain('No Codex agents in this session')
+})
+
+test('codex_list advertises its default window and optional boolean all argument', () => {
+  const spec = TOOL_SPECS.find(tool => tool.name === 'codex_list')!
+  expect(spec.description).toContain('30 minutes')
+  expect(spec.description).toContain('all=true')
+  expect(spec.inputSchema).toMatchObject({ type: 'object', properties: { all: { type: 'boolean' } } })
+})
+
+test('codex_list all=true shows the full session history, newest first; hidden jobs remain reachable', { timeoutMs: 20_000 }, async ($, on) => {
+  const agents: Record<string, CodexAgent> = {
+    other: listAgent('other', { startedAt: 99, sessionId: 'session-0', turnEndedAt: 2 }),
   }
-  const agents: Record<string, unknown> = {
-    other: { ...base, id: 'other', name: 'elsewhere', threadId: 'th-x', startedAt: 99, sessionId: 'session-0' },
-  }
-  for (let i = 1; i <= 12; i += 1) agents[`j${i}`] = { ...base, id: `j${i}`, name: `job ${i}`, threadId: `th-${i}`, startedAt: i, sessionId: 'session-1' }
-  const fake = fakeBridge(on, { agents })
+  for (let i = 1; i <= 12; i += 1) agents[`j${i}`] = listAgent(`j${i}`, { name: `job ${i}`, startedAt: i, turnEndedAt: 2 })
+  const fake = fakeBridge(on, { agents }, {}, {}, LIST_NOW)
+  fake.agentList.push({ id: 'j1', type: 'codex:sol', name: 'job 1' })
   await start($, fake, { reattached: true })
-  const listed = String((await $.tool.call({ tool: 'mcp__codex__codex_list' } as never)).result).split('\n')
+  const defaultList = String((await $.tool.call({ tool: 'mcp__codex__codex_list' } as never)).result)
+  expect(defaultList).toBe(`No active or recently finished Codex jobs in this session; 12 ${HIDDEN_NOTICE}`)
+  expect(String((await $.tool.call({ tool: 'mcp__codex__codex_list', all: false } as never)).result)).toBe(defaultList)
+  const listed = String((await $.tool.call({ tool: 'mcp__codex__codex_list', all: true } as never)).result).split('\n')
   expect(listed).toHaveLength(12)
-  expect(listed[0]).toMatch(/^j12 job 12 \[gpt-6-luna\/low, workspace-write, approvals auto\] idle 0s, 0 tok: completed$/)
+  expect(listed[0]).toMatch(/^j12 job 12 \[gpt-6.1-sol\/high, full-access, approvals ask\] idle 0s, 123 tok: completed$/)
   expect(listed[9]).toMatch(/^j3 job 3 /)
   expect(listed[11]).toMatch(/^j1 job 1 /)
+  expect(String((await $.tool.call({ tool: 'mcp__codex__codex_result', id: 'j1' } as never)).result)).toContain('Final message:\nOLD RESULT')
   expect(String((await $.tool.call({ tool: 'mcp__codex__codex_result', id: 'other' } as never)).result)).toContain('Final message:\nOLD RESULT')
-  expect(listText([], 'session-1', 0)).toContain('No Codex agents in this session')
+  expect(await send($, 'job 1', 'continue the hidden job')).toEqual({ isDelivered: true })
+  expect(fake.rpcs.map(rpc => rpc.method)).toEqual(['thread/resume', 'turn/start'])
+  expect(String((await $.tool.call({ tool: 'mcp__codex__codex_list' } as never)).result)).toContain('j1 job 1 [gpt-6.1-sol/high, full-access, approvals ask] running')
   done(fake)
 })
 
