@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.10
+
+- Clarify timing in `codex_list` and `codex_result`: running jobs show their elapsed time; finished jobs show `ran 7m 22s, finished 53m ago` alongside their status. The finish age uses the same `turnEndedAt` as the 30-minute filter. Older records without an end timestamp omit timing.
+- Keep the default filter unchanged: a short runtime does not mean a job finished recently.
+
 ## 0.2.9
 
 - Keep `codex_list` focused on active jobs and jobs finished within the last 30 minutes, newest first. With `all: true`, list the full session history.

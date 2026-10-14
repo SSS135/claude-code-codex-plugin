@@ -740,8 +740,10 @@ export function wrapperAnswer(agent: CodexAgent): string {
 
 export function describeAgent(agent: CodexAgent, now: number): string {
   const time = timeOf(agent, now)
+  // Finish age omits seconds once at least a minute elapsed; runtime keeps them.
+  const timing = isLive(agent) ? (time ? ` ${time}` : '') : time ? `, ran ${time}, finished ${elapsed(agent.turnEndedAt, now).replace(/m \d+s$/, 'm')} ago` : ''
   const doing = isLive(agent) ? agent.activity : (agent.lastTurnStatus ?? agent.status)
-  return `${agent.id} ${agent.name} [${agent.model}/${agent.effort}, ${agent.sandbox}, approvals ${agent.approvals}] ${agent.status}${time ? ` ${time}` : ''}, ${formatTokens(agent.tokens)}: ${clip(firstLine(doing), 100)}${agent.warning ? ` (warning: ${clip(firstLine(agent.warning), 120)})` : ''}`
+  return `${agent.id} ${agent.name} [${agent.model}/${agent.effort}, ${agent.sandbox}, approvals ${agent.approvals}] ${agent.status}${timing}, ${formatTokens(agent.tokens)}: ${clip(firstLine(doing), 100)}${agent.warning ? ` (warning: ${clip(firstLine(agent.warning), 120)})` : ''}`
 }
 
 const RECENT_FINISHED_MS = 30 * 60_000

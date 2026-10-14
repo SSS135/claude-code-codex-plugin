@@ -108,6 +108,8 @@ Since 0.2.9, the default list reports how many older finished jobs it hides, inc
 
 Jobs are saved separately under `~/.claude/plugins/codex-agents/` (`CLAUDE_CONFIG_DIR/plugins/codex-agents/` when set), outside temporary task folders and versioned plugin installs. After a process restart, a running job is shown as interrupted; `SendMessage` loads its saved Codex thread with `thread/resume` and starts a new turn before resuming the wrapper. If its saved record or thread is missing, the message is refused with a clear reason and the wrapper stops instead of retrying `codex_await`. Records already lost by older versions cannot be reconstructed automatically.
 
+Since 0.2.10, job lines distinguish runtime from time since finishing: `running 3m 10s` or `idle, ran 7m 22s, finished 53m ago`. Failed and interrupted jobs keep their status too. The finish age uses the same end timestamp as the default list's 30-minute filter; a seven-minute job finished 53 minutes ago is hidden by default. Older records without an end timestamp omit timing.
+
 In the transcript each call is one row like a native one, for example `● Codex(list)` over `⎿  2 agents · 1 running`. While jobs run they are also named at the end of the hint line under the prompt (`codex: Fix flaky retry test (luna)`); the native task list (↓ to manage) shows and stops them.
 
 ## Configuration

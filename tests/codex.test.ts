@@ -2,7 +2,7 @@ import type { On, SessionMessage, TurnStepChunk, TurnStepResult } from 'claude-c
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
 
-import { agentDescription, agentSpecs, aliasOf, approvalAnswer, approvalOptions, bridgeTarget, codexVersionError, configDirs, effectiveDefaults, effortFor, listText, MIN_CODEX_VERSION, modelEffortError, modelFor, nodeOptionPreloads, parseHeader, permissionsFor, shortCommand, TOOL_SPECS, UPDATE_HINT, withoutPreloads, wrapperAnswer } from '../hooks/model'
+import { agentDescription, agentSpecs, aliasOf, approvalAnswer, approvalOptions, bridgeTarget, codexVersionError, configDirs, describeAgent, effectiveDefaults, effortFor, listText, MIN_CODEX_VERSION, modelEffortError, modelFor, nodeOptionPreloads, parseHeader, permissionsFor, resultText, shortCommand, TOOL_SPECS, UPDATE_HINT, withoutPreloads, wrapperAnswer } from '../hooks/model'
 import type { CodexAgent } from '../types'
 
 // A fake bridge: the relay's stdout is a queue the test pushes NDJSON into,
@@ -1064,8 +1064,8 @@ test("codex rows are one header and one result line; the result text stays the m
     await result.unmount()
 
     const cases: [string, Record<string, unknown>, string, string][] = [
-      ['codex_list', {}, 'abc w1 [gpt-6-luna/low, workspace-write, approvals auto] running 3s: thinking\ndef w2 [gpt-6-luna/low, workspace-write, approvals auto] idle 9s: completed', 'Codex(list)\n  ⎿  2 agents · 1 running'],
-      ['codex_result', { id: 'w1' }, 'abc w1 [gpt-6-luna/low, workspace-write, approvals auto] idle 9s: completed\nFinal message:\nDONE BANANA\nmore', 'Codex(result w1)\n  ⎿  done · DONE BANANA'],
+      ['codex_list', {}, 'abc w1 [gpt-6-luna/low, workspace-write, approvals auto] running 3s: thinking\ndef w2 [gpt-6-luna/low, workspace-write, approvals auto] idle, ran 9s, finished 2m ago: completed', 'Codex(list)\n  ⎿  2 agents · 1 running'],
+      ['codex_result', { id: 'w1' }, 'abc w1 [gpt-6-luna/low, workspace-write, approvals auto] idle, ran 9s, finished 2m ago: completed\nFinal message:\nDONE BANANA\nmore', 'Codex(result w1)\n  ⎿  done · DONE BANANA'],
       ['codex_await', {}, 'DONE BANANA\nmore', 'Codex(await)\n  ⎿  done · DONE BANANA'],
       ['codex_await', {}, 'Codex is still running: a1 luna [...] running', 'Codex(await)\n  ⎿  still running'],
     ]
@@ -1174,6 +1174,43 @@ test('codex_list uses the turn end time and includes the exact 30-minute boundar
   expect(listText([agents[1]!], 'session-1', LIST_NOW + 1)).toContain('No active or recently finished Codex jobs')
 })
 
+test('finished job lines distinguish runtime from time since finishing, without changing the filter', () => {
+  const now = 1_800_000_000_000
+  const ended = now - 53 * 60_000
+  const agent = listAgent('finished', {
+    turnStartedAt: ended - 442_000, turnEndedAt: ended,
+  })
+  expect(describeAgent(agent, now)).toContain('] idle, ran 7m 22s, finished 53m ago, 123 tok: completed')
+  expect(resultText(agent, false, now)).toContain('ran 7m 22s, finished 53m ago')
+  expect(listText([agent], 'session-1', now, true)).toContain('ran 7m 22s, finished 53m ago')
+  expect(listText([agent], 'session-1', now)).toContain('No active or recently finished Codex jobs')
+  expect(listText([agent], 'session-1', ended + 5 * 60_000)).toContain('ran 7m 22s, finished 5m ago')
+})
+
+test('running and starting job lines keep their elapsed time and omit a previous finish time', () => {
+  for (const status of ['running', 'starting'] as const) {
+    const agent = listAgent(status, { status, turnStartedAt: LIST_NOW - 190_000, turnEndedAt: LIST_NOW - 300_000 })
+    const line = describeAgent(agent, LIST_NOW)
+    expect(line).toContain(`] ${status} 3m 10s, 123 tok:`)
+    expect(line).not.toContain('ran ')
+    expect(line).not.toContain('finished ')
+  }
+})
+
+test('failed and interrupted job lines retain their status and label both times', () => {
+  for (const status of ['failed', 'interrupted'] as const) {
+    const agent = listAgent(status, { status, lastTurnStatus: status, turnStartedAt: LIST_NOW - 15_000, turnEndedAt: LIST_NOW - 5_000 })
+    expect(describeAgent(agent, LIST_NOW)).toContain(`] ${status}, ran 10s, finished 5s ago, 123 tok: ${status}`)
+  }
+})
+
+test('finished job lines omit timing when an older record has no turn end timestamp', () => {
+  const agent = listAgent('missing-end', { turnEndedAt: 0 })
+  expect(describeAgent(agent, LIST_NOW)).toContain('] idle, 123 tok: completed')
+  expect(resultText(agent, false, LIST_NOW)).not.toContain('finished ')
+  expect(describeAgent(agent, LIST_NOW)).not.toContain('ran ')
+})
+
 test('codex_list all=true includes older finished jobs but only this session', () => {
   const agents = [listAgent('old', { turnEndedAt: 1 }), listAgent('elsewhere', { sessionId: 'session-0' })]
   const listed = listText(agents, 'session-1', LIST_NOW, true)
@@ -1218,7 +1255,7 @@ test('codex_list all=true shows the full session history, newest first; hidden j
   expect(String((await $.tool.call({ tool: 'mcp__codex__codex_list', all: false } as never)).result)).toBe(defaultList)
   const listed = String((await $.tool.call({ tool: 'mcp__codex__codex_list', all: true } as never)).result).split('\n')
   expect(listed).toHaveLength(12)
-  expect(listed[0]).toMatch(/^j12 job 12 \[gpt-6.1-sol\/high, full-access, approvals ask\] idle 0s, 123 tok: completed$/)
+  expect(listed[0]).toMatch(/^j12 job 12 \[gpt-6.1-sol\/high, full-access, approvals ask\] idle, ran 0s, finished 1h 0m ago, 123 tok: completed$/)
   expect(listed[9]).toMatch(/^j3 job 3 /)
   expect(listed[11]).toMatch(/^j1 job 1 /)
   expect(String((await $.tool.call({ tool: 'mcp__codex__codex_result', id: 'j1' } as never)).result)).toContain('Final message:\nOLD RESULT')
