@@ -4,6 +4,20 @@
 
 A Claude Code plugin that runs OpenAI Codex (luna, sol, astra, terra) as native Claude Code background subagents. Claude hands a task to a `codex:sol` agent through its own Agent tool and carries on. The job shows in the native task list, `SendMessage` and `TaskStop` reach it, and when Codex finishes, the native `Agent "<description>" finished` notification brings Claude the Codex final message, word for word. Codex approval requests show up as Claude Code dialogs.
 
+This is [goldmar's reliability fork](https://github.com/goldmar/claude-code-codex-plugin) of [SSS135's upstream plugin](https://github.com/SSS135/claude-code-codex-plugin), version `0.2.10-goldmar.4`, based on upstream `b94d5d08` (0.2.10), with MIT attribution preserved. The plugin is still `codex` and its marketplace is still `codex-plugin`. See [the acceptance gates, rollout and rollback procedure](docs/goldmar-rollout.md) before changing an installed marketplace. Development merges do not switch an installed plugin.
+
+### Live activity in the agent view
+
+Open the Codex agent's detail transcript. Live progress appears as compact lines without repeated await rows or activity headers. Codex's commentary and public reasoning summaries lead each batch, followed by changed paths, plan progress (`1/3 done`) and at most the last three completed commands plus an omitted-command count. Commands appear once, with exit code and duration when provided. Shell wrappers, heredoc bodies and inline interpreter bodies are hidden; redacted command fragments become an ellipsis.
+
+Every event line is at most 120 characters and each batch at most 4,000 characters; each agent buffers at most 60 entries / 16,000 characters, with an omission notice on overflow. Environment assignments and recognized credentials/identifiers are sanitized before display. Raw command output, file diffs, configuration and raw reasoning are omitted. Redaction cannot identify every secret in arbitrary prose; keep secrets out of job messages. Quiet awaits return silently after 45 seconds; internal checks run every two seconds so new activity and cancellation stay responsive. Activity is separate from the final answer and `message_claude` delivery, and makes no Claude model request. Undelivered previews may be lost on reload.
+
+### Reliability policy
+
+Message delivery is serialized per thread. Steering timeouts and refusals retain their original outcome; they cannot start a second turn. Daemon-owned operations retain late responses across hook HTTP timeouts, and terminal work, including failed/interrupted turns, remains owned until release is acknowledged and reconciled. Acknowledged unsubscribe permits eventual Codex teardown; it does not itself prove MCP process exit.
+
+Only a confirmed terminal `serverOverloaded` failure with no work beyond user input and no observed partial work is eligible for a plugin retry. The policy permits at most two retries within 120 seconds, on the same thread and model, with two- then four-second delays extended by `retryAfterMs` hints. Codex-owned `willRetry: true` recovery is not retried again by the plugin. Ambiguous timeouts, arbitrary refusals and partial work do not qualify. Exhaustion is surfaced as failure. Known Codex wrapper hook/bridge errors finish explicitly through the error handler instead of delegating to a Claude model; backend ownership remains available for reconciliation.
+
 <p align="center">
   <img src="./assets/readme/demo.gif" width="100%" alt="Demo: Claude starts a codex:sol agent that writes calc.js with two hidden bugs, then runs a reviewer and a test writer in parallel. The test writer asks Claude a question mid-task, Claude answers, both agents report back through native finish notifications, and Claude summarizes the two bugs they found.">
 </p>
@@ -40,7 +54,7 @@ What happens then:
 - The plugin starts the Codex thread and turn itself, with the Agent call's prompt exactly as given (header lines taken off), in the Agent call's `cwd` or the session's. Nothing is relayed through a Claude model.
 - The agent the engine starts for it is a thin wrapper. Every model request of its loop is answered by the plugin (a `turn.step` hook): while Codex works, the wrapper calls the plugin's `codex_await` tool, and once the Codex turn ends, it hands back the Codex final message, verbatim. Codex `error` notifications (model capacity, retries, a failed compaction) are warnings shown by `codex_list` and `codex_result`, not an end; a failed turn end counts only when the thread does no more work for 30 s. Where the engine requires a background subagent to report through `SubagentHandback` (auto mode), that call carries it; where the engine does not offer that tool, the failed call is followed by the message as the final text. No Claude model runs for it, so it costs no Claude tokens.
 - The wrapper is a real background subagent: it is in the task list ("↓ to manage"), and its finish row and the notification Claude reads are the engine's own.
-- `SendMessage` to the agent (by its agentId, or the `name` the Agent call gave) goes to Codex first: it steers the running turn, or, once the agent finished, starts a new turn on the same Codex thread and resumes the agent, which then notifies again. If Codex refuses the message, `SendMessage` reports it as not delivered.
+- `SendMessage` to the agent (by its agentId, or the `name` the Agent call gave) checks the saved thread and asks the engine to accept the delivery/resume before admitting native input. It then steers the running turn or starts a new turn on the same Codex thread. An engine refusal cannot start or steer Codex. A confirmed native refusal is reported as not delivered; a lost response after native admission remains accepted and pending, so do not repeat the input. The wrapper waits through the handoff and then notifies again.
 - Codex can message the session mid-task (see Messages from Codex below), and a `SendMessage` reply reaches its running turn.
 - `TaskStop`, or stopping the task from the task list, interrupts the Codex turn.
 
@@ -66,24 +80,26 @@ Each job is named after the Agent call's description, numbered when another job 
 
 ## Install
 
+Use the accepted `goldmar-stable` ref only after the rollout gates pass. Replacing an existing `codex-plugin` marketplace requires the [quiet-window procedure](docs/goldmar-rollout.md#switch-commands), including draining and closing sessions first. The commands below are for a fresh installation.
+
 At a Claude Code prompt:
 
 ```
-/plugin marketplace add SSS135/claude-code-codex-plugin
+/plugin marketplace add goldmar/claude-code-codex-plugin#goldmar-stable
 /plugin install codex@codex-plugin
 ```
 
 Or in one line, answering `y` to add the marketplace and then choosing a scope:
 
 ```
-/plugin install codex --marketplace SSS135/claude-code-codex-plugin
+/plugin install codex --marketplace goldmar/claude-code-codex-plugin#goldmar-stable
 ```
 
 From a shell:
 
 ```
-claude plugin marketplace add SSS135/claude-code-codex-plugin
-claude plugin install codex@codex-plugin
+claude plugin marketplace add 'goldmar/claude-code-codex-plugin#goldmar-stable' --scope user
+claude plugin install codex@codex-plugin --scope user
 ```
 
 ### Requirements
@@ -106,7 +122,7 @@ Since 0.2.9, the default list reports how many older finished jobs it hides, inc
 
 `id` is the agent's agentId or the job's name (its description, as `codex_list` shows it); `codex_result` reads saved jobs, including older ones and other sessions'. The list reconciles saved jobs with Claude's native agent IDs, so a restored agent is still included when Claude's session ID changes. A third tool, `codex_await`, serves the wrapper agents alone and refuses any other caller.
 
-Jobs are saved separately under `~/.claude/plugins/codex-agents/` (`CLAUDE_CONFIG_DIR/plugins/codex-agents/` when set), outside temporary task folders and versioned plugin installs. After a process restart, a running job is shown as interrupted; `SendMessage` loads its saved Codex thread with `thread/resume` and starts a new turn before resuming the wrapper. If its saved record or thread is missing, the message is refused with a clear reason and the wrapper stops instead of retrying `codex_await`. Records already lost by older versions cannot be reconstructed automatically.
+Jobs are saved separately under `~/.claude/plugins/codex-agents/` (`CLAUDE_CONFIG_DIR/plugins/codex-agents/` when set), outside temporary task folders and versioned plugin installs. After a process restart, a running job is shown as interrupted; `SendMessage` loads its saved Codex thread with `thread/resume` and verifies the wrapper delivery before starting a new turn. If its saved record or thread is missing, the message is refused with a clear reason and the wrapper stops instead of retrying `codex_await`. Records already lost by older versions cannot be reconstructed automatically.
 
 Since 0.2.10, job lines distinguish runtime from time since finishing: `running 3m 10s` or `idle, ran 7m 22s, finished 53m ago`. Failed and interrupted jobs keep their status too. The finish age uses the same end timestamp as the default list's 30-minute filter; a seven-minute job finished 53 minutes ago is hidden by default. Older records without an end timestamp omit timing.
 
@@ -158,7 +174,7 @@ The relay starts with the session and again on the next codex call or codex:* sp
 Processes end with the work they serve:
 
 - When a job's turn ends, the plugin unsubscribes from its thread (`thread/unsubscribe`). About a minute later `codex app-server` unloads the thread and stops the MCP servers it started for it: `codex-msg`, and those of Codex's own plugins, such as `computer-history`. A `SendMessage` to the job resumes the thread (`thread/resume`) before its next turn.
-- The daemon exits 20 seconds after its relay goes away (the Claude session ended), or after 10 minutes with no turn running and no request. Codex and every MCP server it started exit with it. The plugin starts a new daemon when it next needs one.
+- The daemon exits 20 seconds after its relay goes away (the Claude session ended), or after 10 minutes with no active turn, foreground operation or server request. Cleanup retries and health polling do not postpone that idle shutdown. Codex and every MCP server it started exit with it. The plugin starts a new daemon when it next needs one.
 - The daemon's directory names the bridge build (its path and code), so a session reloaded onto another plugin version starts a new daemon, and the old one exits once its relay is gone. If the old daemon still runs turns, the reloaded plugin keeps driving it instead, so no turn is lost; about 10 seconds after its last turn ends the plugin stops it, and the next request starts the new version's daemon, which resumes the threads. A wait cut off by a daemon that stops mid-turn ends the job as interrupted, and a `SendMessage` to it starts a new turn on its thread. A daemon started by plugin 0.2.2 or earlier, which never exits on its own while its session lives, is stopped by a newer daemon that has seen it run no turn for 5 minutes.
 
 ## Known limits
@@ -168,12 +184,12 @@ Processes end with the work they serve:
 - In auto mode the hand-back arrives with the engine's note that auto mode's classifier was unavailable for the agent's work: the classifier judges a model's actions with its request, and the wrapper's steps make no request. Only that classifier may allow `SubagentHandback`, so the plugin cannot allow it itself. The report under the note is the Codex final message, verbatim.
 - The final message and each `message_claude` message are passed on whole up to 20,000 characters; a longer one is cut there. At most 50 messages wait unread per job.
 - Messages are read only while the job's agent runs; one still unread when the bridge daemon exits is lost.
-- A Codex thread is started before the Agent call's subagent; if another plugin then refuses the spawn, that thread stays unused.
+- A Codex thread is started before the Agent call's subagent; a refused or cancelled spawn is reconciled and released by the daemon once idle.
 - The model is chosen by the agent type alone: the four aliases, no other Codex model id.
 - Each Agent call starts a new Codex thread. `SendMessage` continues one; there is no way to attach a new agent to an older thread.
-- The plugin API does not tell a tool row whether ctrl+o is expanding it, so the text a `codex_*` call returned is not drawn under its row; `codex_result` shows a job's result.
+- Live `codex_await` activity batches draw as compact lines; routine await tool rows are hidden. Other `codex_*` results retain the compact upstream renderer; `codex_result` exposes the durable job result.
 - The running-jobs line under the prompt is drawn on the terminal only.
-- Resuming a thread right after Claude Code restarts can take about 20 seconds while Codex reloads it.
+- Cold resumes can take longer than one HTTP request. Daemon-owned operations retain their outcome and are polled in slices of at most 20 seconds; an HTTP timeout does not retry the Codex operation.
 - On Windows, which has no SIGTERM, the daemon stops Codex with its whole process tree by force (`taskkill /T /F`), so Codex runs none of its own cleanup on the way out.
 - The hooks plugin API is early access and may change between Claude Code releases.
 
@@ -182,7 +198,7 @@ Processes end with the work they serve:
 ```
 claude plugin validate .
 claude plugin test .
-node --test tests/registry.test.mjs tests/bridge.test.mjs
+node --test --test-concurrency=1 tests/registry.test.mjs tests/bridge.test.mjs
 claude --plugin-dir .
 ```
 

@@ -31,8 +31,13 @@
 //             GET  /health
 //             GET  /events           NDJSON stream (one subscriber, the relay)
 //             POST /rpc   {method, params, timeoutMs?} -> {result} | {error}
+//             POST /operation {id, method, params, resumeParams?} -> retained pending/completed outcome
+//             POST /operation/poll {id, timeoutMs} -> same outcome (20 s maximum)
+//             POST /operation/ack {id} -> acknowledges binding/consumption
+//             POST /thread-state {threadId} -> lifecycle, activeTurnId, pending resume handle
+//             POST /release {threadId, turnId?} -> schedules acknowledged eventual unsubscribe
 //             POST /reply {id, result} | {id, error}   answers a server request
-//             POST /wait  {threadId, msgKey?, timeoutMs} long-poll for turn end or a codex-msg message
+//             POST /wait  {threadId, turnId?, msgKey?, timeoutMs} long-poll for exact turn end or a codex-msg message
 //             POST /msg   {key, text}                  bin/codex-msg: a message from a Codex job
 //           While no relay is attached it buffers events (so a plugin reload
 //           loses nothing) and exits, killing codex, after GRACE_MS alone. With a
@@ -53,10 +58,11 @@ import path from 'node:path'
 import readline from 'node:readline'
 import { fileURLToPath } from 'node:url'
 import { serveRegistry } from './registry.mjs'
+import { writerStatus } from './writer-owner.mjs'
 
 const GRACE_MS = 20_000
-const IDLE_MS = 10 * 60_000
-const IDLE_CHECK_MS = 60_000
+const IDLE_MS = Number(process.env.CODEX_BRIDGE_IDLE_MS) > 0 ? Number(process.env.CODEX_BRIDGE_IDLE_MS) : 10 * 60_000
+const IDLE_CHECK_MS = Number(process.env.CODEX_BRIDGE_IDLE_CHECK_MS) > 0 ? Number(process.env.CODEX_BRIDGE_IDLE_CHECK_MS) : 60_000
 /** Half the idle window, so a daemon about to idle out itself still stops an idle legacy one. */
 const LEGACY_IDLE_MS = IDLE_MS / 2
 const DRAIN_CHECK_MS = 5_000
@@ -69,6 +75,9 @@ const MESSAGE_CAP = 20_000
  * kept working on the thread; work on it within this window drops the failure.
  */
 const FAILED_HOLD_MS = Number(process.env.CODEX_BRIDGE_FAILED_HOLD_MS) || 30_000
+const RELEASE_RETRY_MS = Number(process.env.CODEX_BRIDGE_RELEASE_RETRY_MS) || 2_000
+const ABANDONED_OPERATION_MS = Number(process.env.CODEX_BRIDGE_ABANDONED_OPERATION_MS) || 120_000
+const SHUTDOWN_GRACE_MS = 1_000
 /** What a codex-msg delivery hands a waiting /wait. */
 const MAIL = Symbol('mail')
 const SELF = fileURLToPath(import.meta.url)
@@ -173,6 +182,9 @@ async function daemon(codexPath, dir) {
   const [file, leading] = codexCommand(codexPath)
   const codex = spawn(file, [...leading, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
+    // The CLI wrapper, native app-server, and its stdio MCP children must share
+    // an owned process group independent of the daemon's own group.
+    detached: !IS_WINDOWS,
     windowsHide: true,
   })
   // A codex that cannot start: say why in daemon.log (the relay reports its tail).
@@ -191,8 +203,18 @@ async function daemon(codexPath, dir) {
   const outstanding = new Map() // server request id -> event
   const active = new Map() // threadId -> running turnId
   const lastTurn = new Map() // threadId -> last completed turn
-  const failedHolds = new Map() // threadId -> timer of a failed turn/completed held back
-  const waiters = new Map() // threadId -> Set<(value) => void>
+  const failedHolds = new Map() // exact thread/turn -> held completion and timer
+  const terminalTurns = new Map() // exact thread/turn -> terminal tombstone
+  const supersededTurns = new Set() // an older start cannot replace a newer observed turn
+  const latestTurn = new Map() // threadId -> newest observed turnId
+  const waiters = new Map() // exact thread/turn -> Set<(value) => void>
+  const threads = new Map() // threadId -> lifecycle state and generation
+  const threadQueues = new Map()
+  const releases = new Map() // threadId -> cleanup ownership, retained through rejected/late ACKs
+  const interruptions = new Map() // exact stop intent survives wrapper/HTTP cancellation
+  const operations = new Map() // caller operation id -> retained outcome, independent of HTTP
+  let lifecycleRevision = 0
+  const turnKey = (threadId, turnId) => JSON.stringify([threadId, turnId])
   const mailboxes = new Map() // codex-msg key -> texts not yet read
   const mailWaiters = new Map() // codex-msg key -> Set<(value) => void>
   const drainMail = key => {
@@ -204,9 +226,11 @@ async function daemon(codexPath, dir) {
   let subscriber = null
   let graceTimer = null
   let everSubscribed = false
-  /** Requests other than /events being served, and when the daemon was last in use. */
-  let inFlight = 0
-  let lastUse = Date.now()
+  // Foreground ownership survives HTTP cancellation and includes operations
+  // queued behind cleanup. Repeated cleanup failures alone must not keep the
+  // app-server and its MCP processes resident forever.
+  let foregroundRuns = 0
+  let lastWork = Date.now()
 
   const emit = event => {
     if (subscriber) subscriber.write(JSON.stringify(event) + '\n')
@@ -221,7 +245,7 @@ async function daemon(codexPath, dir) {
   const rpc = (method, params, timeoutMs = 60_000) =>
     new Promise(resolve => {
       const id = nextId++
-      const timer = setTimeout(() => {
+      const timer = timeoutMs === null ? null : setTimeout(() => {
         pending.delete(id)
         resolve({ error: { code: -32000, message: `${method} timed out after ${timeoutMs} ms` } })
       }, timeoutMs)
@@ -229,12 +253,216 @@ async function daemon(codexPath, dir) {
       writeCodex(params === undefined ? { id, method } : { id, method, params })
     })
 
-  const settleWaiters = (threadId, value) => {
-    const set = waiters.get(threadId)
+  const settleWaiters = (threadId, turnId, value) => {
+    const key = turnKey(threadId, turnId)
+    const set = waiters.get(key)
     if (!set) return
-    waiters.delete(threadId)
+    waiters.delete(key)
     for (const done of set) done(value)
   }
+
+  const onThread = (threadId, work) => {
+    const run = (threadQueues.get(threadId) ?? Promise.resolve()).then(work)
+    const tail = run.catch(() => {})
+    threadQueues.set(threadId, tail)
+    void tail.then(() => { if (threadQueues.get(threadId) === tail) threadQueues.delete(threadId) })
+    return run
+  }
+  const threadState = threadId => {
+    const owned = [...operations.values()].filter(op => op.threadId === threadId && !op.acknowledged && !op.answer?.error)
+    const operation = owned.find(op => op.method === 'thread/resume')
+    const admission = owned.find(op => op.method === 'turn/start')
+    return { status: threads.get(threadId)?.status ?? 'unknown', activeTurnId: active.get(threadId) ?? null, ...(operation ? { operationId: operation.id } : {}), ...(admission ? { pendingOperationId: admission.id } : {}) }
+  }
+  const markLoaded = threadId => {
+    const state = threads.get(threadId)
+    threads.set(threadId, { status: 'loaded', generation: (state?.generation ?? 0) + 1, observedAt: ++lifecycleRevision })
+    releases.delete(threadId)
+  }
+  const observeStart = (threadId, turnId) => {
+    const key = turnKey(threadId, turnId)
+    if (terminalTurns.has(key) || supersededTurns.has(key)) return false
+    const previous = latestTurn.get(threadId)
+    if (previous && previous !== turnId) supersededTurns.add(turnKey(threadId, previous))
+    if (!threads.has(threadId)) markLoaded(threadId)
+    const release = releases.get(threadId)
+    if (release) releases.delete(threadId)
+    threads.get(threadId).status = 'loaded'
+    latestTurn.set(threadId, turnId)
+    active.set(threadId, turnId)
+    threads.get(threadId).observedAt = ++lifecycleRevision
+    return true
+  }
+  const serverRunningTurn = thread => thread?.turns?.findLast(turn => turn.status === 'inProgress')
+  const idleThread = thread => ['idle', 'systemError', 'notLoaded'].includes(thread?.status?.type ?? thread?.status) && !serverRunningTurn(thread)
+  const pendingUse = threadId => [...operations.values()].some(op => op.status === 'pending' && op.params?.threadId === threadId && ['thread/resume', 'turn/start'].includes(op.method))
+  const compactOperation = op => {
+    delete op.params
+    if (op.answer?.result) {
+      const result = op.answer.result
+      op.answer = { result: {
+        ...(result.thread?.id ? { thread: { id: result.thread.id } } : {}),
+        ...(result.turn?.id ? { turn: { id: result.turn.id, status: result.turn.status } } : {}),
+        ...(typeof result.model === 'string' ? { model: result.model } : {}),
+      } }
+    }
+  }
+  const compactReleasedOperations = threadId => {
+    for (const op of operations.values()) {
+      if (op.status === 'completed' && ['thread/start', 'thread/resume', 'turn/start'].includes(op.method) && op.threadId === threadId) compactOperation(op)
+    }
+  }
+
+  // A release is a daemon-owned intent. It survives HTTP cancellation, RPC rejection,
+  // and lost notifications; a later load/start waits behind the actual unsubscribe.
+  const requestRelease = (threadId, turnId) => {
+    const state = threads.get(threadId)
+    if (!state || ['unsubscribed', 'closed'].includes(state.status)) return threadState(threadId)
+    if (pendingUse(threadId)) return threadState(threadId)
+    if (active.has(threadId) || (turnId && latestTurn.get(threadId) !== turnId)) return threadState(threadId)
+    if (!releases.has(threadId)) releases.set(threadId, { turnId, generation: state.generation, nextAttempt: Date.now(), running: false })
+    state.status = 'releasePending'
+    return threadState(threadId)
+  }
+  const releasePending = async (threadId, release) => {
+    if (release.running || release.nextAttempt > Date.now()) return
+    release.running = true
+    try {
+      await onThread(threadId, async () => {
+        const state = threads.get(threadId)
+        if (releases.get(threadId) !== release || state?.generation !== release.generation || active.has(threadId)) return
+        const read = await rpc('thread/read', { threadId, includeTurns: true }, 10_000)
+        if (releases.get(threadId) !== release || state.generation !== release.generation || active.has(threadId)) return
+        const running = serverRunningTurn(read.result?.thread)
+        if (running) { observeStart(threadId, running.id); return }
+        if (read.error || !idleThread(read.result?.thread)) return
+        // Admission can happen while thread/read is awaiting its response. The
+        // admitted operation owns the next decision and runs after this queue item.
+        if (pendingUse(threadId)) {
+          releases.delete(threadId)
+          state.status = 'loaded'
+          return
+        }
+        // No timeout: a late ACK still owns this release and serializes a new load.
+        const answer = await rpc('thread/unsubscribe', { threadId }, null)
+        if (!answer.error && ['unsubscribed', 'notSubscribed', 'notLoaded'].includes(answer.result?.status)) {
+          state.status = answer.result.status === 'notLoaded' ? 'closed' : 'unsubscribed'
+          releases.delete(threadId)
+          compactReleasedOperations(threadId)
+          emit({ type: 'notification', method: 'thread/released', params: { threadId, status: state.status } })
+        }
+      })
+    } finally {
+      release.running = false
+      release.nextAttempt = Date.now() + RELEASE_RETRY_MS
+    }
+  }
+  const runRpc = async (method, params, timeoutMs = null, resumeParams) => {
+    const foreground = !['thread/read', 'thread/unsubscribe'].includes(method)
+    if (foreground) { foregroundRuns += 1; lastWork = Date.now() }
+    const work = async () => {
+      // Decisions in disconnected/reloaded hooks can race. Admission is the
+      // daemon's responsibility too: queueing two starts must not start two turns.
+      if (method === 'turn/start' && active.has(params?.threadId)) {
+        return { error: { code: -32006, message: 'the thread already has an active turn; steer or reconcile it first', data: { kind: 'activeTurn' } } }
+      }
+      if (method === 'turn/start' && resumeParams && threads.get(params.threadId)?.status !== 'loaded') {
+        const resumedAt = lifecycleRevision
+        const resumed = await rpc('thread/resume', resumeParams, null)
+        if (resumed.error) return resumed
+        if ((threads.get(params.threadId)?.observedAt ?? 0) <= resumedAt) markLoaded(params.threadId)
+      }
+      if (method === 'turn/start' && active.has(params?.threadId)) {
+        return { error: { code: -32006, message: 'the thread became active while resuming; steer or reconcile it first', data: { kind: 'activeTurn' } } }
+      }
+      const admittedAt = lifecycleRevision
+      const answer = await rpc(method, params, timeoutMs)
+      if (!answer.error) {
+        if (['thread/start', 'thread/resume'].includes(method) && answer.result?.thread?.id && (threads.get(answer.result.thread.id)?.observedAt ?? 0) <= admittedAt) markLoaded(answer.result.thread.id)
+        if (method === 'turn/start' && answer.result?.turn?.id && params?.threadId) observeStart(params.threadId, answer.result.turn.id)
+      }
+      return answer
+    }
+    try {
+      return await (params?.threadId && ['thread/resume', 'turn/start', 'thread/unsubscribe'].includes(method) ? onThread(params.threadId, work) : work())
+    } finally {
+      if (foreground) { foregroundRuns -= 1; lastWork = Date.now() }
+    }
+  }
+  const reconcileTerminal = async (threadId, turnId, timeoutMs) => {
+    const key = turnKey(threadId, turnId)
+    if (!turnId || terminalTurns.has(key) || failedHolds.has(key)) return
+    const answer = await rpc('thread/read', { threadId, includeTurns: true }, Math.min(timeoutMs, 1_000))
+    const observed = answer.result?.thread?.turns?.find(turn => turn.id === turnId)
+    // Native Codex may project an unfinished persisted turn as interrupted.
+    // Without a completion time that is not a terminal receipt. An already
+    // observed non-success notification keeps ownership of its reconciliation.
+    const terminalReceipt = observed && ['completed', 'failed', 'interrupted'].includes(observed.status)
+      && (observed.status !== 'interrupted' || Number.isFinite(observed.completedAt))
+    if (terminalReceipt && idleThread(answer.result?.thread) && !failedHolds.has(key)) {
+      onCodexMessage({ method: 'turn/completed', params: { threadId, turn: observed } })
+    }
+  }
+  const interrupt = (threadId, requestedTurnId) => {
+    const admission = [...operations.values()].find(op => op.threadId === threadId && op.method === 'turn/start' && op.status === 'pending')
+    const turnId = requestedTurnId ?? active.get(threadId) ?? (admission ? null : latestTurn.get(threadId)) ?? null
+    const existing = interruptions.get(threadId)
+    if (existing && existing.turnId === turnId && existing.pendingId === admission?.id) return existing
+    const stop = { turnId, pendingId: admission?.id, running: false, attempts: 0 }
+    interruptions.set(threadId, stop)
+    void driveInterrupt(threadId, stop)
+    return stop
+  }
+  const driveInterrupt = async (threadId, stop) => {
+    if (stop.running || stop.attempts >= 3) return
+    stop.running = true
+    try {
+      // An admitted start can outlive the hook. finishOperation re-enters here
+      // after its exact outcome is known; do not block the admission queue.
+      if (pendingUse(threadId)) return
+      stop.turnId ??= active.get(threadId) ?? null
+      if (!stop.turnId || terminalTurns.has(turnKey(threadId, stop.turnId))) return
+      for (; stop.attempts < 3; ) {
+        if (active.get(threadId) !== stop.turnId || terminalTurns.has(turnKey(threadId, stop.turnId))) return
+        stop.attempts += 1
+        await rpc('turn/interrupt', { threadId, turnId: stop.turnId }, 2_000)
+        await reconcileTerminal(threadId, stop.turnId, 500)
+        // An RPC acknowledgement is not a turn-end receipt. Only the reconciled
+        // terminal notification/read may change the job to interrupted.
+        if (terminalTurns.has(turnKey(threadId, stop.turnId))) return
+        await new Promise(resolve => setTimeout(resolve, 250 * stop.attempts))
+      }
+    } finally { stop.running = false }
+  }
+  const operationAnswer = op => ({ operationId: op.id, status: op.status, ...(op.answer ?? {}) })
+  const finishOperation = (op, answer) => {
+    op.answer = answer
+    op.status = 'completed'
+    op.completedAt = Date.now()
+    const threadId = op.params?.threadId ?? answer.result?.thread?.id
+    op.threadId = threadId
+    const turnId = latestTurn.get(threadId)
+    // A terminal notification may precede its start/resume response. Its first
+    // release was fenced by this pending operation, so reconcile after settlement,
+    // including rejected admissions that left an earlier terminal turn loaded.
+    if (threadId && turnId && terminalTurns.has(turnKey(threadId, turnId)) && !active.has(threadId)) requestRelease(threadId, turnId)
+    for (const done of op.waiters) done(operationAnswer(op))
+    op.waiters.clear()
+    const stop = interruptions.get(threadId)
+    if (stop) {
+      if (op.method === 'turn/start') stop.turnId ??= answer.result?.turn?.id ?? null
+      void driveInterrupt(threadId, stop)
+    }
+  }
+  setInterval(() => {
+    for (const [threadId, release] of releases) void releasePending(threadId, release).catch(() => {})
+    for (const op of operations.values()) {
+      if (op.acknowledged || op.status !== 'completed' || op.answer?.error || Date.now() - op.completedAt < ABANDONED_OPERATION_MS) continue
+      if (!['thread/start', 'thread/resume'].includes(op.method)) continue
+      const threadId = op.answer.result?.thread?.id ?? op.params?.threadId
+      if (threadId) requestRelease(threadId)
+    }
+  }, Math.min(RELEASE_RETRY_MS, 1_000)).unref()
 
   const onCodexMessage = message => {
     if (message.id !== undefined && message.method === undefined) {
@@ -253,29 +481,53 @@ async function daemon(codexPath, dir) {
     }
     const { method, params = {} } = message
     const isTurnEnd = method === 'turn/completed' && params.turn
-    if ((isTurnEnd || method === 'turn/started' || method.startsWith('item/')) && failedHolds.has(params.threadId)) {
-      clearTimeout(failedHolds.get(params.threadId))
-      failedHolds.delete(params.threadId)
+    const turnId = params.turn?.id ?? params.turnId
+    const key = turnKey(params.threadId, turnId)
+    if (method === 'turn/started' && turnId && !observeStart(params.threadId, turnId)) return
+    // Items are evidence only for their exact live turn; old delayed items never
+    // resurrect a terminal turn or cancel another turn's failure observation.
+    if (method.startsWith('item/') && (terminalTurns.has(key) || active.get(params.threadId) !== turnId)) return
+    if (method === 'thread/closed') {
+      const state = threads.get(params.threadId)
+      if (state?.status === 'unsubscribed' && !active.has(params.threadId)) { state.status = 'closed'; releases.delete(params.threadId); compactReleasedOperations(params.threadId) }
     }
-    if (method === 'turn/started' && params.turn?.id) active.set(params.threadId, params.turn.id)
-    // Work after the thread's turn ended: follow it as a running turn again.
-    if (method.startsWith('item/') && typeof params.turnId === 'string' && !active.has(params.threadId)) active.set(params.threadId, params.turnId)
     if (method === 'serverRequest/resolved' && params.requestId !== undefined) outstanding.delete(params.requestId)
-    if (isTurnEnd && params.turn.status === 'failed') {
-      failedHolds.set(params.threadId, setTimeout(() => {
-        failedHolds.delete(params.threadId)
-        endTurn(params)
-      }, FAILED_HOLD_MS))
-    } else if (isTurnEnd) endTurn(params)
+    if (isTurnEnd && ['failed', 'interrupted'].includes(params.turn.status)) {
+      if (!failedHolds.has(key) && !terminalTurns.has(key)) {
+        const held = { params, timer: null }
+        failedHolds.set(key, held)
+        const reconcile = async () => {
+          if (failedHolds.get(key) !== held) return
+          if (latestTurn.get(params.threadId) !== turnId) { failedHolds.delete(key); endTurn(params); return }
+          const answer = await rpc('thread/read', { threadId: params.threadId, includeTurns: true }, 10_000)
+          if (failedHolds.get(key) !== held) return
+          const running = serverRunningTurn(answer.result?.thread)
+          if (running || answer.error || !idleThread(answer.result?.thread)) {
+            if (running && running.id !== turnId) observeStart(params.threadId, running.id)
+            held.timer = setTimeout(reconcile, RELEASE_RETRY_MS)
+          } else { failedHolds.delete(key); endTurn(params) }
+        }
+        held.timer = setTimeout(reconcile, FAILED_HOLD_MS)
+      }
+    } else if (isTurnEnd) {
+      const held = failedHolds.get(key)
+      if (held) { clearTimeout(held.timer); failedHolds.delete(key) }
+      endTurn(params)
+    }
     else if (!isNoise(method)) emit({ type: 'notification', method, params })
   }
 
   const endTurn = params => {
-    active.delete(params.threadId)
-    lastTurn.set(params.threadId, params.turn)
-    lastUse = Date.now()
+    const key = turnKey(params.threadId, params.turn.id)
+    if (terminalTurns.has(key)) return
+    terminalTurns.set(key, params.turn)
+    if (active.get(params.threadId) === params.turn.id) active.delete(params.threadId)
+    if (!latestTurn.has(params.threadId) || latestTurn.get(params.threadId) === params.turn.id) lastTurn.set(params.threadId, params.turn)
+    if (threads.has(params.threadId) && latestTurn.get(params.threadId) === params.turn.id) threads.get(params.threadId).observedAt = ++lifecycleRevision
+    lastWork = Date.now()
     emit({ type: 'notification', method: 'turn/completed', params })
-    settleWaiters(params.threadId, { status: 'completed', turn: params.turn })
+    settleWaiters(params.threadId, params.turn.id, { status: 'completed', turn: params.turn })
+    requestRelease(params.threadId, params.turn.id)
   }
 
   readline.createInterface({ input: codex.stdout }).on('line', line => {
@@ -295,13 +547,25 @@ async function daemon(codexPath, dir) {
     } catch {}
   }
 
+  let shuttingDown = false
   const shutdown = code => {
-    if (codex.exitCode === null && codex.signalCode === null) stopTree(codex.pid)
+    if (shuttingDown) return
+    shuttingDown = true
+    const stopGroup = signal => {
+      if (IS_WINDOWS) { stopTree(codex.pid); return }
+      // The group remains ours even if its leader has exited; stopping only
+      // the wrapper PID leaves its native app-server/MCP descendants behind.
+      try { process.kill(-codex.pid, signal) } catch {}
+    }
+    stopGroup('SIGTERM')
     cleanup()
     // End the relay's stream before exiting, so the relay reads an ordinary end, not a reset.
     if (subscriber) subscriber.end()
     subscriber = null
-    setTimeout(() => process.exit(code), 100)
+    // Escalate before this daemon exits, including after the leader exits on
+    // TERM. A stubborn grandchild must not outlive the cleanup backstop.
+    setTimeout(() => stopGroup('SIGKILL'), SHUTDOWN_GRACE_MS)
+    setTimeout(() => process.exit(code), SHUTDOWN_GRACE_MS + 100)
   }
 
   const armGrace = () => {
@@ -315,9 +579,8 @@ async function daemon(codexPath, dir) {
       clearTimeout(timer)
       resolve({ error: { code: -32001, message: 'codex app-server exited' } })
     }
-    if (subscriber) subscriber.end()
-    cleanup()
-    setTimeout(() => process.exit(code ?? 1), 100)
+    pending.clear()
+    shutdown(code ?? 1)
   })
   for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => shutdown(0))
 
@@ -330,22 +593,15 @@ async function daemon(codexPath, dir) {
 
   const server = http.createServer(async (req, res) => {
     try {
+      if (shuttingDown) return sendJson(res, 503, { error: { code: -32001, message: 'codex bridge is shutting down' } })
       const url = new URL(req.url ?? '/', 'http://bridge')
       // On Windows any local process or web page reaches the port: only the secret's holders get past it.
       if (secret) {
         if (!url.pathname.startsWith(`/${secret}/`)) return sendJson(res, 403, { error: { message: 'forbidden' } })
         url.pathname = url.pathname.slice(secret.length + 1)
       }
-      if (url.pathname !== '/events') {
-        inFlight += 1
-        lastUse = Date.now()
-        res.on('close', () => {
-          inFlight -= 1
-          lastUse = Date.now()
-        })
-      }
       if (req.method === 'GET' && url.pathname === '/health') {
-        return sendJson(res, 200, { ok: true, pid: process.pid, codexPid: codex.pid, build: BUILD, active: Object.fromEntries(active) })
+        return sendJson(res, 200, { ok: true, pid: process.pid, codexPid: codex.pid, build: BUILD, active: Object.fromEntries(active), loaded: [...threads.values()].filter(state => state.status === 'loaded').length, releasing: releases.size, pendingOperations: [...operations.values()].filter(op => op.status === 'pending').length, pendingRequests: pending.size })
       }
       if (req.method === 'GET' && url.pathname === '/events') {
         if (subscriber) subscriber.end()
@@ -367,41 +623,104 @@ async function daemon(codexPath, dir) {
       }
       if (req.method !== 'POST') return sendJson(res, 404, { error: { message: 'not found' } })
       const body = await readBody(req)
+      if (url.pathname === '/writer-status') return sendJson(res, 200, writerStatus(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), body.threadId))
+      if (url.pathname === '/interrupt') {
+        if (typeof body.threadId !== 'string' || !/^[A-Za-z0-9_-]{1,200}$/.test(body.threadId) || (body.turnId != null && typeof body.turnId !== 'string')) return sendJson(res, 400, { error: { message: 'valid threadId and optional turnId required' } })
+        const stop = interrupt(body.threadId, body.turnId)
+        // The worker owns the stop even if this HTTP request is cancelled.
+        const deadline = Date.now() + 2_000
+        while (Date.now() < deadline && (!stop.turnId || !terminalTurns.has(turnKey(body.threadId, stop.turnId)))) {
+          if (stop.attempts >= 3 && !stop.running) break
+          await new Promise(resolve => setTimeout(resolve, 25))
+        }
+        const turn = stop.turnId && terminalTurns.get(turnKey(body.threadId, stop.turnId))
+        return sendJson(res, 200, turn ? { status: 'completed', turn } : { status: 'stillRunning' })
+      }
+      if (url.pathname === '/thread-state') return sendJson(res, 200, threadState(body.threadId))
+      if (url.pathname === '/release') return sendJson(res, 200, requestRelease(body.threadId, body.turnId))
+      if (url.pathname === '/operation') {
+        if (typeof body.id !== 'string' || !body.id || typeof body.method !== 'string') return sendJson(res, 400, { error: { code: -32602, message: 'operation id and method required' } })
+        if (body.resumeParams !== undefined && (body.method !== 'turn/start' || !body.params?.threadId || body.resumeParams?.threadId !== body.params.threadId)) return sendJson(res, 400, { error: { code: -32602, message: 'resumeParams must belong to the turn/start thread' } })
+        // JSON payload equality is deterministic for the submitting hook; object
+        // key order does not change the operation's meaning.
+        const canonical = value => value && typeof value === 'object' ? (Array.isArray(value) ? value.map(canonical) : Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])]))) : value
+        const fingerprint = createHash('sha256').update(JSON.stringify(canonical({ method: body.method, params: body.params, resumeParams: body.resumeParams }))).digest('hex')
+        let op = operations.get(body.id)
+        if (op && op.fingerprint !== fingerprint) return sendJson(res, 409, { error: { code: -32602, message: 'operation id already belongs to a different request' } })
+        if (!op) {
+          op = { id: body.id, method: body.method, params: body.params, threadId: body.params?.threadId, fingerprint, status: 'pending', acknowledged: false, waiters: new Set() }
+          operations.set(op.id, op)
+          void runRpc(op.method, op.params, null, body.resumeParams).then(answer => finishOperation(op, answer), () => finishOperation(op, { error: { code: -32001, message: 'bridge operation failed' } }))
+        }
+        return sendJson(res, 200, operationAnswer(op))
+      }
+      if (url.pathname === '/operation/poll' || url.pathname === '/operation/ack') {
+        const op = operations.get(body.id)
+        if (!op) return sendJson(res, 404, { error: { code: -32004, message: 'unknown operation' } })
+        if (url.pathname === '/operation/ack') {
+          if (op.status !== 'completed') return sendJson(res, 409, { error: { code: -32005, message: 'operation is still pending' } })
+          op.acknowledged = true
+          // The caller has durably bound/consumed this outcome. Keep the handle
+          // and digest for dedupe, but stop retaining request config/prompt bodies
+          // or complete thread histories for the daemon's whole lifetime.
+          compactOperation(op)
+          return sendJson(res, 200, { ok: true })
+        }
+        if (op.status === 'completed') return sendJson(res, 200, operationAnswer(op))
+        const answer = await new Promise(resolve => {
+          const done = value => { clearTimeout(timer); op.waiters.delete(done); resolve(value) }
+          const timer = setTimeout(() => done(operationAnswer(op)), Math.max(1, Math.min(Number(body.timeoutMs) || 20_000, 20_000)))
+          op.waiters.add(done)
+          res.on('close', () => { clearTimeout(timer); op.waiters.delete(done) })
+        })
+        return sendJson(res, 200, answer)
+      }
       if (url.pathname === '/rpc') {
         if (typeof body.method !== 'string') return sendJson(res, 400, { error: { message: 'method required' } })
-        const answer = await rpc(body.method, body.params, body.timeoutMs ?? 60_000)
-        if (body.method === 'turn/start' && answer.result?.turn?.id && body.params?.threadId) {
-          active.set(body.params.threadId, answer.result.turn.id)
-        }
+        const answer = await runRpc(body.method, body.params, body.timeoutMs ?? 60_000)
         return sendJson(res, 200, answer)
       }
       if (url.pathname === '/reply') {
         if (!outstanding.has(body.id)) return sendJson(res, 404, { error: { message: `no open server request ${body.id}` } })
         outstanding.delete(body.id)
+        lastWork = Date.now()
         writeCodex(body.error !== undefined ? { id: body.id, error: body.error } : { id: body.id, result: body.result })
         return sendJson(res, 200, { ok: true })
       }
       if (url.pathname === '/wait') {
         const { threadId, msgKey } = body
+        const turnId = body.turnId ?? active.get(threadId) ?? latestTurn.get(threadId)
+        const key = turnKey(threadId, turnId)
         // The hook host aborts HTTP at 30 s. Bound even legacy callers' waits.
         const timeoutMs = Math.max(1, Math.min(Number(body.timeoutMs) || 20_000, 20_000))
+        const deadline = Date.now() + timeoutMs
         // Messages first: a job may send one and end its turn before the next poll.
         if (msgKey && mailboxes.get(msgKey)?.length) return sendJson(res, 200, { status: 'message', messages: drainMail(msgKey) })
-        if (!active.has(threadId)) return sendJson(res, 200, { status: 'idle', turn: lastTurn.get(threadId) ?? null })
+        // Notifications can be lost across a reconnect. Reconcile the requested
+        // exact turn, never a thread's newest unrelated completion. The read is
+        // bounded inside this poll's budget and has no mutating side effects.
+        await reconcileTerminal(threadId, turnId, timeoutMs)
+        if (terminalTurns.has(key)) {
+          requestRelease(threadId, turnId)
+          return sendJson(res, 200, { status: 'completed', turn: terminalTurns.get(key) })
+        }
+        if (!active.has(threadId) && !body.turnId) return sendJson(res, 200, { status: 'idle', turn: lastTurn.get(threadId) ?? null })
         const answer = await new Promise(resolve => {
-          const set = waiters.get(threadId) ?? new Set()
-          waiters.set(threadId, set)
+          const set = waiters.get(key) ?? new Set()
+          waiters.set(key, set)
           const mail = msgKey ? (mailWaiters.get(msgKey) ?? new Set()) : null
           if (mail) mailWaiters.set(msgKey, mail)
           const done = value => {
             clearTimeout(timer)
             set.delete(done)
+            if (set.size === 0) waiters.delete(key)
             mail?.delete(done)
             resolve(value === MAIL ? { status: 'message', messages: drainMail(msgKey) } : value)
           }
-          const timer = setTimeout(() => done({ status: 'timeout', turnId: active.get(threadId) ?? null }), timeoutMs)
+          const timer = setTimeout(() => done({ status: 'timeout', turnId: active.get(threadId) ?? null }), Math.max(1, deadline - Date.now()))
           set.add(done)
           mail?.add(done)
+          res.on('close', () => { clearTimeout(timer); set.delete(done); mail?.delete(done); if (set.size === 0) waiters.delete(key) })
         })
         return sendJson(res, 200, answer)
       }
@@ -413,6 +732,7 @@ async function daemon(codexPath, dir) {
         const box = mailboxes.get(key) ?? []
         if (box.length >= MAILBOX_CAP) return sendJson(res, 429, { error: { message: `${MAILBOX_CAP} messages are already waiting to be read` } })
         box.push(text.slice(0, MESSAGE_CAP))
+        lastWork = Date.now()
         mailboxes.set(key, box)
         const set = mailWaiters.get(key)
         if (set) {
@@ -462,8 +782,8 @@ async function daemon(codexPath, dir) {
     }
   }
   setInterval(() => {
-    if (active.size > 0 || inFlight > 0) lastUse = Date.now()
-    else if (subscriber && Date.now() - lastUse >= IDLE_MS) shutdown(0)
+    if (active.size > 0 || foregroundRuns > 0 || outstanding.size > 0) lastWork = Date.now()
+    else if (subscriber && Date.now() - lastWork >= IDLE_MS) shutdown(0)
     stopIdleLegacy().catch(error => process.stderr.write(`legacy daemon sweep failed: ${error.message}\n`))
   }, IDLE_CHECK_MS)
 }
@@ -511,7 +831,7 @@ const readHealth = async socketPath => {
 
 const isHealthy = async socketPath => (await readHealth(socketPath)) !== null
 
-const isBusy = health => Object.keys(health?.active ?? {}).length > 0
+const isBusy = health => Object.keys(health?.active ?? {}).length > 0 || (health?.pendingRequests ?? 0) > 0 || (health?.releasing ?? 0) > 0
 
 /** Stops the daemon in `dir` that answered `health`, when the pid it reports is the one its launcher recorded; whether it did. */
 const stopDaemon = (dir, health) => {

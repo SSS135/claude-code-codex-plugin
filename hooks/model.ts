@@ -23,8 +23,13 @@ export type BridgeEvent =
   | { type: 'exit'; code: number | null; signal: string | null; stderrTail: string[] }
   | { type: 'fatal'; message: string; logTail: string }
 
-/** A failure to show the model as the tool's error. */
-export class CodexError extends Error {}
+/** Preserve the protocol classification; a transport timeout is never an idle receipt. */
+export class CodexError extends Error {
+  constructor(message: string, readonly code?: number, readonly data?: unknown) {
+    super(message)
+    this.name = 'CodexError'
+  }
+}
 
 /** Where $.http.fetch sends a bridge endpoint: over the daemon's Unix socket, or on Windows to its loopback URL, which carries the daemon's secret (bin/bridge.mjs). */
 export const bridgeTarget = (socket: string, endpoint: string): { url: string; socketPath?: string } =>
@@ -415,6 +420,23 @@ export function afterTurn(agent: CodexAgent, turn: Record<string, unknown>, now:
     turnEndedAt: now,
     ...(final !== null ? { lastMessage: final } : {}),
   }
+}
+
+/** A new attempt is safe only after a structured terminal overload with no
+ * observed work. Transport errors, prose matching and server-owned retries
+ * never authorize repeating input that may have produced side effects.
+ */
+export function overloadRetryDelay(agent: CodexAgent, turn: Record<string, unknown>, now: number): number | null {
+  const error = turn.error as Record<string, unknown> | null | undefined
+  if (turn.status !== 'failed' || error?.codexErrorInfo !== 'serverOverloaded' || turn.willRetry === true || error.willRetry === true) return null
+  if (!Array.isArray(turn.items) || turn.items.some(item => !item || typeof item !== 'object' || (item as { type?: unknown }).type !== 'userMessage') || agent.capacityWorkObserved === true) return null
+  if (!agent.capacityInput || (agent.capacityAttempts ?? 0) >= 2) return null
+  const attempt = agent.capacityAttempts ?? 0
+  const started = agent.capacityStartedAt ?? agent.turnStartedAt
+  const hint = error.retryAfterMs ?? turn.retryAfterMs
+  if (hint !== undefined && (typeof hint !== 'number' || !Number.isFinite(hint) || hint < 0)) return null
+  const delay = Math.max(2000 * (attempt + 1), typeof hint === 'number' ? hint : 0)
+  return now - started + delay <= 120_000 ? delay : null
 }
 
 // ------------------------------------------------------------ approvals

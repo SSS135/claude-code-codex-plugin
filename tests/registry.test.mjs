@@ -7,6 +7,36 @@ import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { readAgents, serveRegistry, writeAgent } from '../bin/registry.mjs'
 
+test('0.2.10 and goldmar.1 records are found by restored ID or name without rewriting their bytes', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-registry-legacy-'))
+  try {
+    for (const [id, outbox] of [['upstream', undefined], ['goldmar1', []]]) {
+      // Fields written by both historical newAgent implementations; all newer
+      // capacity and stop fields are optional. Very old outbox is also optional.
+      const agent = {
+        id, name: `helper-${id}`, description: 'fixture', threadId: `thread-${id}`, sessionId: 'previous-session',
+        model: 'gpt-6.1-sol', effort: 'high', sandbox: 'workspace-write', approvals: 'ask', cwd: '/fixture',
+        status: 'idle', currentTurnId: null, lastTurnId: 'previous-turn', lastTurnStatus: 'completed',
+        lastMessage: 'fixture result', activity: '', tokens: 0, error: null, msgKey: `key-${id}`, digest: [],
+        startedAt: 1, updatedAt: 2, turnStartedAt: 1, turnEndedAt: 2, ...(outbox ? { outbox } : {}),
+      }
+      const file = path.join(dir, `${id}.json`)
+      const bytes = JSON.stringify(agent)
+      fs.writeFileSync(file, bytes)
+      for (const query of [{ sessionId: 'restored-session', ids: [id] }, { ref: id }, { ref: agent.name }]) {
+        const found = readAgents(query, dir)[id]
+        assert.equal(found.threadId, agent.threadId)
+        assert.equal(found.sandbox, agent.sandbox)
+        assert.equal(found.approvals, agent.approvals)
+        assert.deepEqual(found.outbox, [])
+      }
+      assert.equal(fs.readFileSync(file, 'utf8'), bytes, 'reads must not migrate live files in place')
+      fs.writeFileSync(path.join(dir, `bad-${id}.json`), JSON.stringify({ ...agent, id: `bad-${id}`, threadId: null }))
+      assert.deepEqual(readAgents({ ref: `bad-${id}` }, dir), {})
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
 test('separate sessions persist independently, survive registry-server restart, and retain stale records', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-registry-test-'))
   const first = await serveRegistry(dir)
