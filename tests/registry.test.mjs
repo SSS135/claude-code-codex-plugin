@@ -7,10 +7,10 @@ import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { readAgents, serveRegistry, writeAgent } from '../bin/registry.mjs'
 
-test('0.2.10 and goldmar.1 records are found by restored ID or name without rewriting their bytes', () => {
+test('Legacy records with and without an outbox are found by restored ID or name without rewriting their bytes', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-registry-legacy-'))
   try {
-    for (const [id, outbox] of [['upstream', undefined], ['goldmar1', []]]) {
+    for (const [id, outbox] of [['upstream', undefined], ['with-outbox', []]]) {
       // Fields written by both historical newAgent implementations; all newer
       // capacity and stop fields are optional. Very old outbox is also optional.
       const agent = {

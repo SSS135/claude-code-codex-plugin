@@ -4,13 +4,11 @@
 
 A Claude Code plugin that runs OpenAI Codex (luna, sol, astra, terra) as native Claude Code background subagents. Claude hands a task to a `codex:sol` agent through its own Agent tool and carries on. The job shows in the native task list, `SendMessage` and `TaskStop` reach it, and when Codex finishes, the native `Agent "<description>" finished` notification brings Claude the Codex final message, word for word. Codex approval requests show up as Claude Code dialogs.
 
-This is [goldmar's reliability fork](https://github.com/goldmar/claude-code-codex-plugin) of [SSS135's upstream plugin](https://github.com/SSS135/claude-code-codex-plugin), version `0.2.10-goldmar.4`, based on upstream `b94d5d08` (0.2.10), with MIT attribution preserved. The plugin is still `codex` and its marketplace is still `codex-plugin`. See [the acceptance gates, rollout and rollback procedure](docs/goldmar-rollout.md) before changing an installed marketplace. Development merges do not switch an installed plugin.
-
 ### Live activity in the agent view
 
-Open the Codex agent's detail transcript. Live progress appears as compact lines without repeated await rows or activity headers. Codex's commentary and public reasoning summaries lead each batch, followed by changed paths, plan progress (`1/3 done`) and at most the last three completed commands plus an omitted-command count. Commands appear once, with exit code and duration when provided. Shell wrappers, heredoc bodies and inline interpreter bodies are hidden; redacted command fragments become an ellipsis.
+Open the Codex agent's detail transcript. Commentary, public reasoning summaries and plans appear as assistant markdown blocks, preserving paragraphs, lists and code fences. Completed shell commands appear as native Bash tool blocks with recorded exit status and duration. These blocks replay completed work without executing commands again or making a Claude model request. Native rendering controls grouping and expansion; routine await rows stay hidden.
 
-Every event line is at most 120 characters and each batch at most 4,000 characters; each agent buffers at most 60 entries / 16,000 characters, with an omission notice on overflow. Environment assignments and recognized credentials/identifiers are sanitized before display. Raw command output, file diffs, configuration and raw reasoning are omitted. Redaction cannot identify every secret in arbitrary prose; keep secrets out of job messages. Quiet awaits return silently after 45 seconds; internal checks run every two seconds so new activity and cancellation stay responsive. Activity is separate from the final answer and `message_claude` delivery, and makes no Claude model request. Undelivered previews may be lost on reload.
+Command previews are sanitized and limited to 1,000 characters, with shell wrappers, heredoc bodies and inline interpreter bodies hidden. Raw command output, file diffs, configuration and raw reasoning are omitted. Each agent buffers at most 60 events / 512,000 characters with an omission notice on overflow; individual messages over 256,000 characters are omitted with a notice. Redaction cannot identify every secret in arbitrary prose; keep secrets out of job messages. Quiet awaits return silently after 45 seconds, with internal checks every two seconds. Activity is separate from the final answer and `message_claude` delivery. Undelivered previews may be lost on reload.
 
 ### Reliability policy
 
@@ -80,26 +78,24 @@ Each job is named after the Agent call's description, numbered when another job 
 
 ## Install
 
-Use the accepted `goldmar-stable` ref only after the rollout gates pass. Replacing an existing `codex-plugin` marketplace requires the [quiet-window procedure](docs/goldmar-rollout.md#switch-commands), including draining and closing sessions first. The commands below are for a fresh installation.
-
 At a Claude Code prompt:
 
 ```
-/plugin marketplace add goldmar/claude-code-codex-plugin#goldmar-stable
+/plugin marketplace add SSS135/claude-code-codex-plugin
 /plugin install codex@codex-plugin
 ```
 
 Or in one line, answering `y` to add the marketplace and then choosing a scope:
 
 ```
-/plugin install codex --marketplace goldmar/claude-code-codex-plugin#goldmar-stable
+/plugin install codex --marketplace SSS135/claude-code-codex-plugin
 ```
 
 From a shell:
 
 ```
-claude plugin marketplace add 'goldmar/claude-code-codex-plugin#goldmar-stable' --scope user
-claude plugin install codex@codex-plugin --scope user
+claude plugin marketplace add SSS135/claude-code-codex-plugin
+claude plugin install codex@codex-plugin
 ```
 
 ### Requirements
@@ -187,7 +183,7 @@ Processes end with the work they serve:
 - A Codex thread is started before the Agent call's subagent; a refused or cancelled spawn is reconciled and released by the daemon once idle.
 - The model is chosen by the agent type alone: the four aliases, no other Codex model id.
 - Each Agent call starts a new Codex thread. `SendMessage` continues one; there is no way to attach a new agent to an older thread.
-- Live `codex_await` activity batches draw as compact lines; routine await tool rows are hidden. Other `codex_*` results retain the compact upstream renderer; `codex_result` exposes the durable job result.
+- Live activity replays as assistant markdown and native Bash blocks; routine await tool rows are hidden. Other `codex_*` results retain their compact renderer; `codex_result` exposes the durable job result.
 - The running-jobs line under the prompt is drawn on the terminal only.
 - Cold resumes can take longer than one HTTP request. Daemon-owned operations retain their outcome and are polled in slices of at most 20 seconds; an HTTP timeout does not retry the Codex operation.
 - On Windows, which has no SIGTERM, the daemon stops Codex with its whole process tree by force (`taskkill /T /F`), so Codex runs none of its own cleanup on the way out.
@@ -199,6 +195,7 @@ Processes end with the work they serve:
 claude plugin validate .
 claude plugin test .
 node --test --test-concurrency=1 tests/registry.test.mjs tests/bridge.test.mjs
+CODEX_NATIVE_LIFECYCLE=1 node --test --test-concurrency=1 tests/native-lifecycle.test.mjs
 claude --plugin-dir .
 ```
 

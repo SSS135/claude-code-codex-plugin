@@ -1950,7 +1950,7 @@ test('engine delivery refusal admits no native start or steer, for both running 
 })
 
 test('actual engine resume objects recover legacy records by ID across sessions without replacing their thread', async ($, on) => {
-  // 0.2.10 and goldmar.1 used this same record schema, without the newer
+  // Legacy records used this same schema, without the newer
   // optional stop/capacity fields. Neither record is listed by the engine yet.
   const legacy = savedAgent('legacy', { sessionId: 'previous-session', status: 'idle', currentTurnId: null, sandbox: 'workspace-write' })
   const fake = fakeBridge(on, {}, {}, { legacy })
