@@ -177,7 +177,8 @@ async function daemon(codexPath, dir) {
   })
   // A codex that cannot start: say why in daemon.log (the relay reports its tail).
   codex.on('error', error => {
-    process.stderr.write(`cannot start ${codexPath}: ${error.message}\n`)
+    const hint = error.code === 'ENOENT' ? ' (not found: install it with `npm install -g @openai/codex` for the node on PATH, or set the codexPath plugin option)' : ''
+    process.stderr.write(`cannot start ${codexPath}: ${error.message}${hint}\n`)
     process.exit(1)
   })
   const stderrTail = []
