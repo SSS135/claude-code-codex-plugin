@@ -91,7 +91,7 @@ claude plugin install codex@codex-plugin
 - Claude Code with the hooks plugin API (function hooks, currently early access).
 - The Codex CLI 0.160.0 or newer, with `codex app-server`. An older one refuses each codex:* spawn with the version found and how to update. It ships inside the ChatGPT desktop app on macOS, or you can install it separately.
 - Node 18 or newer.
-- macOS, Linux or Windows 10/11. On Windows install the Codex CLI with `npm i -g @openai/codex` (or point `codexPath` at a `codex.exe`); Codex runs its shell commands in PowerShell there.
+- macOS, Linux or Windows 10/11. On Windows install the Codex app or the Codex CLI with `npm i -g @openai/codex` (or point `codexPath` at a `codex.exe`); Codex runs its shell commands in PowerShell there.
 
 ## Tools
 
@@ -124,7 +124,7 @@ Set these in the install screen or the plugin's config menu (`userConfig`):
 | `defaultSandbox` | `workspace-write` | read-only, workspace-write, full-access. |
 | `defaultApprovals` | `auto` | auto, ask, never. |
 
-Both path defaults are macOS paths (Apple Silicon with Homebrew). Elsewhere, either keep them and put `codex` and `node` on PATH, or set absolute paths. An empty path also means PATH. On Windows npm's `codex.cmd` shim cannot run without a shell, so the bridge runs the npm package's `codex.js` with node instead, found beside a configured path or on PATH, or a `codex.exe` found there; `codexPath` may also name a `codex.exe` or `codex.js` directly.
+Both path defaults are macOS paths (Apple Silicon with Homebrew). Elsewhere, either keep them and put `codex` and `node` on PATH, or set absolute paths. An empty path also means PATH. On Windows npm's `codex.cmd` shim cannot run without a shell, so the bridge runs the npm package's `codex.js` with node instead, found beside a configured path or on PATH, or a `codex.exe` found there, else the Codex desktop app's own `codex.exe` (Store package `OpenAI.Codex`, located with `Get-AppxPackage` since its folder name changes with each app update); `codexPath` may also name a `codex.exe` or `codex.js` directly.
 
 A project can set its own defaults in `.claude/codex.json`. The plugin uses the nearest one found walking up to the project root:
 

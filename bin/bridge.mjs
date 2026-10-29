@@ -107,10 +107,22 @@ const isAlive = pid => {
 }
 
 /**
+ * The codex.exe of the Codex desktop app (Store package OpenAI.Codex), or null.
+ * Its folder name carries the app version and WindowsApps cannot be listed, so
+ * Windows is asked where the package lives.
+ */
+const codexAppExe = () => {
+  const ran = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', '(Get-AppxPackage OpenAI.Codex).InstallLocation'], { encoding: 'utf8', timeout: 15_000, windowsHide: true })
+  const dir = (ran.stdout ?? '').trim().split(/\r?\n/)[0]
+  const exe = dir ? path.join(dir, 'app', 'resources', 'codex.exe') : null
+  return exe && fs.existsSync(exe) ? exe : null
+}
+
+/**
  * The file and leading arguments that run `codexPath`. On Windows a bare name
  * or npm's codex.cmd shim cannot run without a shell, so it becomes the npm
  * package's codex.js on this node, or a codex.exe, found beside the given
- * path or on PATH.
+ * path or on PATH, else the Codex desktop app's codex.exe.
  */
 const codexCommand = codexPath => {
   if (!IS_WINDOWS || /\.exe$/i.test(codexPath)) return [codexPath, []]
@@ -122,7 +134,8 @@ const codexCommand = codexPath => {
     const exe = path.join(dir, 'codex.exe')
     if (fs.existsSync(exe)) return [exe, []]
   }
-  return [codexPath, []]
+  const appExe = path.isAbsolute(codexPath) ? null : codexAppExe()
+  return appExe ? [appExe, []] : [codexPath, []]
 }
 
 // Notifications the plugin never reads: streaming deltas and chatter.
@@ -177,7 +190,7 @@ async function daemon(codexPath, dir) {
   })
   // A codex that cannot start: say why in daemon.log (the relay reports its tail).
   codex.on('error', error => {
-    const hint = error.code === 'ENOENT' ? ' (not found: install it with `npm install -g @openai/codex` for the node on PATH, or set the codexPath plugin option)' : ''
+    const hint = error.code === 'ENOENT' ? ' (not found: install the Codex app, or `npm install -g @openai/codex` for the node on PATH, or set the codexPath plugin option)' : ''
     process.stderr.write(`cannot start ${codexPath}: ${error.message}${hint}\n`)
     process.exit(1)
   })
@@ -481,7 +494,7 @@ const codexVersion = codexPath => {
   const ran = spawnSync(file, [...leading, '--version'], { encoding: 'utf8', timeout: 15_000, windowsHide: true })
   if (ran.error || ran.status !== 0) {
     const why = ran.error?.message ?? `exit code ${ran.status ?? ran.signal}: ${(ran.stderr || ran.stdout || '').trim().split('\n').slice(-3).join(' | ')}`
-    throw new Error(`cannot run the Codex CLI ${codexPath} (${why}). Install or update it (npm i -g @openai/codex@latest, or update the ChatGPT app on macOS), or set the plugin's codexPath.`)
+    throw new Error(`cannot run the Codex CLI ${codexPath} (${why}). Install or update it (npm i -g @openai/codex@latest, or update the ChatGPT app on macOS or the Codex app on Windows), or set the plugin's codexPath.`)
   }
   return ran.stdout.trim() || null
 }

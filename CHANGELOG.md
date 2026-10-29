@@ -3,6 +3,7 @@
 ## Unreleased
 
 - A codex binary that is not found (`spawn codex ENOENT`, e.g. after nvm switches Node versions, whose global npm packages are per version) now says how to fix it: install `@openai/codex` for the node on PATH or set `codexPath`.
+- On Windows, with no codex on PATH, the bridge runs the Codex desktop app's `codex.exe` (Store package `OpenAI.Codex`, found with `Get-AppxPackage`): no npm install needed, and it survives app updates and nvm switches.
 
 ## 0.2.10
 

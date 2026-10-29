@@ -10,7 +10,7 @@
     "codexPath": {
       "type": "string",
       "title": "Codex binary",
-      "description": "Path to the codex CLI binary (needs `codex app-server`). When this path is empty or does not exist, `codex` is looked up on PATH (on Windows: npm's @openai/codex package or a codex.exe).",
+      "description": "Path to the codex CLI binary (needs `codex app-server`). When this path is empty or does not exist, `codex` is looked up on PATH (on Windows: npm's @openai/codex package or a codex.exe, else the Codex desktop app's codex.exe).",
       "default": "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"
     },
     "nodePath": {
