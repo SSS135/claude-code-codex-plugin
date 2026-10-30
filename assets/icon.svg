@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1E293B"/>
+      <stop offset="1" stop-color="#0B1120"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" fill="url(#bg)"/>
+  <!-- two agents -->
+  <rect x="170" y="392" width="240" height="240" rx="60" fill="#2DD4BF"/>
+  <rect x="614" y="392" width="240" height="240" rx="60" fill="#A78BFA"/>
+  <!-- delegation arc: left to right -->
+  <path d="M290,392 C290,170 734,170 734,300" fill="none" stroke="#E2E8F0" stroke-width="56"/>
+  <path d="M668,290 L800,290 L734,372 Z" fill="#E2E8F0"/>
+  <!-- reply arc: right to left -->
+  <path d="M734,632 C734,854 290,854 290,724" fill="none" stroke="#E2E8F0" stroke-width="56"/>
+  <path d="M224,734 L356,734 L290,652 Z" fill="#E2E8F0"/>
+</svg>
