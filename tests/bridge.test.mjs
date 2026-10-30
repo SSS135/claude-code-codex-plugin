@@ -14,10 +14,18 @@ const BRIDGE = fileURLToPath(new URL('../bin/bridge.mjs', import.meta.url))
 const MSG = fileURLToPath(new URL('../bin/codex-msg', import.meta.url))
 const HOLD_MS = 300
 const FAKE_CODEX = `#!/usr/bin/env node
+import { spawn } from 'node:child_process'
+import fs from 'node:fs'
 import readline from 'node:readline'
+// Stands for an MCP server Codex started: it ignores SIGTERM, so only a SIGKILL ends it.
+if (process.env.FAKE_CODEX_CHILD_PID) {
+  const child = spawn(process.execPath, ['-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: 'ignore' })
+  fs.writeFileSync(process.env.FAKE_CODEX_CHILD_PID, String(child.pid))
+}
 const send = message => process.stdout.write(JSON.stringify(message) + '\\n')
 readline.createInterface({ input: process.stdin }).on('line', line => {
   const message = JSON.parse(line)
+  if (message.method === 'test/exit') process.exit(0)
   if (message.method === 'test/emit') message.params.messages.forEach(send)
   if (message.id !== undefined) send({ id: message.id, result: {} })
 }).on('close', () => process.exit(0))
@@ -36,7 +44,7 @@ const call = (address, method, urlPath, body) => new Promise((resolve, reject) =
 
 const note = (method, params) => ({ method, params })
 
-/** Starts the daemon over the fake Codex; resolves its address and a stop that cleans up. */
+/** Starts the daemon over the fake Codex; resolves its address, its process and a stop that cleans up. */
 async function startDaemon(env = {}) {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-bridge-test-'))
   const dir = path.join(base, 'd-1')
@@ -54,7 +62,7 @@ async function startDaemon(env = {}) {
     await new Promise(resolve => setTimeout(resolve, 100))
     try {
       const candidate = process.platform === 'win32' ? fs.readFileSync(file, 'utf8') : file
-      if ((await call(candidate, 'GET', '/health')).ok) return { address: candidate, stop }
+      if ((await call(candidate, 'GET', '/health')).ok) return { address: candidate, daemon, stop }
     } catch {}
   }
   await stop()
@@ -92,6 +100,34 @@ test('a failed turn end is held back and dropped when the thread works on; a rea
     assert.ok(Date.now() - startedAt >= HOLD_MS - 50)
   } finally {
     await stop()
+  }
+})
+
+test('the processes codex started end with the daemon, and with codex when it exits on its own', { skip: process.platform === 'win32' && 'Unix process groups; Windows stops the tree with taskkill /T' }, async () => {
+  const isAlive = pid => {
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch {
+      return false
+    }
+  }
+  for (const end of ['the daemon is stopped', 'codex exits']) {
+    const pidFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'codex-bridge-child-')), 'pid')
+    const { address, daemon, stop } = await startDaemon({ FAKE_CODEX_CHILD_PID: pidFile })
+    try {
+      const child = Number(fs.readFileSync(pidFile, 'utf8'))
+      assert.ok(isAlive(child), end)
+      const exited = new Promise(resolve => daemon.on('exit', resolve))
+      if (end === 'codex exits') await call(address, 'POST', '/rpc', { method: 'test/exit', timeoutMs: 1000 })
+      else daemon.kill('SIGTERM')
+      await exited
+      for (let i = 0; i < 30 && isAlive(child); i += 1) await new Promise(resolve => setTimeout(resolve, 100))
+      assert.equal(isAlive(child), false, end)
+    } finally {
+      await stop()
+      fs.rmSync(path.dirname(pidFile), { recursive: true, force: true })
+    }
   }
 })
 

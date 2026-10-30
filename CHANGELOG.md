@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.0.1
+
+Fixed:
+
+- A Codex turn that failed now releases its thread too, so Codex unloads it and stops its MCP servers (`codex-msg` and others); a later `SendMessage` resumes the thread first.
+- On macOS and Linux, stopping the bridge daemon now also stops the processes Codex started (its MCP servers), not only Codex: Codex runs in its own process group, which gets SIGTERM, then SIGKILL after 1 s. When Codex exits on its own, what is left of that group is stopped too.
+- A message is no longer sent to Codex twice: when steering the running turn times out, `SendMessage` reports it as not delivered (Codex may already have it) instead of starting a new turn with it, and two messages sent at once to a finished job start one turn, the second steering it.
+- A Codex thread started for an Agent call whose spawn then fails is released instead of staying loaded.
+- `SendMessage` to a finished job no longer starts a second, empty Codex thread: the engine resumes the subagent through `agent.spawn`, which now passes such a resume on, so the job keeps its thread, name and settings (#4). A resume of an agent with no saved Codex thread is refused with a reason instead.
+- TaskStop no longer misses a stop: it sends `turn/interrupt` up to 3 times, until the bridge reports the turn ended.
+
+Added:
+
+- A turn that fails because the model is at capacity is retried once: after 30 s the job starts one turn on the same thread with the text `continue` (never the original prompt), and its wrapper keeps waiting. A second capacity failure ends the job as failed; TaskStop or a `SendMessage` during the wait cancels the retry.
+
 ## 1.0.0
 
 Breaking:

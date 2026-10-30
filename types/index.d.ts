@@ -39,6 +39,10 @@ export type CodexAgent = {
   outbox: OutboxItem[]
   /** Compact lines of the current or last turn: commands, file changes, messages. */
   digest: string[]
+  /** When a turn that failed at capacity is retried with "continue"; set while the job waits for that. */
+  capacityRetryAt?: number | null
+  /** The turn that retry started: a capacity failure of it ends the job. */
+  capacityRetryTurnId?: string | null
   startedAt: number
   updatedAt: number
   turnStartedAt: number

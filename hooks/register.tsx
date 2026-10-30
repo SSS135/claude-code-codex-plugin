@@ -19,7 +19,7 @@ import type { CodexAgent, CodexApprovals, CodexSandbox, OutboxItem } from '../ty
 import {
   agentSpecs,
   aliasOfType,
-  afterTurn,
+  afterTurnEnd,
   approvalAnswer,
   approvalDigest,
   approvalOptions,
@@ -101,6 +101,9 @@ const RESULT_MARK = '  ⎿  '
 /** Under the 30 s after which $.http.fetch gives up on an answer. */
 const POLL_SLICE_MS = 20_000
 const RPC_TIMEOUT_MS = 25_000
+/** TaskStop's turn/interrupt calls at most, and how long it waits after each for the turn to end. */
+const INTERRUPT_ATTEMPTS = 3
+const INTERRUPT_WAIT_MS = 2_000
 /** How long one codex_await call blocks before the wrapper's loop calls it again. */
 const AWAIT_MS = 3_600_000
 /** A short wait between reads of the registry; it counts against the hook's 10 s budget. */
@@ -122,6 +125,12 @@ let bridgeSettings: Settings | null = null
 const loadedThreads = new Set<string>()
 /** Per thread, the tail of its loads, turn starts and releases, which run one at a time. */
 const threadQueues = new Map<string, Promise<unknown>>()
+/**
+ * Per thread, the last turn this module started on it while the bridge ran. A hook
+ * may not see the $.state writes of a hook running beside it, so its record may
+ * not show that turn yet.
+ */
+const startedTurns = new Map<string, string>()
 /** The node binary the bridge runs on, which Codex runs bin/codex-msg on too. */
 let nodeBinary = 'node'
 /** Subagents seen at turn.step that are not codex:* agents. */
@@ -278,6 +287,7 @@ async function startBridge($: Engine): Promise<void> {
     } finally {
       isBridgeRunning = false
       loadedThreads.clear()
+      startedTurns.clear()
       // Settles a start still waiting for `ready` with the reason; one that was ready is unaffected.
       current.reject(new CodexError(bridgeStopReason(ended, [...stderrTail, ...stderr.rest()])))
       if (socket === current) socket = null
@@ -467,37 +477,77 @@ async function newAgent($: Engine, id: string, threadId: string, input: JobInput
 
 /** Starts a new turn, passing sandbox, approvals, model and effort again. */
 function startTurn($: Engine, agent: CodexAgent, text: string): Promise<CodexAgent> {
+  return onThread(agent.threadId, () => startTurnOnQueue($, agent, text))
+}
+
+/** startTurn's work, for a caller already running on the thread's queue. */
+async function startTurnOnQueue($: Engine, agent: CodexAgent, text: string): Promise<CodexAgent> {
+  await ensureLoaded($, agent)
+  const now = await $.clock.now()
+  const started = await rpc<{ turn: { id: string } }>($, 'turn/start', turnStartParams(agent, text))
+  startedTurns.set(agent.threadId, started.turn.id)
+  const written = await patchAgent($, agent.id, current => ({
+    status: 'running',
+    // turn/started may already have landed with the same id
+    currentTurnId: started.turn.id,
+    error: null,
+    warning: null,
+    activity: current.currentTurnId === started.turn.id ? current.activity : 'thinking',
+    turnStartedAt: now,
+    // A new turn replaces a pending capacity retry.
+    capacityRetryAt: null,
+  }))
+  return written ?? agent
+}
+
+/** The one retry of a turn that failed at capacity: "continue" on the same thread, never the original prompt. */
+function retryWithContinue($: Engine, agent: CodexAgent): Promise<void> {
   return onThread(agent.threadId, async () => {
-    await ensureLoaded($, agent)
-    const now = await $.clock.now()
-    const started = await rpc<{ turn: { id: string } }>($, 'turn/start', turnStartParams(agent, text))
-    const written = await patchAgent($, agent.id, current => ({
-      status: 'running',
-      // turn/started may already have landed with the same id
-      currentTurnId: started.turn.id,
-      error: null,
-      warning: null,
-      activity: current.currentTurnId === started.turn.id ? current.activity : 'thinking',
-      turnStartedAt: now,
-    }))
-    return written ?? agent
+    // A message that started a turn since replaces the retry.
+    const started = startedTurns.get(agent.threadId)
+    if (started !== undefined && started !== agent.lastTurnId) return
+    try {
+      const retry = await startTurnOnQueue($, agent, 'continue')
+      await patchAgent($, agent.id, () => ({ capacityRetryTurnId: retry.currentTurnId, warning: 'capacity: retried with continue' }))
+    } catch (error) {
+      const now = await $.clock.now()
+      await patchAgent($, agent.id, () => ({
+        status: 'failed',
+        capacityRetryAt: null,
+        lastTurnStatus: 'failed',
+        error: `the model was at capacity and the retry did not start: ${errorText(error)}`,
+        activity: 'failed',
+        turnEndedAt: now,
+      }))
+      // Queued behind this work, not awaited in it.
+      void releaseThread($, agent.threadId)
+    }
   })
 }
 
-/** Steers the running turn, or starts a new one when none runs. */
-async function sendMessage($: Engine, agent: CodexAgent, text: string): Promise<'steered' | 'started'> {
-  if (agent.status === 'running' && agent.currentTurnId) {
-    try {
-      await ensureLoaded($, agent)
-      await rpc($, 'turn/steer', { threadId: agent.threadId, expectedTurnId: agent.currentTurnId, input: textInput(text) })
-      return 'steered'
-    } catch (error) {
-      // The turn ended between our read and the steer: start a new one below.
-      if (!(error instanceof CodexError)) throw error
+/**
+ * Steers the running turn, or starts a new one when none runs. Decided on the
+ * thread's queue, so two messages to an idle job start one turn, not two.
+ */
+function sendMessage($: Engine, agent: CodexAgent, text: string): Promise<'steered' | 'started'> {
+  return onThread(agent.threadId, async () => {
+    // A turn an earlier message on the queue started, unless the record saw it end.
+    const started = startedTurns.get(agent.threadId)
+    const turnId = started !== undefined && started !== agent.lastTurnId ? started : agent.status === 'running' ? agent.currentTurnId : null
+    if (turnId) {
+      try {
+        await ensureLoaded($, agent)
+        await rpc($, 'turn/steer', { threadId: agent.threadId, expectedTurnId: turnId, input: textInput(text) })
+        return 'steered'
+      } catch (error) {
+        // Only Codex's refusal ("no active turn to steer", "expected active turn id ... but found ...") means the turn
+        // ended: start a new one below. After any other error, a timeout above all, Codex may hold the steer already.
+        if (!(error instanceof CodexError) || !/no active turn|expected active turn id/.test(error.message)) throw error
+      }
     }
-  }
-  await startTurn($, agent, text)
-  return 'started'
+    await startTurnOnQueue($, agent, text)
+    return 'started'
+  })
 }
 
 // ------------------------------------------------------------ native agents
@@ -574,7 +624,7 @@ async function settleTurn($: Engine, agent: CodexAgent, answer: WaitAnswer): Pro
   const turn = answer.turn
   await patchAgent($, agent.id, current => {
     if (!isLive(current)) return {}
-    if (turn && (current.currentTurnId === null || turn.id === current.currentTurnId)) return afterTurn(current, turn, now)
+    if (turn && (current.currentTurnId === null || turn.id === current.currentTurnId)) return afterTurnEnd(current, turn, now)
     // The bridge runs no turn on the thread and its last one is not ours.
     return { status: 'failed', currentTurnId: null, lastTurnStatus: 'failed', error: 'the Codex turn was lost', turnEndedAt: now }
   })
@@ -664,7 +714,12 @@ async function awaitJob($: Engine, agentId: string | undefined, signal: AbortSig
   const deadline = startedAt + AWAIT_MS
   let settling = 0
   for (;;) {
-    const agent = (await read($, agentsAtom))[agentId]
+    let agent = (await read($, agentsAtom))[agentId]
+    // The wrapper's polls drive a due capacity retry, so a stopped job gets none and a reloaded plugin loses none.
+    if (agent?.status === 'starting' && agent.capacityRetryAt && (await $.clock.now()) >= agent.capacityRetryAt) {
+      await retryWithContinue($, agent)
+      agent = (await read($, agentsAtom))[agentId]
+    }
     if (agent && !isLive(agent)) {
       // A message sent just before the turn ended still goes out, ahead of the result;
       // with the bridge gone there is none to read, and the result goes alone.
@@ -724,11 +779,11 @@ async function onNotification($: Engine, method: string, params: Record<string, 
   const agent = byThread(await read($, agentsAtom), params.threadId)
   if (!agent) return
   const turn = params.turn as Record<string, unknown> | undefined
-  if (method.startsWith('item/') && typeof params.turnId === 'string' && !isLive(agent)) {
-    // The thread still works after its job was settled: the job runs again.
+  if (method.startsWith('item/') && typeof params.turnId === 'string' && (!isLive(agent) || agent.capacityRetryAt)) {
+    // The thread still works after its job was settled, or while it waits for a capacity retry: the job runs again.
     const turnId = params.turnId
-    await patchAgent($, agent.id, current => isLive(current) ? {} : {
-      status: 'running', currentTurnId: turnId,
+    await patchAgent($, agent.id, current => isLive(current) && !current.capacityRetryAt ? {} : {
+      status: 'running', currentTurnId: turnId, capacityRetryAt: null,
       warning: `Codex kept working after its turn was reported ${current.lastTurnStatus ?? current.status}${current.error ? `: ${current.error}` : ''}`,
       error: null,
     })
@@ -774,10 +829,10 @@ async function onNotification($: Engine, method: string, params: Record<string, 
       const now = await $.clock.now()
       // A late end of an earlier turn leaves a newer running one alone.
       await patchAgent($, agent.id, current =>
-        current.currentTurnId === null || current.currentTurnId === turn.id ? afterTurn(current, turn, now) : {},
+        current.currentTurnId === null || current.currentTurnId === turn.id ? afterTurnEnd(current, turn, now) : {},
       )
-      // Never hold the event loop on the release. A failed turn's thread stays subscribed: Codex may work on.
-      if (turn.status !== 'failed') void releaseThread($, params.threadId)
+      // Never hold the event loop on the release. A failed end is final too: the bridge drops one the thread works on after.
+      void releaseThread($, params.threadId)
       return
     }
   }
@@ -944,6 +999,16 @@ export const register: Register = (on, options) => {
       await pushRoster($)
       return spawned
     }
+    // A resume (SendMessage to a finished job) keeps the job and its thread: session.send
+    // started the turn on it, and the resumed subagent's loop awaits that turn.
+    const resume = (e as { resume?: { agentId?: string } }).resume
+    if (resume) {
+      const id = String(resume.agentId)
+      // The saved record, also when this hook does not hold it yet.
+      await reconcileAgents($, undefined, id)
+      if (!(await read($, agentsAtom))[id]?.threadId) return { deny: `codex: no saved Codex thread for agent ${id}; start a new codex:* agent` }
+      return next(e)
+    }
     // Agents address each other by name: a job needs one, and one name means one recent agent.
     const name = e.name?.trim()
     if (!name) return { deny: 'codex: give the agent a `name` (the Agent call\'s name parameter); other agents message it by that name' }
@@ -988,7 +1053,14 @@ export const register: Register = (on, options) => {
     }
     spawnsInFlight += 1
     try {
-      const spawned = await next({ ...e, background: true })
+      let spawned: Awaited<ReturnType<typeof next>>
+      try {
+        spawned = await next({ ...e, background: true })
+      } catch (error) {
+        // No subagent will run on the thread.
+        void releaseThread($, threadId)
+        throw error
+      }
       if (spawned.agentId === undefined) {
         void releaseThread($, threadId)
         return spawned
@@ -1084,10 +1156,22 @@ export const register: Register = (on, options) => {
     if (e.agentId !== undefined) agentEndedAt.set(e.agentId, await $.clock.now())
     if (e.agentId === undefined || e.reason !== 'aborted') return done
     const agent = (await read($, agentsAtom))[e.agentId]
+    // A stopped job gets no capacity retry.
+    if (agent?.status === 'starting' && agent.capacityRetryAt) {
+      const now = await $.clock.now()
+      await patchAgent($, agent.id, () => ({ status: 'interrupted', capacityRetryAt: null, lastTurnStatus: 'interrupted', activity: 'interrupted', error: null, turnEndedAt: now }))
+      void releaseThread($, agent.threadId)
+    }
     if (agent?.status === 'running' && agent.currentTurnId) {
-      await rpc($, 'turn/interrupt', { threadId: agent.threadId, turnId: agent.currentTurnId }).catch(error =>
-        $.ui.log(`codex: interrupting ${agent.name} failed: ${errorText(error)}`),
-      )
+      // An interrupt can be missed: send it again while the bridge still reports the turn running.
+      for (let attempt = 1; attempt <= INTERRUPT_ATTEMPTS; attempt += 1) {
+        await rpc($, 'turn/interrupt', { threadId: agent.threadId, turnId: agent.currentTurnId }).catch(error =>
+          $.ui.log(`codex: interrupting ${agent.name} failed: ${errorText(error)}`),
+        )
+        if (attempt === INTERRUPT_ATTEMPTS) break
+        const answer = (await post($, '/wait', { threadId: agent.threadId, timeoutMs: INTERRUPT_WAIT_MS }).catch(() => null)) as WaitAnswer | null
+        if (answer?.status !== 'timeout') break
+      }
     }
     return done
   })

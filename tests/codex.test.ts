@@ -32,6 +32,8 @@ type Fake = {
   /** What the engine's spawn received, and the agentIds it hands out in turn. */
   spawned: Record<string, unknown>[]
   agentIds: string[]
+  /** Makes the engine's spawn throw this. */
+  spawnError: string | null
   /** What the engine's agent list answers. */
   agentList: { id: string; type: string; name?: string }[]
   /** The agent lists the plugin sent the bridge (/roster), in order. */
@@ -87,6 +89,7 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
     waits: [],
     spawned: [],
     agentIds: ['a1', 'a2', 'a3'],
+    spawnError: null,
     agentList: [],
     rosters: [],
     delivered: [],
@@ -121,6 +124,10 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
   })
   on('agent.spawn', (_$, e) => {
     fake.spawned.push(JSON.parse(JSON.stringify(e)))
+    if (fake.spawnError !== null) throw new Error(fake.spawnError)
+    // A resumed subagent keeps its id.
+    const resume = (e as { resume?: { agentId: string } }).resume
+    if (resume) return { model: 'claude-haiku-4-5', agentId: resume.agentId }
     const agentId = fake.agentIds.shift() as string
     fake.agentList.push({ id: agentId, type: e.subagentType, ...(e.name ? { name: e.name } : {}) })
     return { model: 'claude-haiku-4-5', agentId }
@@ -591,7 +598,7 @@ test('a codex:* spawn needs a name no recent agent has; list_agents reads the ag
 test('SendMessage steers a running Codex turn and starts a new one once it ended, then delivers', { timeoutMs: 20_000 }, async ($, on) => {
   const fake = fakeBridge(on)
   await start($, fake)
-  await spawn($, fake, 'task', { name: 'helper' })
+  const spawned = await spawn($, fake, 'effort: low\ntask', { name: 'helper' })
 
   expect(await send($, 'a1', 'also say BANANA')).toEqual({ isDelivered: true })
   expect(fake.rpcs.find(rpc => rpc.method === 'turn/steer')?.params).toMatchObject({ threadId: 'th-1', expectedTurnId: 'turn-1', input: [{ text: 'also say BANANA' }] })
@@ -606,6 +613,22 @@ test('SendMessage steers a running Codex turn and starts a new one once it ended
   expect(starts).toHaveLength(2)
   expect(starts[1]?.params).toMatchObject({ threadId: 'th-1', input: [{ text: 'next task' }], sandboxPolicy: { type: 'workspaceWrite' } })
   expect((await agentsOf(fake)).a1).toMatchObject({ status: 'running', currentTurnId: 'turn-2' })
+  // The delivery resumes the subagent through agent.spawn (#4): it keeps the job, its thread and its settings.
+  const resumed = await $.agent.spawn(spawnInput('next task', { name: 'helper', resume: { agentId: 'a1' } }))
+  expect(resumed).toMatchObject({ agentId: 'a1' })
+  expect(fake.rpcs.filter(rpc => rpc.method === 'thread/start')).toHaveLength(1)
+  expect(fake.rpcs.filter(rpc => rpc.method === 'turn/start')).toHaveLength(2)
+  expect(Object.keys(await agentsOf(fake))).toEqual(['a1'])
+  expect((await agentsOf(fake)).a1).toMatchObject({ name: 'helper', effort: 'low', threadId: 'th-1' })
+  expect(spawned).toMatchObject({ effort: 'low' })
+  // A resume with no saved thread (a wiped or never-written record) is refused, not run as a new job.
+  fake.agentList.push({ id: 'a9', type: 'codex:luna' })
+  for (const agentId of ['a9', 'zz']) {
+    const refused = await $.agent.spawn(spawnInput('next task', { name: 'helper', resume: { agentId } }))
+    expect(refused.deny).toBe(`codex: no saved Codex thread for agent ${agentId}; start a new codex:* agent`)
+  }
+  expect(fake.rpcs.filter(rpc => rpc.method === 'thread/start')).toHaveLength(1)
+  fake.agentList.pop()
   expect((await step($, 'a1', 0)).result.stopReason).toBe('tool_use')
 
   // Refused when Codex refuses it; anyone else's messages pass untouched.
@@ -669,19 +692,91 @@ test('a late end of an earlier turn neither ends nor releases the turn started a
   done(fake)
 })
 
+test('a failed turn end releases its thread too, so its MCP servers stop; the next SendMessage resumes it first', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake)
+  await spawn($, fake)
+  push(fake, note('turn/completed', { threadId: 'th-1', turn: { id: 'turn-1', status: 'failed', error: { message: 'boom' }, items: [] } }))
+  await until(fake, async () => releases(fake).length === 1, 'the release')
+  expect((await agentsOf(fake)).a1).toMatchObject({ status: 'failed' })
+
+  const before = fake.rpcs.length
+  expect(await send($, 'a1', 'try again')).toEqual({ isDelivered: true })
+  expect(fake.rpcs.slice(before).map(rpc => rpc.method)).toEqual(['thread/resume', 'turn/start'])
+  expect((await agentsOf(fake)).a1).toMatchObject({ status: 'running', currentTurnId: 'turn-2' })
+  done(fake)
+})
+
+test('a steer that timed out is not sent again as a new turn; a refused steer starts one', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake)
+  await spawn($, fake)
+  const starts = () => fake.rpcs.filter(rpc => rpc.method === 'turn/start').length
+
+  // Codex may have taken a steer whose answer timed out: the message is reported not delivered, never sent twice.
+  fake.rpcErrors['turn/steer'] = 'turn/steer timed out after 25000 ms'
+  expect(await send($, 'a1', 'also this')).toEqual({ isDelivered: false, reason: 'Codex did not take the message: turn/steer timed out after 25000 ms' })
+  expect(starts()).toBe(1)
+  expect((await agentsOf(fake)).a1).toMatchObject({ status: 'running', currentTurnId: 'turn-1' })
+
+  // Codex refuses a steer when the turn has ended: a new turn takes the message.
+  fake.rpcErrors['turn/steer'] = 'no active turn to steer'
+  expect(await send($, 'a1', 'and this')).toEqual({ isDelivered: true })
+  expect(starts()).toBe(2)
+  fake.rpcErrors['turn/steer'] = 'expected active turn id `turn-2` but found `turn-9`'
+  expect(await send($, 'a1', 'and that')).toEqual({ isDelivered: true })
+  expect(starts()).toBe(3)
+  done(fake)
+})
+
+test('two messages to an idle job start one turn: the second steers it', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake)
+  await spawn($, fake)
+  push(fake, note('turn/completed', { threadId: 'th-1', turn: { id: 'turn-1', status: 'completed', items: [] } }))
+  await until(fake, async () => (await agentsOf(fake)).a1?.status === 'idle', 'idle')
+
+  expect(await Promise.all([send($, 'a1', 'first'), send($, 'a1', 'second')])).toEqual([{ isDelivered: true }, { isDelivered: true }])
+  const starts = fake.rpcs.filter(rpc => rpc.method === 'turn/start')
+  expect(starts.map(rpc => (rpc.params.input as { text: string }[])[0]?.text)).toEqual(['sleep 20', 'first'])
+  expect(fake.rpcs.filter(rpc => rpc.method === 'turn/steer').map(rpc => rpc.params)).toMatchObject([{ expectedTurnId: 'turn-2', input: [{ text: 'second' }] }])
+  done(fake)
+})
+
+test('a spawn that fails after its Codex thread started releases the thread', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake)
+  fake.spawnError = 'spawn exploded'
+  await $.agent.spawn(spawnInput('task')).catch(() => undefined)
+  await until(fake, async () => releases(fake).length === 1, 'the release')
+  expect(releases(fake)).toEqual([{ threadId: 'th-1' }])
+  expect(fake.rpcs.filter(rpc => rpc.method === 'turn/start')).toHaveLength(0)
+  done(fake)
+})
+
 test('TaskStop: an aborted wrapper turn interrupts the Codex turn', { timeoutMs: 20_000 }, async ($, on) => {
   const fake = fakeBridge(on)
   await start($, fake)
   await spawn($, fake)
+  // A missed interrupt is sent again while the bridge still reports the turn running; it stops once the turn ended.
+  fake.rpcErrors['turn/interrupt'] = 'connection reset'
+  fake.waitQueue = [{ status: 'timeout' }, { status: 'idle', turn: null }]
   await $.turn.complete({ answer: '', durationMs: 5, isAborted: true, turnId: 't-a1', agentId: 'a1', reason: 'aborted' })
-  expect(fake.rpcs.filter(rpc => rpc.method === 'turn/interrupt').map(rpc => rpc.params)).toEqual([{ threadId: 'th-1', turnId: 'turn-1' }])
+  const interrupts = () => fake.rpcs.filter(rpc => rpc.method === 'turn/interrupt').map(rpc => rpc.params)
+  expect(interrupts()).toEqual([{ threadId: 'th-1', turnId: 'turn-1' }, { threadId: 'th-1', turnId: 'turn-1' }])
+  expect(fake.waits.map(wait => wait.threadId)).toEqual(['th-1', 'th-1'])
   // The interrupted turn's end releases the thread.
   push(fake, note('turn/completed', { threadId: 'th-1', turn: { id: 'turn-1', status: 'interrupted', items: [] } }))
   await until(fake, async () => releases(fake).length === 1, 'the release')
   // A turn that ended normally, or the main loop's, interrupts nothing.
   await $.turn.complete({ answer: 'x', durationMs: 5, isAborted: false, turnId: 't-a1', agentId: 'a1', reason: 'answer' })
   await $.turn.complete({ answer: '', durationMs: 5, isAborted: true, turnId: 'main', reason: 'aborted' })
-  expect(fake.rpcs.filter(rpc => rpc.method === 'turn/interrupt')).toHaveLength(1)
+  expect(interrupts()).toHaveLength(2)
+
+  // A turn the bridge keeps reporting running gets three interrupts at most.
+  await spawn($, fake, 'y')
+  await $.turn.complete({ answer: '', durationMs: 5, isAborted: true, turnId: 't-a2', agentId: 'a2', reason: 'aborted' })
+  expect(interrupts().slice(2)).toEqual([0, 1, 2].map(() => ({ threadId: 'th-2', turnId: 'turn-2' })))
   done(fake)
 })
 
@@ -1175,16 +1270,55 @@ test('a failed compaction, even a reported failed turn, does not end a job whose
   push(fake, note('item/completed', { threadId: 'th-1', turnId: 'turn-1', item: { type: 'agentMessage', text: 'compaction failed, going on', phase: 'commentary' } }))
   await until(fake, async () => (await agentsOf(fake)).a1?.warning === compact, 'the warning')
   expect((await agentsOf(fake)).a1).toMatchObject({ status: 'running', error: null })
-  // Liveness: work after a reported failure revives the job; its thread stays subscribed.
+  // Liveness: work after a reported failure (at capacity: the job waits to retry) revives the job.
   push(fake, note('turn/completed', { threadId: 'th-1', turn: { id: 'turn-1', status: 'failed', error: { message: compact }, items: [] } }))
-  await until(fake, async () => (await agentsOf(fake)).a1?.status === 'failed', 'failed')
+  await until(fake, async () => (await agentsOf(fake)).a1?.status === 'starting', 'waiting to retry')
   push(fake, note('item/started', { threadId: 'th-1', turnId: 'turn-1', item: { type: 'commandExecution', command: 'blender -b' } }))
   await until(fake, async () => (await agentsOf(fake)).a1?.status === 'running', 'running again')
   expect((await agentsOf(fake)).a1).toMatchObject({ currentTurnId: 'turn-1', error: null, warning: `Codex kept working after its turn was reported failed: ${compact}` })
-  expect(releases(fake)).toEqual([])
   push(fake, finished('DONE'))
   await until(fake, async () => (await agentsOf(fake)).a1?.status === 'idle', 'idle')
   expect(await finalOf($, 'a1')).toBe('DONE')
+  expect(fake.rpcs.filter(rpc => rpc.method === 'turn/start')).toHaveLength(1)
+  done(fake)
+})
+
+test('a turn that failed at capacity is retried once with "continue" on its thread after 30 s; a second failure ends the job', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake)
+  await spawn($, fake)
+  const starts = () => fake.rpcs.filter(rpc => rpc.method === 'turn/start')
+  push(fake, note('turn/completed', { threadId: 'th-1', turn: { id: 'turn-1', status: 'failed', error: { message: CAPACITY, codexErrorInfo: 'serverOverloaded' }, items: [] } }))
+  await until(fake, async () => (await agentsOf(fake)).a1?.status === 'starting', 'waiting to retry')
+  expect((await agentsOf(fake)).a1).toMatchObject({ currentTurnId: null, lastTurnId: 'turn-1', digest: ['capacity: retrying with continue'] })
+
+  // The wrapper keeps awaiting; nothing is retried before the 30 s are up.
+  const early = awaitCall($, 'a1')
+  await fake.clock.advance(5_000)
+  expect(String((await early).result)).toContain('still')
+  expect(starts()).toHaveLength(1)
+
+  // Then one turn on the same thread, with "continue", never the original prompt; the retry's own capacity failure ends the job.
+  fake.waitQueue = [{ status: 'completed', turn: { id: 'turn-2', status: 'failed', error: { message: CAPACITY }, items: [] } }]
+  for (let i = 0; i < 6 && starts().length < 2; i += 1) {
+    const poll = awaitCall($, 'a1')
+    await fake.clock.advance(5_000)
+    await poll
+  }
+  expect(starts().map(rpc => [rpc.params.threadId, (rpc.params.input as { text: string }[])[0]?.text])).toEqual([['th-1', 'sleep 20'], ['th-1', 'continue']])
+  expect((await agentsOf(fake)).a1).toMatchObject({ status: 'failed', error: CAPACITY, capacityRetryTurnId: 'turn-2' })
+  expect(await finalOf($, 'a1')).toBe(`Codex failed: ${CAPACITY}`)
+  expect(starts()).toHaveLength(2)
+
+  // TaskStop while a job waits for its retry: no retry follows.
+  await spawn($, fake, 'y')
+  push(fake, note('turn/completed', { threadId: 'th-2', turn: { id: 'turn-3', status: 'failed', error: { message: CAPACITY }, items: [] } }))
+  await until(fake, async () => (await agentsOf(fake)).a2?.status === 'starting', 'a2 waiting to retry')
+  await $.turn.complete({ answer: '', durationMs: 5, isAborted: true, turnId: 't-a2', agentId: 'a2', reason: 'aborted' })
+  await until(fake, async () => releases(fake).some(release => release.threadId === 'th-2'), 'the release')
+  for (let i = 0; i < 7; i += 1) await fake.clock.advance(5_000)
+  expect(await awaitCall($, 'a2').then(ran => ran.result)).toBe('Codex turn interrupted.')
+  expect(starts()).toHaveLength(3)
   done(fake)
 })
 

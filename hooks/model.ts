@@ -417,6 +417,33 @@ export function afterTurn(agent: CodexAgent, turn: Record<string, unknown>, now:
   }
 }
 
+/** How long a turn that failed at capacity waits before its retry with "continue". */
+export const CAPACITY_RETRY_MS = 30_000
+
+/**
+ * The agent after its turn ended. A turn that failed because the model was at
+ * capacity, unless it was itself that retry, leaves the job live, waiting
+ * CAPACITY_RETRY_MS for one retry with "continue" on the same thread.
+ */
+export function afterTurnEnd(agent: CodexAgent, turn: Record<string, unknown>, now: number): Partial<CodexAgent> {
+  const error = turn.error as { message?: string; codexErrorInfo?: unknown } | null | undefined
+  const isCapacity = turn.status === 'failed' && (error?.codexErrorInfo === 'serverOverloaded' || /at capacity|overloaded/i.test(error?.message ?? ''))
+  if (!isCapacity || String(turn.id) === agent.capacityRetryTurnId) return afterTurn(agent, turn, now)
+  // Both the turn/completed notification and a codex_await poll report the end.
+  if (agent.capacityRetryAt && agent.lastTurnId === String(turn.id)) return {}
+  return {
+    status: 'starting',
+    currentTurnId: null,
+    lastTurnId: String(turn.id),
+    lastTurnStatus: 'failed',
+    activity: 'waiting to retry',
+    error: error?.message ?? 'the model is at capacity',
+    warning: `capacity: retrying with "continue" in ${CAPACITY_RETRY_MS / 1000} s`,
+    capacityRetryAt: now + CAPACITY_RETRY_MS,
+    digest: [...agent.digest, 'capacity: retrying with continue'],
+  }
+}
+
 // ------------------------------------------------------------ approvals
 
 export const ALLOW_ONCE = 'Allow once'

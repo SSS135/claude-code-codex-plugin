@@ -41,7 +41,8 @@
 //           relay attached it exits after IDLE_MS with no turn running and no
 //           request in flight; the plugin starts a new one when it next needs
 //           Codex. Codex stops a thread's MCP servers (bin/codex-msg among them)
-//           when it unloads the thread, and all of them when it exits. It also
+//           when it unloads the thread, and all of them when it exits; off
+//           Windows the daemon then ends what is left of codex's process group. It also
 //           stops daemons of bridge builds that predate this lifecycle (their
 //           directory is the bare session key) once it has seen them run no
 //           turn for LEGACY_IDLE_MS.
@@ -62,6 +63,8 @@ const IDLE_CHECK_MS = 60_000
 /** Half the idle window, so a daemon about to idle out itself still stops an idle legacy one. */
 const LEGACY_IDLE_MS = IDLE_MS / 2
 const DRAIN_CHECK_MS = 5_000
+/** How long codex's process group has to exit on SIGTERM before SIGKILL (not on Windows). */
+const GROUP_KILL_MS = 1_000
 const BUFFER_CAP = 5_000
 const MAILBOX_CAP = 50
 const MESSAGE_CAP = 20_000
@@ -97,6 +100,34 @@ const stopTree = pid => {
     if (IS_WINDOWS) spawnSync('taskkill', ['/pid', String(pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true })
     else process.kill(pid, 'SIGTERM')
   } catch {}
+}
+
+/**
+ * Ends codex with the processes it started (its MCP servers). Off Windows codex
+ * leads its own process group: the group gets SIGTERM, then SIGKILL after
+ * GROUP_KILL_MS if any of it is left, which also ends the MCP servers of a codex
+ * that already exited. On Windows only a running codex is stopped: the pid of an
+ * exited one may be reused.
+ */
+const stopCodex = async codex => {
+  if (IS_WINDOWS) {
+    if (codex.exitCode === null && codex.signalCode === null) stopTree(codex.pid)
+    return
+  }
+  const signalGroup = signal => {
+    try {
+      process.kill(-codex.pid, signal)
+      return true
+    } catch {
+      return false
+    }
+  }
+  if (!signalGroup('SIGTERM')) return
+  for (const deadline = Date.now() + GROUP_KILL_MS; Date.now() < deadline; ) {
+    await new Promise(resolve => setTimeout(resolve, 50))
+    if (!signalGroup(0)) return
+  }
+  signalGroup('SIGKILL')
 }
 
 const isAlive = pid => {
@@ -188,6 +219,9 @@ async function daemon(codexPath, dir) {
   const [file, leading] = codexCommand(codexPath)
   const codex = spawn(file, [...leading, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
+    // Off Windows codex leads its own process group, so stopCodex reaches its MCP servers too
+    // (on Windows detached would give it a console of its own; taskkill /T reaches the tree there).
+    detached: !IS_WINDOWS,
     windowsHide: true,
   })
   // A codex that cannot start: say why in daemon.log (the relay reports its tail).
@@ -312,12 +346,13 @@ async function daemon(codexPath, dir) {
     } catch {}
   }
 
-  const shutdown = code => {
-    if (codex.exitCode === null && codex.signalCode === null) stopTree(codex.pid)
+  const shutdown = async code => {
+    const stopping = stopCodex(codex)
     cleanup()
     // End the relay's stream before exiting, so the relay reads an ordinary end, not a reset.
     if (subscriber) subscriber.end()
     subscriber = null
+    await stopping
     setTimeout(() => process.exit(code), 100)
   }
 
@@ -326,7 +361,7 @@ async function daemon(codexPath, dir) {
     graceTimer = setTimeout(() => shutdown(0), GRACE_MS)
   }
 
-  codex.on('exit', (code, signal) => {
+  codex.on('exit', async (code, signal) => {
     emit({ type: 'exit', code, signal, stderrTail })
     for (const { resolve, timer } of pending.values()) {
       clearTimeout(timer)
@@ -334,6 +369,8 @@ async function daemon(codexPath, dir) {
     }
     if (subscriber) subscriber.end()
     cleanup()
+    // Its MCP servers may outlive it: end what is left of its process group.
+    await stopCodex(codex)
     setTimeout(() => process.exit(code ?? 1), 100)
   })
   for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => shutdown(0))
