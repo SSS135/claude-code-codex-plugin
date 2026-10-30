@@ -7,9 +7,11 @@ import fs from 'node:fs'
 import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
+import readline from 'node:readline'
 import { fileURLToPath } from 'node:url'
 
 const BRIDGE = fileURLToPath(new URL('../bin/bridge.mjs', import.meta.url))
+const MSG = fileURLToPath(new URL('../bin/codex-msg', import.meta.url))
 const HOLD_MS = 300
 const FAKE_CODEX = `#!/usr/bin/env node
 import readline from 'node:readline'
@@ -33,28 +35,36 @@ const call = (address, method, urlPath, body) => new Promise((resolve, reject) =
 })
 
 const note = (method, params) => ({ method, params })
-const turn = (threadId, id, status, extra = {}) => note('turn/completed', { threadId, turn: { id, status, items: [], ...extra } })
 
-test('a failed turn end is held back and dropped when the thread works on; a real failure ends after the hold', async () => {
+/** Starts the daemon over the fake Codex; resolves its address and a stop that cleans up. */
+async function startDaemon(env = {}) {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-bridge-test-'))
   const dir = path.join(base, 'd-1')
   fs.mkdirSync(dir)
   const fake = path.join(base, 'fake-codex.mjs')
   fs.writeFileSync(fake, FAKE_CODEX, { mode: 0o755 })
-  const daemon = spawn(process.execPath, [BRIDGE, '--daemon', fake, dir], {
-    stdio: 'ignore', windowsHide: true, env: { ...process.env, CODEX_BRIDGE_FAILED_HOLD_MS: String(HOLD_MS) },
-  })
+  const daemon = spawn(process.execPath, [BRIDGE, '--daemon', fake, dir], { stdio: 'ignore', windowsHide: true, env: { ...process.env, ...env } })
+  const stop = async () => {
+    daemon.kill()
+    await new Promise(resolve => setTimeout(resolve, 300))
+    fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 })
+  }
+  const file = path.join(dir, 's')
+  for (let i = 0; i < 100; i += 1) {
+    await new Promise(resolve => setTimeout(resolve, 100))
+    try {
+      const candidate = process.platform === 'win32' ? fs.readFileSync(file, 'utf8') : file
+      if ((await call(candidate, 'GET', '/health')).ok) return { address: candidate, stop }
+    } catch {}
+  }
+  await stop()
+  assert.fail('the daemon did not start')
+}
+const turn = (threadId, id, status, extra = {}) => note('turn/completed', { threadId, turn: { id, status, items: [], ...extra } })
+
+test('a failed turn end is held back and dropped when the thread works on; a real failure ends after the hold', async () => {
+  const { address, stop } = await startDaemon({ CODEX_BRIDGE_FAILED_HOLD_MS: String(HOLD_MS) })
   try {
-    const file = path.join(dir, 's')
-    let address = ''
-    for (let i = 0; i < 100 && !address; i += 1) {
-      await new Promise(resolve => setTimeout(resolve, 100))
-      try {
-        const candidate = process.platform === 'win32' ? fs.readFileSync(file, 'utf8') : file
-        if ((await call(candidate, 'GET', '/health')).ok) address = candidate
-      } catch {}
-    }
-    assert.ok(address, 'the daemon did not start')
     const emit = messages => call(address, 'POST', '/rpc', { method: 'test/emit', params: { messages } })
     const wait = (threadId, timeoutMs) => call(address, 'POST', '/wait', { threadId, timeoutMs })
     const capacity = { message: 'Selected model is at capacity. Please try a different model.' }
@@ -81,9 +91,40 @@ test('a failed turn end is held back and dropped when the thread works on; a rea
     assert.deepEqual([failed.status, failed.turn.status, failed.turn.error], ['completed', 'failed', capacity])
     assert.ok(Date.now() - startedAt >= HOLD_MS - 50)
   } finally {
-    daemon.kill()
-    await new Promise(resolve => setTimeout(resolve, 300))
-    fs.rmSync(base, { recursive: true, force: true, maxRetries: 5 })
+    await stop()
+  }
+})
+
+test('codex-msg: message_agent queues {text, to} for the job, list_agents reads the roster the plugin posted', async () => {
+  const { address, stop } = await startDaemon()
+  const server = spawn(process.execPath, [MSG, address, 'key-1'], { stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true })
+  const lines = readline.createInterface({ input: server.stdout })
+  const answers = new Map()
+  lines.on('line', line => {
+    const message = JSON.parse(line)
+    answers.get(message.id)?.(message)
+  })
+  let id = 0
+  const request = (method, params) => new Promise(resolve => {
+    id += 1
+    answers.set(id, resolve)
+    server.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n')
+  })
+  const tool = async (name, args) => (await request('tools/call', { name, arguments: args })).result
+  try {
+    assert.deepEqual((await request('tools/list', {})).result.tools.map(one => one.name), ['message_agent', 'list_agents'])
+    assert.equal((await tool('message_agent', { text: 'ping', to: 'peer_b' })).content[0].text, 'Sent to peer_b. A reply, if any, arrives as a new user message.')
+    await tool('message_agent', { text: 'question', to: 'main' })
+    const waited = await call(address, 'POST', '/wait', { threadId: 'th-x', msgKey: 'key-1', timeoutMs: 1000 })
+    assert.deepEqual(waited, { status: 'message', messages: [{ text: 'ping', to: 'peer_b' }, { text: 'question' }] })
+    assert.equal((await tool('message_agent', { text: '' })).isError, true)
+
+    assert.match((await tool('list_agents', {})).content[0].text, /^No agent list yet/)
+    await call(address, 'POST', '/roster', { text: '- main\n- peer_b (codex:luna, running)' })
+    assert.equal((await tool('list_agents', {})).content[0].text, '- main\n- peer_b (codex:luna, running)')
+  } finally {
+    server.kill()
+    await stop()
   }
 })
 

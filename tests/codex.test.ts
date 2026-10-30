@@ -34,6 +34,8 @@ type Fake = {
   agentIds: string[]
   /** What the engine's agent list answers. */
   agentList: { id: string; type: string; name?: string }[]
+  /** The agent lists the plugin sent the bridge (/roster), in order. */
+  rosters: string[]
   /** SendMessage deliveries that reached the engine beneath the plugin. */
   delivered: { to: string; text: string }[]
   /** What the engine's session.messages answers per agent. */
@@ -86,6 +88,7 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
     spawned: [],
     agentIds: ['a1', 'a2', 'a3'],
     agentList: [],
+    rosters: [],
     delivered: [],
     messages: {},
     modelSteps: 0,
@@ -217,6 +220,7 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
       } else reply = { result: answer(rpc) }
     }
     if (path === '/reply') fake.replies.push(body)
+    if (path === '/roster') fake.rosters.push(String(body.text))
     if (path === '/wait') {
       fake.waits.push(body)
       if (fake.waitError !== null) reply = { error: { message: fake.waitError } }
@@ -268,11 +272,14 @@ async function start($: Engine, fake: Fake, ready: Record<string, unknown> = {})
   fake.wake()
 }
 
-/** What the Agent tool hands `agent.spawn` for a call. */
+let spawnCount = 0
+
+/** What the Agent tool hands `agent.spawn` for a call; each call names a new agent. */
 const spawnInput = (prompt: string, extra: Record<string, unknown> = {}) => ({
   tool_use_id: 'toolu_test',
   prompt,
   description: 'Sleep a while',
+  name: `job_${(spawnCount += 1)}`,
   subagentType: 'codex:luna',
   provider: { plugin: 'engine', tier: 'core' as const },
   parentModel: 'claude-opus-5-5',
@@ -350,27 +357,24 @@ test('a codex:* spawn starts the Codex turn with the exact prompt, keyed by the 
   expect(fake.argv[2]).toBe(CODEX_DEFAULT)
 
   const prompt = 'Write unit tests for calc.js\n\n  keep the indentation\n'
-  const agent = await spawn($, fake, prompt, { description: 'Write calc tests' })
+  const agent = await spawn($, fake, prompt, { description: 'Write calc tests', name: 'calc_tests' })
   expect(fake.spawned[0]).toMatchObject({ subagentType: 'codex:luna', prompt, background: true })
-  expect(agent).toMatchObject({ id: 'a1', name: 'Write calc tests', description: 'Write calc tests', model: 'gpt-6-luna', effort: 'max', status: 'running', currentTurnId: 'turn-1', cwd: '/work/app' })
+  expect(agent).toMatchObject({ id: 'a1', name: 'calc_tests', description: 'Write calc tests', model: 'gpt-6-luna', effort: 'max', status: 'running', currentTurnId: 'turn-1', cwd: '/work/app' })
   expect(fake.rpcs.map(rpc => rpc.method)).toEqual(['model/list', 'thread/start', 'thread/name/set', 'turn/start'])
   expect(fake.rpcs[1]?.params).toMatchObject({ model: 'gpt-6-luna', cwd: '/work/app', sandbox: 'workspace-write', approvalPolicy: 'on-request', approvalsReviewer: 'auto_review', ephemeral: false })
   // The job can message the session: bin/codex-msg as an MCP server, named with the bridge's socket and the job's key.
   const msgKey = String(agent.msgKey)
   expect(msgKey).toMatch(/^[0-9a-f]{32}$/)
   const started = fake.rpcs[1]?.params as { config: { mcp_servers: Record<string, { command: string; args: string[] }> }; developerInstructions: string }
-  expect(started.config.mcp_servers.claude_session?.command).toBe(NODE_DEFAULT)
-  expect(started.config.mcp_servers.claude_session?.args).toEqual([expect.stringMatching(/\/bin\/codex-msg$/), '/tmp/cxb-test/s', msgKey])
-  expect(started.developerInstructions).toContain('call the message_claude tool of the claude_session MCP server')
-  expect(fake.rpcs[2]?.params).toEqual({ threadId: 'th-1', name: 'Write calc tests' })
+  expect(started.config.mcp_servers.claude_agents?.command).toBe(NODE_DEFAULT)
+  expect(started.config.mcp_servers.claude_agents?.args).toEqual([expect.stringMatching(/\/bin\/codex-msg$/), '/tmp/cxb-test/s', msgKey])
+  expect(started.developerInstructions).toContain('call the message_agent tool of the claude_agents MCP server')
+  expect(fake.rpcs[2]?.params).toEqual({ threadId: 'th-1', name: 'calc_tests' })
   expect(fake.rpcs[3]?.params).toMatchObject({ threadId: 'th-1', effort: 'max', input: [{ type: 'text', text: prompt, text_elements: [] }] })
 
-  // The cwd the Agent call set wins, and a second luna gets its own name.
-  await spawn($, fake, 'x', { cwd: '/elsewhere' })
-  expect((await agentsOf(fake)).a2).toMatchObject({ name: 'Sleep a while', cwd: '/elsewhere' })
-  // The same description again: a numbered name.
-  await spawn($, fake, 'z')
-  expect((await agentsOf(fake)).a3?.name).toBe('Sleep a while (2)')
+  // The cwd the Agent call set wins, and the job is called what the call named it.
+  await spawn($, fake, 'x', { cwd: '/elsewhere', name: 'other' })
+  expect((await agentsOf(fake)).a2).toMatchObject({ name: 'other', description: 'Sleep a while', cwd: '/elsewhere' })
 
   push(fake, note('turn/started', { threadId: 'th-1', turn: { id: 'turn-1' } }))
   push(fake, note('item/started', { threadId: 'th-1', item: { type: 'commandExecution', command: "/bin/zsh -lc 'sleep 20'" } }))
@@ -492,7 +496,7 @@ test('a codex-msg message returns codex_await early and goes to main as the agen
   const agent = await spawn($, fake)
   const question = 'Which DB should I use?\n\n  keep *this* exactly '
   fake.waitQueue = [{ status: 'timeout' }, { status: 'message', messages: [question] }]
-  expect((await awaitCall($, 'a1')).result).toBe('Codex sent a message for the main session.')
+  expect((await awaitCall($, 'a1')).result).toBe('Codex sent a message for main.')
   expect(fake.waits.map(wait => wait.msgKey)).toEqual([agent.msgKey, agent.msgKey])
 
   const relay = await step($, 'a1', 1)
@@ -507,7 +511,7 @@ test('a codex-msg message returns codex_await early and goes to main as the agen
   expect(await check(relayId)).toMatchObject({ decision: 'ask' })
   expect(await check('toolu_other')).toMatchObject({ decision: 'ask' })
   expect((await agentsOf(fake)).a1?.outbox).toEqual([])
-  expect((await agentsOf(fake)).a1?.digest).toEqual(['message to Claude: Which DB should I use?'])
+  expect((await agentsOf(fake)).a1?.digest).toEqual(['message to main: Which DB should I use?'])
 
   // Back to waiting; a message sent just before the turn ended goes out ahead of the result.
   expect((await step($, 'a1', 2)).result.toolUses[0]?.name).toBe('mcp__codex__codex_await')
@@ -533,6 +537,53 @@ test('a reply to a Codex question reaches the running Codex turn as a steer', { 
     { threadId: 'th-1', expectedTurnId: 'turn-1', input: [{ type: 'text', text: 'The secret word is MANGO.', text_elements: [] }] },
   ])
   expect(fake.rpcs.filter(rpc => rpc.method === 'turn/start')).toHaveLength(1)
+  done(fake)
+})
+
+test('message_agent with `to` goes to that agent as the job\'s own SendMessage; a Codex recipient learns the sender', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake)
+  await spawn($, fake, 'sleep 20', { name: 'peer_a' })
+  await spawn($, fake, 'sleep 20', { name: 'peer_b' })
+  fake.waitQueue = [{ status: 'message', messages: [{ text: 'ping', to: 'peer_b' }] }]
+  expect((await awaitCall($, 'a1')).result).toBe('Codex sent a message for peer_b.')
+  const relay = await step($, 'a1', 1)
+  expect(inputOf(relay.chunks)).toEqual({ to: 'peer_b', summary: 'Codex: ping', message: 'ping' })
+  expect(await $.tool.check({ tool: 'SendMessage', input: inputOf(relay.chunks), tool_use_id: (relay.chunks[0] as { id: string }).id, agentId: 'a1' } as never)).toMatchObject({ decision: 'allow' })
+  expect((await agentsOf(fake)).a1?.digest).toEqual(['message to peer_b: ping'])
+
+  // The engine delivers it from a1's loop: Codex peer_b reads who wrote.
+  expect(await $.session.send({ to: 'peer_b', text: 'ping', origin: { kind: 'model' }, agentId: 'a1' } as never)).toEqual({ isDelivered: true })
+  expect(fake.rpcs.filter(rpc => rpc.method === 'turn/steer').map(rpc => rpc.params)).toEqual([
+    { threadId: 'th-2', expectedTurnId: 'turn-2', input: [{ type: 'text', text: 'Message from agent peer_a:\n\nping', text_elements: [] }] },
+  ])
+  done(fake)
+})
+
+test('a message to a name no agent has is not sent; Codex is told instead', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake)
+  await spawn($, fake, 'sleep 20', { name: 'peer_a' })
+  fake.waitQueue = [{ status: 'message', messages: [{ text: 'hello?', to: 'ghost' }] }]
+  await awaitCall($, 'a1')
+  const next = await step($, 'a1', 1)
+  expect(next.result.toolUses[0]?.name).toBe('mcp__codex__codex_await')
+  expect(fake.delivered).toEqual([])
+  expect(fake.rpcs.filter(rpc => rpc.method === 'turn/steer').map(rpc => (rpc.params.input as { text: string }[])[0]?.text)).toEqual([
+    'Message to ghost not delivered: no agent of this session has that name. list_agents shows the agents you can message.',
+  ])
+  done(fake)
+})
+
+test('a codex:* spawn needs a name no recent agent has; list_agents reads the agents the plugin sends the bridge', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake)
+  const nameless = await $.agent.spawn({ ...spawnInput('x'), name: undefined })
+  expect(nameless.deny).toContain('give the agent a `name`')
+  await spawn($, fake, 'sleep 20', { name: 'peer_a' })
+  expect((await $.agent.spawn(spawnInput('x', { name: 'peer_a' }))).deny).toContain('the name peer_a is taken')
+  expect((await $.agent.spawn(spawnInput('x', { name: 'main' }))).deny).toContain('the name main is taken')
+  expect(fake.rosters.at(-1)).toBe('- main (the Claude Code session that started the jobs)\n- peer_a (codex:luna, running)')
   done(fake)
 })
 
@@ -585,9 +636,9 @@ test('an ended turn releases its thread, so Codex unloads it and stops its MCP s
   const before = fake.rpcs.length
   expect(await send($, 'a1', 'next task')).toEqual({ isDelivered: true })
   expect(fake.rpcs.slice(before).map(rpc => rpc.method)).toEqual(['thread/resume', 'turn/start'])
-  const resumed = fake.rpcs[before]?.params as { threadId: string; config: { mcp_servers: { claude_session: { args: string[] } } } }
+  const resumed = fake.rpcs[before]?.params as { threadId: string; config: { mcp_servers: { claude_agents: { args: string[] } } } }
   expect(resumed.threadId).toBe('th-1')
-  expect(resumed.config.mcp_servers.claude_session.args.slice(1)).toEqual(['/tmp/cxb-test/s', agent.msgKey])
+  expect(resumed.config.mcp_servers.claude_agents.args.slice(1)).toEqual(['/tmp/cxb-test/s', agent.msgKey])
 
   // That turn's end releases it again; a repeated end does not.
   push(fake, note('turn/completed', { threadId: 'th-1', turn: { id: 'turn-2', status: 'completed', items: [] } }))
@@ -637,11 +688,11 @@ test('TaskStop: an aborted wrapper turn interrupts the Codex turn', { timeoutMs:
 test('an approval asks the person and posts the reply; a dismissed dialog declines', { timeoutMs: 20_000 }, async ($, on) => {
   const fake = fakeBridge(on)
   await start($, fake)
-  await spawn($, fake)
+  await spawn($, fake, 'sleep 20', { name: 'sleeper' })
 
   push(fake, { type: 'request', id: 7, method: 'item/commandExecution/requestApproval', params: { threadId: 'th-1', command: "/bin/zsh -lc 'touch /x'" } })
   await until(fake, async () => fake.replies.length === 1, 'first reply')
-  expect(fake.asked[0]).toContain('Codex Sleep a while (gpt-6-luna) wants to run: touch /x')
+  expect(fake.asked[0]).toContain('Codex sleeper (gpt-6-luna) wants to run: touch /x')
   expect(fake.replies[0]).toEqual({ id: 7, result: { decision: 'accept' } })
 
   fake.askAnswer = null
@@ -728,9 +779,9 @@ test("Windows bridge: requests go to the daemon's loopback URL under its secret,
   push(fake, { type: 'ready', socket: 'http://127.0.0.1:5000/s3cret', reattached: false, active: {} })
   const agent = await spawn($, fake, 'x')
   expect(fake.targets.length).toBeGreaterThan(0)
-  for (const target of fake.targets) expect(target).toMatch(/^ http:\/\/127\.0\.0\.1:5000\/s3cret\/(rpc|wait|registry\/(read|write))$/)
+  for (const target of fake.targets) expect(target).toMatch(/^ http:\/\/127\.0\.0\.1:5000\/s3cret\/(rpc|wait|roster|registry\/(read|write))$/)
   const started = fake.rpcs.find(rpc => rpc.method === 'thread/start')?.params as { config: { mcp_servers: Record<string, { args: string[] }> } }
-  expect(started.config.mcp_servers.claude_session?.args.slice(1)).toEqual(['http://127.0.0.1:5000/s3cret', String(agent.msgKey)])
+  expect(started.config.mcp_servers.claude_agents?.args.slice(1)).toEqual(['http://127.0.0.1:5000/s3cret', String(agent.msgKey)])
   done(fake)
 })
 
@@ -1088,11 +1139,11 @@ test('codex_list and codex_result read the jobs', { timeoutMs: 20_000 }, async (
   const fake = fakeBridge(on)
   await start($, fake)
   expect(String((await $.tool.call({ tool: 'mcp__codex__codex_list' } as never)).result)).toContain('subagent_type codex:luna')
-  await spawn($, fake)
-  expect(String((await $.tool.call({ tool: 'mcp__codex__codex_list' } as never)).result)).toMatch(/^a1 Sleep a while \[gpt-6-luna\/max, workspace-write, approvals auto\] running/)
+  await spawn($, fake, 'sleep 20', { name: 'sleeper' })
+  expect(String((await $.tool.call({ tool: 'mcp__codex__codex_list' } as never)).result)).toMatch(/^a1 sleeper \[gpt-6-luna\/max, workspace-write, approvals auto\] running/)
   push(fake, note('turn/completed', { threadId: 'th-1', turn: { id: 'turn-1', status: 'completed', items: [{ type: 'agentMessage', text: 'ALL GREEN', phase: 'final_answer' }] } }))
   await until(fake, async () => (await agentsOf(fake)).a1?.status === 'idle', 'idle')
-  expect(String((await $.tool.call({ tool: 'mcp__codex__codex_result', id: 'Sleep a while' } as never)).result)).toContain('Final message:\nALL GREEN')
+  expect(String((await $.tool.call({ tool: 'mcp__codex__codex_result', id: 'sleeper' } as never)).result)).toContain('Final message:\nALL GREEN')
   done(fake)
 })
 
@@ -1273,9 +1324,9 @@ test('running agents show beside the prompt hint, and nothing once none runs', {
   const hint = { component: 'PromptHint' as const, requestId: 'hint', props: { isDraft: false, isWorking: false, hint: '? for shortcuts' } }
   const ui = await $.ui.mount({ plugin: 'codex', surface: 'terminal', ...hint })
   expect(linesOf((await ui.drawn()) as Node)).toBe('? for shortcuts|')
-  await spawn($, fake)
+  await spawn($, fake, 'sleep 20', { name: 'sleeper' })
   await ui.redraw()
-  expect(linesOf((await ui.drawn()) as Node)).toBe('? for shortcuts|codex: Sleep a while (luna)')
+  expect(linesOf((await ui.drawn()) as Node)).toBe('? for shortcuts|codex: sleeper (luna)')
   push(fake, note('turn/completed', { threadId: 'th-1', turn: { id: 'turn-1', status: 'completed', items: [] } }))
   await until(fake, async () => (await agentsOf(fake)).a1?.status === 'idle', 'idle')
   await ui.redraw()

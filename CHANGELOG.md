@@ -1,6 +1,19 @@
 # Changelog
 
-## Unreleased
+## 1.0.0
+
+Breaking:
+
+- The Codex-side MCP server is renamed `claude_session` -> `claude_agents`, and its tool `message_claude(text)` -> `message_agent(text, to?)`. The old names are gone; resumed jobs get the new ones on their next turn.
+- A `codex:*` Agent call needs a `name`, and one that `main` or a running or recently finished agent (30 minutes) already has is refused. The job is called by that name, not by its description.
+
+Added:
+
+- Agents message each other: `message_agent` takes `to`, a recipient agent's name or id (another Codex job, a Claude subagent, or `main`, the default), and the job's agent sends it with `SendMessage`. A name no agent has is not sent; Codex is told so instead.
+- `list_agents`: the session's agents a job can message (running or finished within 30 minutes), with name, type, status and task.
+- A message to a Codex job from another agent arrives as `Message from agent <name>:` and the text, so Codex knows whom to answer.
+
+Also:
 
 - A codex binary that is not found (`spawn codex ENOENT`, e.g. after nvm switches Node versions, whose global npm packages are per version) now says how to fix it: install `@openai/codex` for the node on PATH or set `codexPath`.
 - On Windows, with no codex on PATH, the bridge runs the Codex desktop app's `codex.exe` (Store package `OpenAI.Codex`, found with `Get-AppxPackage`): no npm install needed, and it survives app updates and nvm switches.

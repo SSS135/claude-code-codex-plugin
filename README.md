@@ -17,8 +17,10 @@ A Claude Code plugin that runs OpenAI Codex (luna, sol, astra, terra) as native 
 The plugin registers four agent types, one per Codex model family: `codex:luna`, `codex:sol`, `codex:astra` and `codex:terra`. Claude uses them like `general-purpose`, so you can ask in plain words, for example "have a Codex agent fix the flaky retry test". Claude turns that into an Agent call like this:
 
 ```json
-{ "subagent_type": "codex:sol", "description": "Fix flaky retry test", "prompt": "effort: medium\nFix the flaky test in retry.test.ts and run it." }
+{ "subagent_type": "codex:sol", "name": "retry_fix", "description": "Fix flaky retry test", "prompt": "effort: medium\nFix the flaky test in retry.test.ts and run it." }
 ```
+
+`name` is required: other agents message the job by it. A call without one, or with a name that `main` or a running or recently finished agent (within 30 minutes) already has, is refused.
 
 ### Which agent Claude picks
 
@@ -40,8 +42,8 @@ What happens then:
 - The plugin starts the Codex thread and turn itself, with the Agent call's prompt exactly as given (header lines taken off), in the Agent call's `cwd` or the session's. Nothing is relayed through a Claude model.
 - The agent the engine starts for it is a thin wrapper. Every model request of its loop is answered by the plugin (a `turn.step` hook): while Codex works, the wrapper calls the plugin's `codex_await` tool, and once the Codex turn ends, it hands back the Codex final message, verbatim. Codex `error` notifications (model capacity, retries, a failed compaction) are warnings shown by `codex_list` and `codex_result`, not an end; a failed turn end counts only when the thread does no more work for 30 s. Where the engine requires a background subagent to report through `SubagentHandback` (auto mode), that call carries it; where the engine does not offer that tool, the failed call is followed by the message as the final text. No Claude model runs for it, so it costs no Claude tokens.
 - The wrapper is a real background subagent: it is in the task list ("↓ to manage"), and its finish row and the notification Claude reads are the engine's own.
-- `SendMessage` to the agent (by its agentId, or the `name` the Agent call gave) goes to Codex first: it steers the running turn, or, once the agent finished, starts a new turn on the same Codex thread and resumes the agent, which then notifies again. If Codex refuses the message, `SendMessage` reports it as not delivered.
-- Codex can message the session mid-task (see Messages from Codex below), and a `SendMessage` reply reaches its running turn.
+- `SendMessage` to the agent (by its agentId, or the `name` the Agent call gave) goes to Codex first: it steers the running turn, or, once the agent finished, starts a new turn on the same Codex thread and resumes the agent, which then notifies again. If Codex refuses the message, `SendMessage` reports it as not delivered. Sent by another agent (a Claude subagent, or another Codex job), it reaches Codex as `Message from agent <name>:` and the text, so Codex knows whom to answer; from `main` it arrives as it is.
+- Codex can message the session, other Codex jobs and Claude subagents mid-task (see Messages from Codex below), and a `SendMessage` reply reaches its running turn.
 - `TaskStop`, or stopping the task from the task list, interrupts the Codex turn.
 
 ### Prompt header lines
@@ -58,11 +60,16 @@ An effort the model does not take, an unknown sandbox or approvals value, a key 
 
 ### Messages from Codex
 
-A Codex job can message the Claude session mid-task, as a native background subagent can `SendMessage` to `main`: a question it needs answered, a blocker, or an important interim finding. Each Codex thread gets one extra MCP server, `claude_session` (`bin/codex-msg`, Node, no dependencies), with one tool, `message_claude(text)`, and developer instructions saying when to use it. The tool posts the text to the bridge daemon (`POST /msg`), which holds it for the job's agent; the agent's `codex_await` returns early, and the plugin has the agent send the text to `main` with its own `SendMessage` call, word for word, then wait again. In auto mode the plugin allows that call itself through a `tool.check` hook, only for the call it made: no model request produced the step, so auto mode's classifier has no verdict for it. Claude sees the native message row from that agent. A reply is an ordinary `SendMessage` to the agent, which steers the running Codex turn, so Codex reads it mid-turn as a new user message.
+A Codex job can message any agent of the Claude session mid-task, as a native background subagent can `SendMessage`: `main`, another Codex job, or a Claude subagent. Use it for a question, a blocker, an important interim finding, or coordination with a peer. Each Codex thread gets one extra MCP server, `claude_agents` (`bin/codex-msg`, Node, no dependencies), with two tools and developer instructions saying when to use them:
 
-It is an MCP server, not a shell command, because Codex's sandboxes refuse a shell command's `connect()` to the bridge's Unix socket: both `read-only` and `workspace-write` fail with EPERM (tested with `codex sandbox`, Codex CLI 0.160), and only `network_access = true` lifts that, which opens the network too. Codex starts its MCP servers outside the job's sandbox, so `message_claude` works in every sandbox, and in testing it ran without an approval prompt under `approvals: ask`.
+- `message_agent(text, to?)`: `to` names the recipient as `list_agents` shows it or the task gives it (its Agent call `name`, or its agentId); without `to`, or with `main`, it goes to the main session. The tool posts the text to the bridge daemon (`POST /msg`), which holds it for the job's agent; the agent's `codex_await` returns early, and the plugin has the agent send the text to that recipient with its own `SendMessage` call, word for word, then wait again. In auto mode the plugin allows that call itself through a `tool.check` hook, only for the call it made: no model request produced the step, so auto mode's classifier has no verdict for it. A name no agent of the session has is not sent: Codex gets `Message to <name> not delivered` as a new user message instead.
+- `list_agents()`: `main`, then each Codex job and Claude subagent of the session that runs or finished within the last 30 minutes, with its name, type, status and task. The plugin sends this list to the bridge as jobs and subagents start and on each `codex_await` poll (every 20 s or sooner), so it is at most that old. An older agent is left out of the list but still takes a message by its name.
 
-Each job is named after the Agent call's description, numbered when another job has it (`Fix flaky retry test`, `Fix flaky retry test (2)`); the Codex thread carries the description too, so the session is easy to find in the Codex app, `codex resume` and `codex agents`.
+The recipient sees the native message row from the sending agent; a Codex recipient reads it mid-turn as `Message from agent <name>:` and the text (a finished one is woken: a new turn on its thread). A reply is an ordinary `SendMessage` back. Messages between agents are not copied to `main`; each sending job's `codex_result` digest lists them (`message to <name>: ...`).
+
+It is an MCP server, not a shell command, because Codex's sandboxes refuse a shell command's `connect()` to the bridge's Unix socket: both `read-only` and `workspace-write` fail with EPERM (tested with `codex sandbox`, Codex CLI 0.160), and only `network_access = true` lifts that, which opens the network too. Codex starts its MCP servers outside the job's sandbox, so `message_agent` works in every sandbox, and in testing it ran without an approval prompt under `approvals: ask`.
+
+Each job is named after the Agent call's `name`; the record numbers it only when an older job already has that name. The Codex thread carries the name too, so the session is easy to find in the Codex app, `codex resume` and `codex agents`.
 
 ## Install
 
@@ -166,7 +173,8 @@ Processes end with the work they serve:
 - The wrapper agent is defined on `haiku`, because an agent type must name a Claude model; the plugin answers every request of its loop, so that model is never called. Where the engine names the agent's model (its task details), it may say haiku; `codex_list` and `codex_result` show the Codex model.
 - If the plugin's `turn.step` hook fails for a wrapper request, the engine sends that request to haiku, whose system prompt tells it to call `codex_await` and deliver its result unchanged. A failure is reported in the transcript's dim plugin line.
 - In auto mode the hand-back arrives with the engine's note that auto mode's classifier was unavailable for the agent's work: the classifier judges a model's actions with its request, and the wrapper's steps make no request. Only that classifier may allow `SubagentHandback`, so the plugin cannot allow it itself. The report under the note is the Codex final message, verbatim.
-- The final message and each `message_claude` message are passed on whole up to 20,000 characters; a longer one is cut there. At most 50 messages wait unread per job.
+- The final message and each `message_agent` message are passed on whole up to 20,000 characters; a longer one is cut there. At most 50 messages wait unread per job; nothing else limits two agents messaging each other back and forth.
+- `list_agents` knows when a Claude subagent finished only from turns the plugin saw end since it last loaded; after a reload, finished Claude subagents drop off the list until they run again (messaging them by name still works).
 - Messages are read only while the job's agent runs; one still unread when the bridge daemon exits is lost.
 - A Codex thread is started before the Agent call's subagent; if another plugin then refuses the spawn, that thread stays unused.
 - The model is chosen by the agent type alone: the four aliases, no other Codex model id.

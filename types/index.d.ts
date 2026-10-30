@@ -2,6 +2,8 @@ export type CodexSandbox = 'read-only' | 'workspace-write' | 'full-access'
 /** yolo: no sandbox and no approvals; only on the user's explicit request or a project default. */
 export type CodexApprovals = 'ask' | 'auto' | 'never' | 'yolo'
 export type CodexStatus = 'starting' | 'running' | 'idle' | 'interrupted' | 'failed'
+/** A message a Codex job sent with message_agent: to an agent by name or id, or to main when `to` is absent. */
+export type OutboxItem = { text: string; to?: string }
 
 /** One Codex job: a Codex thread run under a native `codex:<alias>` subagent, keyed by that subagent's agentId. */
 export type CodexAgent = {
@@ -33,8 +35,8 @@ export type CodexAgent = {
   warning?: string | null
   /** The key bin/codex-msg names this job by (in the thread's developer instructions). */
   msgKey: string
-  /** codex-msg messages read from the bridge and not yet passed on to the main session. */
-  outbox: string[]
+  /** codex-msg messages read from the bridge and not yet passed on; `to` names the recipient agent, absent for main. */
+  outbox: OutboxItem[]
   /** Compact lines of the current or last turn: commands, file changes, messages. */
   digest: string[]
   startedAt: number

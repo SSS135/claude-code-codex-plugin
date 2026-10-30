@@ -12,10 +12,14 @@ export const registryDir = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(
 
 const validId = id => typeof id === 'string' && /^[A-Za-z0-9_-]{1,200}$/.test(id)
 const strings = value => Array.isArray(value) && value.every(item => typeof item === 'string')
+/** An outbox item, {text, to?}; a bare string is a record written before 1.0. */
+const outboxItem = item => typeof item === 'string' ||
+  (typeof item?.text === 'string' && (item.to === undefined || typeof item.to === 'string'))
+const outboxItems = value => Array.isArray(value) && value.every(outboxItem)
 const validAgent = agent => agent && validId(agent.id) && typeof agent.threadId === 'string' &&
   ['name', 'model', 'effort', 'cwd', 'lastMessage', 'activity', 'sessionId'].every(key => typeof agent[key] === 'string') &&
   ['updatedAt', 'startedAt', 'turnStartedAt', 'turnEndedAt', 'tokens'].every(key => Number.isFinite(agent[key])) &&
-  strings(agent.digest) && (agent.outbox === undefined || strings(agent.outbox)) &&
+  strings(agent.digest) && (agent.outbox === undefined || outboxItems(agent.outbox)) &&
   ['read-only', 'workspace-write', 'full-access'].includes(agent.sandbox) &&
   ['ask', 'auto', 'never', 'yolo'].includes(agent.approvals) &&
   [agent.currentTurnId, agent.lastTurnId, agent.lastTurnStatus, agent.error].every(value => value === null || typeof value === 'string') &&
@@ -29,7 +33,7 @@ export function readAgents(query, dir = registryDir) {
     try {
       const agent = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'))
       if (!validAgent(agent) || name !== `${agent.id}.json`) continue
-      agent.outbox ??= []
+      agent.outbox = (agent.outbox ?? []).map(item => (typeof item === 'string' ? { text: item } : item))
       if (agent.sessionId === query.sessionId || query.ids?.includes(agent.id) ||
           (query.ref && (agent.id === query.ref || agent.name === query.ref))) agents[agent.id] = agent
     } catch (error) {

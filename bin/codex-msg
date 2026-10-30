@@ -1,16 +1,18 @@
 #!/usr/bin/env node
-// codex-msg: the MCP server that lets a Codex job message the Claude session
-// that runs it.
+// codex-msg: the MCP server that lets a Codex job message the agents of the
+// Claude session that runs it: the main session, other codex:* jobs and
+// Claude subagents.
 //
 //   node codex-msg <socket> <key>      (<socket>: on Windows the bridge's loopback URL)
 //
-// The plugin names it in the Codex thread's config (mcp_servers.claude_session),
+// The plugin names it in the Codex thread's config (mcp_servers.claude_agents),
 // so codex app-server starts it outside the job's sandbox: Codex's read-only
 // and workspace-write sandboxes both refuse a shell command's connect() to the
-// bridge's Unix socket. It serves one tool, message_claude, over stdio
-// (newline-delimited JSON-RPC). The bridge daemon queues the text for the job's
-// codex:* agent, which passes it on to the main session with SendMessage,
-// verbatim. CommonJS on purpose: an extensionless script.
+// bridge's Unix socket. It serves two tools over stdio (newline-delimited
+// JSON-RPC): message_agent, whose text the bridge daemon queues for the job's
+// codex:* agent, which passes it on with SendMessage, verbatim; and
+// list_agents, which reads the roster the plugin keeps on the bridge.
+// CommonJS on purpose: an extensionless script.
 
 'use strict'
 const http = require('node:http')
@@ -22,21 +24,38 @@ if (!socketPath || !key) {
   process.exit(2)
 }
 
-const TOOL = {
-  name: 'message_claude',
-  description:
-    'Send a message to the Claude Code session that started this job: a question you need answered, a blocker, or an important interim finding. Not for progress updates or your final result. A reply, if one comes, arrives as a new user message in your turn.',
-  inputSchema: { type: 'object', properties: { text: { type: 'string', description: 'The message, as the session should read it.' } }, required: ['text'] },
-  annotations: { readOnlyHint: true, openWorldHint: false },
-}
+const TOOLS = [
+  {
+    name: 'message_agent',
+    description:
+      'Send a message to an agent of the Claude Code session that started this job: by default the session itself (main), or, with `to`, another agent by the name list_agents shows or your task gives. Use it for a question you need answered, a blocker, an important interim finding, or coordination with a peer agent; not for progress updates or your final result. A reply, if one comes, arrives as a new user message in your turn.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', description: 'The message, as the recipient should read it.' },
+        to: { type: 'string', description: 'The recipient agent\'s name (or id). Omit to message the main session.' },
+      },
+      required: ['text'],
+    },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  },
+  {
+    name: 'list_agents',
+    description:
+      "List the agents of the Claude Code session you can message: main, codex:* jobs and Claude subagents that are running or finished within the last 30 minutes, with name, type, status and task. An older agent still takes a message by its name.",
+    inputSchema: { type: 'object', properties: {} },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  },
+]
 
 const write = message => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n')
 
-const post = text =>
+/** POSTs to the bridge; resolves { body } on 200, else { error }. */
+const post = (route, payload) =>
   new Promise(resolve => {
-    const body = JSON.stringify({ key, text })
+    const body = JSON.stringify(payload)
     // On Windows the bridge's address is a loopback URL rather than a socket (see bin/bridge.mjs).
-    const [url, via] = /^https?:/.test(socketPath) ? [`${socketPath}/msg`, {}] : ['http://bridge/msg', { socketPath }]
+    const [url, via] = /^https?:/.test(socketPath) ? [`${socketPath}${route}`, {}] : [`http://bridge${route}`, { socketPath }]
     const req = http.request(
       url,
       { ...via, method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } },
@@ -44,20 +63,28 @@ const post = text =>
         let answer = ''
         res.setEncoding('utf8')
         res.on('data', chunk => (answer += chunk))
-        res.on('end', () => resolve(res.statusCode === 200 ? null : `the bridge refused the message: ${answer}`))
+        res.on('end', () => resolve(res.statusCode === 200 ? { body: answer } : { error: `the bridge refused the request: ${answer}` }))
       },
     )
-    req.on('error', error => resolve(`cannot reach the Claude session (${error.message})`))
+    req.on('error', error => resolve({ error: `cannot reach the Claude session (${error.message})` }))
     req.end(body)
   })
 
+const textResult = (text, isError = false) => ({ content: [{ type: 'text', text }], ...(isError ? { isError: true } : {}) })
+
 async function call(params) {
-  if (params?.name !== TOOL.name) return { content: [{ type: 'text', text: `No tool ${params?.name}.` }], isError: true }
-  const text = typeof params.arguments?.text === 'string' ? params.arguments.text : ''
-  if (text.trim() === '') return { content: [{ type: 'text', text: 'The message is empty.' }], isError: true }
-  const error = await post(text)
-  if (error) return { content: [{ type: 'text', text: error }], isError: true }
-  return { content: [{ type: 'text', text: 'Sent to the Claude session. A reply, if any, arrives as a new user message.' }] }
+  const args = params?.arguments ?? {}
+  if (params?.name === 'list_agents') {
+    const { body, error } = await post('/agents', { key })
+    return error ? textResult(error, true) : textResult(body)
+  }
+  if (params?.name !== 'message_agent') return textResult(`No tool ${params?.name}.`, true)
+  const text = typeof args.text === 'string' ? args.text : ''
+  if (text.trim() === '') return textResult('The message is empty.', true)
+  const to = typeof args.to === 'string' && args.to.trim() !== '' && args.to.trim() !== 'main' ? args.to.trim() : undefined
+  const { error } = await post('/msg', to ? { key, text, to } : { key, text })
+  if (error) return textResult(error, true)
+  return textResult(`Sent to ${to ?? 'the main session'}. A reply, if any, arrives as a new user message.`)
 }
 
 readline.createInterface({ input: process.stdin }).on('line', async line => {
@@ -77,13 +104,13 @@ readline.createInterface({ input: process.stdin }).on('line', async line => {
         result: {
           protocolVersion: params?.protocolVersion ?? '2025-06-18',
           capabilities: { tools: {} },
-          serverInfo: { name: 'claude-session', version: '0.1.0' },
+          serverInfo: { name: 'claude-agents', version: '1.0.0' },
         },
       })
     case 'ping':
       return write({ id, result: {} })
     case 'tools/list':
-      return write({ id, result: { tools: [TOOL] } })
+      return write({ id, result: { tools: TOOLS } })
     case 'tools/call':
       return write({ id, result: await call(params) })
     default:

@@ -620,19 +620,29 @@ export function permissionsFor(
 
 // ------------------------------------------------------------ codex-msg
 
-/** The MCP server, bin/codex-msg, through which a job messages the session; Codex starts it outside the job's sandbox. */
-export const MSG_SERVER = 'claude_session'
+/** The MCP server, bin/codex-msg, through which a job messages the session's agents; Codex starts it outside the job's sandbox. */
+export const MSG_SERVER = 'claude_agents'
 
-/** What thread/start and thread/resume take so a job can message the session: the server in `config`, its use in the developer instructions. */
+/** What thread/start and thread/resume take so a job can message the session's agents: the server in `config`, its use in the developer instructions. */
 export const messagingParams = (node: string, root: string, socketPath: string, key: string) => ({
   config: { mcp_servers: { [MSG_SERVER]: { command: node, args: [`${root}/bin/codex-msg`, socketPath, key] } } },
   developerInstructions: [
     'You run as a background job of a Claude Code session, which gets your final message when your turn ends.',
-    `To message that session while you work, call the message_claude tool of the ${MSG_SERVER} MCP server with the text.`,
-    'Use it for a question you need answered, a blocker, or an important interim finding; never for progress updates, and never for your final result.',
-    'A reply, when the session sends one, arrives as a new user message in your turn; keep working on what you can while you wait for it.',
+    `To message that session while you work, call the message_agent tool of the ${MSG_SERVER} MCP server with the text.`,
+    'To message another agent of the session (another Codex job or a Claude subagent), pass its name as `to`: the name your task gives, or one the list_agents tool of the same server shows.',
+    'Use it for a question you need answered, a blocker, an important interim finding, or coordination with a peer; never for progress updates, and never for your final result.',
+    'A reply arrives as a new user message in your turn; one from another agent starts with "Message from agent <name>:". Keep working on what you can while you wait for it.',
   ].join('\n'),
 })
+
+/** How a message from another agent reaches a Codex job, so it knows whom to answer. */
+export const fromAgent = (sender: string, text: string): string => `Message from agent ${sender}:\n\n${text}`
+
+/** The list_agents answer: main, then each agent of the session as one line. */
+export function rosterText(agents: readonly { name: string; type: string; status: string; description: string }[]): string {
+  const lines = agents.map(agent => `- ${agent.name} (${agent.type}, ${agent.status})${agent.description ? `: ${agent.description}` : ''}`)
+  return ['- main (the Claude Code session that started the jobs)', ...lines].join('\n')
+}
 
 export type MessagingParams = ReturnType<typeof messagingParams>
 
@@ -682,6 +692,7 @@ export function agentDescription(alias: string, defaults: Defaults): string {
     `"approvals: auto|ask|never|yolo" (default ${defaults.approvals}; auto: Codex's own reviewer decides escalations, looser than Claude's auto mode; ask: the user approves each; never: the sandbox alone decides; yolo: no sandbox and no approvals, ONLY when the user explicitly asked for it).`,
     `Project defaults: ${PROJECT_CONFIG}.`,
     'Codex may message you mid-task as this agent. SendMessage to it steers the running Codex turn, or starts a new turn on the same thread once it finished; TaskStop interrupts it.',
+    'The Agent call needs a `name` no running or recently finished agent has: other agents (Codex jobs through message_agent, Claude subagents through SendMessage) reach it by that name; list peer names in each prompt.',
   ].join(' ')
 }
 
@@ -689,7 +700,7 @@ export function agentDescription(alias: string, defaults: Defaults): string {
 export const WRAPPER_PROMPT = [
   'You relay one OpenAI Codex job that the codex plugin has already started with your task.',
   `Call the ${AWAIT_TOOL} tool with no arguments: it blocks until the Codex turn ends. While it says the job is still running, call it again.`,
-  'When it returns a message from Codex for the main session, send exactly that text with SendMessage to "main", then call it again.',
+  'When it returns a message from Codex, send exactly that text with SendMessage to the agent it names, then call it again.',
   `When it returns the result, deliver exactly that text, nothing added, removed or reworded: with ${HANDBACK_TOOL} when you have that tool, else as your reply.`,
   'Never do the task yourself and never call any other tool.',
   'If codex_await fails, report its error and stop. Never retry a missing job or diagnose the tool yourself.',
@@ -746,7 +757,7 @@ export function describeAgent(agent: CodexAgent, now: number): string {
   return `${agent.id} ${agent.name} [${agent.model}/${agent.effort}, ${agent.sandbox}, approvals ${agent.approvals}] ${agent.status}${timing}, ${formatTokens(agent.tokens)}: ${clip(firstLine(doing), 100)}${agent.warning ? ` (warning: ${clip(firstLine(agent.warning), 120)})` : ''}`
 }
 
-const RECENT_FINISHED_MS = 30 * 60_000
+export const RECENT_FINISHED_MS = 30 * 60_000
 
 /** codex_list: active and recently finished session jobs, or all with `all`, newest first (`agents` sorted so). */
 export function listText(agents: readonly CodexAgent[], sessionId: string, now: number, all = false): string {

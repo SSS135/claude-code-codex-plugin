@@ -15,7 +15,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, TurnStepChunk, TurnStepResult } from 'claude-code'
 
-import type { CodexAgent, CodexApprovals, CodexSandbox } from '../types'
+import type { CodexAgent, CodexApprovals, CodexSandbox, OutboxItem } from '../types'
 import {
   agentSpecs,
   aliasOfType,
@@ -44,6 +44,9 @@ import {
   describeAgent,
   findIn,
   firstLine,
+  fromAgent,
+  RECENT_FINISHED_MS,
+  rosterText,
   isLive,
   listText,
   outputText,
@@ -321,7 +324,7 @@ async function rpc<T>($: Engine, method: string, params: unknown): Promise<T> {
 
 type WaitAnswer =
   | { status: 'completed' | 'idle'; turn: { id?: string; status?: string; items?: Item[] } | null }
-  | { status: 'message'; messages: string[] }
+  | { status: 'message'; messages: (OutboxItem | string)[] }
   | { status: 'timeout' }
 
 /** Long-polls until the thread's turn ends or the job (named by `msgKey`) sends a codex-msg message: time inside $.http.fetch is budget-free. */
@@ -602,16 +605,50 @@ async function isHandbackRefused($: Engine, agentId: string): Promise<boolean> {
   return last?.toolUses.some(use => use.tool === HANDBACK_TOOL && use.isError === true) ?? false
 }
 
+/** A bridge or record from before 1.0 holds bare texts, all for main. */
+const outboxItem = (item: OutboxItem | string): OutboxItem => (typeof item === 'string' ? { text: item } : item)
+
 /** Holds codex-msg messages until the wrapper's loop passes them on with SendMessage. */
-async function queueMessages($: Engine, agentId: string, messages: readonly string[]): Promise<void> {
+async function queueMessages($: Engine, agentId: string, messages: readonly (OutboxItem | string)[]): Promise<void> {
   if (messages.length === 0) return
+  const items = messages.map(outboxItem)
   await patchAgent($, agentId, current => ({
-    outbox: [...current.outbox, ...messages],
-    digest: [...current.digest, ...messages.map(text => `message to Claude: ${clip(firstLine(text), 200)}`)],
+    outbox: [...current.outbox, ...items],
+    digest: [...current.digest, ...items.map(item => `message to ${item.to ?? 'main'}: ${clip(firstLine(item.text), 200)}`)],
   }))
 }
 
-const messagesText = (count: number) => `Codex sent ${count === 1 ? 'a message' : `${count} messages`} for the main session.`
+const messagesText = (messages: readonly (OutboxItem | string)[]) => {
+  const to = [...new Set(messages.map(item => outboxItem(item).to ?? 'main'))]
+  return `Codex sent ${messages.length === 1 ? 'a message' : `${messages.length} messages`} for ${to.join(', ')}.`
+}
+
+/** When each subagent's last turn ended, as turn.complete saw it: list_agents hides one finished longer ago than RECENT_FINISHED_MS. */
+const agentEndedAt = new Map<string, number>()
+
+/** codex:* jobs and Claude subagents of this session that run or finished within RECENT_FINISHED_MS. */
+async function recentAgents($: Engine): Promise<{ name: string; type: string; status: string; description: string }[]> {
+  const now = await $.clock.now()
+  const jobs = await read($, agentsAtom)
+  return (await $.agent.list()).flatMap(info => {
+    const job = jobs[info.id]
+    const live = job ? isLive(job) : ['pending', 'running', 'waiting', 'idle'].includes(info.status)
+    const endedAt = job ? job.turnEndedAt : (agentEndedAt.get(info.id) ?? 0)
+    if (!live && endedAt < now - RECENT_FINISHED_MS) return []
+    const status = job ? (isLive(job) ? 'running' : (job.lastTurnStatus ?? job.status)) : info.status
+    return [{ name: info.name ?? info.id, type: info.type, status, description: info.description }]
+  })
+}
+
+/** Sends a running bridge the agents list_agents shows; a failure only leaves the previous list standing. */
+async function pushRoster($: Engine): Promise<void> {
+  if (!isBridgeRunning) return
+  try {
+    await post($, '/roster', { text: rosterText(await recentAgents($)) })
+  } catch (error) {
+    $.ui.log(`codex: sending the agent list to the bridge failed: ${errorText(error)}`, { to: 'debug' })
+  }
+}
 
 /**
  * codex_await: blocks until the wrapper's Codex turn ends, or the job sends a
@@ -651,6 +688,8 @@ async function awaitJob($: Engine, agentId: string | undefined, signal: AbortSig
     }
     const left = deadline - (await $.clock.now())
     if (left <= 0) return `${STILL_RUNNING}: ${describeAgent(agent, await $.clock.now())}`
+    // Each poll refreshes the list a running job's list_agents reads.
+    await pushRoster($)
     let answer: WaitAnswer
     try {
       answer = await waitTurn($, agent.threadId, Math.min(left, POLL_SLICE_MS), agent.msgKey)
@@ -672,7 +711,7 @@ async function awaitJob($: Engine, agentId: string | undefined, signal: AbortSig
     }
     if (answer.status === 'message') {
       await queueMessages($, agentId, answer.messages)
-      return messagesText(answer.messages.length)
+      return messagesText(answer.messages)
     }
     await settleTurn($, agent, answer)
   }
@@ -900,7 +939,17 @@ export const register: Register = (on, options) => {
   // prompt as given, header lines stripped, once the subagent's id is known.
   on('agent.spawn', async ($, e, next) => {
     const alias = aliasOfType(e.subagentType)
-    if (alias === undefined) return next(e)
+    if (alias === undefined) {
+      const spawned = await next(e)
+      await pushRoster($)
+      return spawned
+    }
+    // Agents address each other by name: a job needs one, and one name means one recent agent.
+    const name = e.name?.trim()
+    if (!name) return { deny: 'codex: give the agent a `name` (the Agent call\'s name parameter); other agents message it by that name' }
+    if (name === 'main' || (await recentAgents($)).some(agent => agent.name === name)) {
+      return { deny: `codex: the name ${name} is taken by a running or recently finished agent; pick another` }
+    }
     let input: JobInput
     let body: string
     let threadId: string
@@ -921,8 +970,9 @@ export const register: Register = (on, options) => {
       if (error) return { deny: `codex: ${error}` }
       input = {
         description: taskLabel(e),
-        // Made unique as the job is recorded (putAgent), so two spawns at once never share one.
-        name: taskLabel(e) || alias,
+        // The Agent call's name, which SendMessage and message_agent address; putAgent suffixes it
+        // in the record only when an older job holds it.
+        name,
         model,
         effort,
         sandbox,
@@ -952,6 +1002,7 @@ export const register: Register = (on, options) => {
         await patchAgent($, agent.id, () => ({ status: 'failed', error: `the Codex turn did not start: ${errorText(error)}`, turnEndedAt: now }))
         void releaseThread($, threadId)
       }
+      await pushRoster($)
       return spawned
     } finally {
       spawnsInFlight -= 1
@@ -960,8 +1011,8 @@ export const register: Register = (on, options) => {
 
   // The codex:* subagent's loop: every model request is answered here and no
   // Claude model runs. While the Codex turn runs, the answer is a codex_await
-  // call; a codex-msg message is passed on as a SendMessage to main; once the
-  // turn ended, the answer is the Codex final message, verbatim.
+  // call; a codex-msg message is passed on as a SendMessage to the agent it
+  // names, or main; once the turn ended, the answer is the Codex final message, verbatim.
   on('turn.step', async function* ($, e, next) {
     if (e.agentId === undefined || foreignAgents.has(e.agentId)) return yield* next(e)
     let agent = (await read($, agentsAtom))[e.agentId]
@@ -971,11 +1022,18 @@ export const register: Register = (on, options) => {
     }
     await reconcileAgents($)
     agent = (await read($, agentsAtom))[e.agentId]
-    const message = agent?.outbox[0]
-    if (agent && message !== undefined) {
-      // A codex-msg message goes to the main session as this agent's own SendMessage, verbatim.
-      await patchAgent($, agent.id, current => ({ outbox: current.outbox.slice(1) }))
-      return yield* toolStep(e, 'SendMessage', { to: 'main', summary: messageSummary(message), message })
+    while (agent && agent.outbox.length > 0) {
+      // A codex-msg message goes out as this agent's own SendMessage, verbatim.
+      const { text, to = 'main' } = outboxItem(agent.outbox[0] as OutboxItem | string)
+      agent = (await patchAgent($, agent.id, current => ({ outbox: current.outbox.slice(1) }))) ?? agent
+      if (to === 'main' || (await $.agent.list()).some(info => info.id === to || info.name === to)) {
+        return yield* toolStep(e, 'SendMessage', { to, summary: messageSummary(text), message: text })
+      }
+      // The engine would refuse it after the call, out of Codex's sight: Codex hears it instead.
+      await sendMessage($, agent, `Message to ${to} not delivered: no agent of this session has that name. list_agents shows the agents you can message.`).catch(error =>
+        $.ui.log(`codex: telling ${agent?.name} its message to ${to} was not delivered failed: ${errorText(error)}`),
+      )
+      agent = (await read($, agentsAtom))[e.agentId]
     }
     if (agent && !isLive(agent)) {
       const text = wrapperAnswer(agent)
@@ -996,8 +1054,11 @@ export const register: Register = (on, options) => {
     const agent = await recipient($, e.to)
     if (!agent) return next(e)
     if (!agent.threadId) return { isDelivered: false as const, reason: missingThread(agent.id) }
+    // From another agent, Codex is told whom to answer; main's messages arrive as they are.
+    const sender = e.agentId === undefined ? undefined : (await $.agent.list()).find(info => info.id === e.agentId)
+    const text = e.agentId === undefined ? e.text : fromAgent(sender?.name ?? e.agentId, e.text)
     try {
-      await sendMessage($, agent, e.text)
+      await sendMessage($, agent, text)
     } catch (error) {
       const now = await $.clock.now()
       await patchAgent($, agent.id, () => ({
@@ -1013,13 +1074,14 @@ export const register: Register = (on, options) => {
   // (SubagentHandback is left to the engine: only auto mode's classifier may allow it.)
   on('tool.check', { tool: 'SendMessage' }, async ($, e, next) => {
     if (e.tool_use_id === undefined || !relayCalls.delete(e.tool_use_id)) return next(e)
-    return { decision: 'allow' as const, reason: "codex: relays a Codex job's message to the main session, verbatim" }
+    return { decision: 'allow' as const, reason: "codex: relays a Codex job's message, verbatim" }
   })
 
   // TaskStop, or the task list's stop, kills the subagent mid codex_await: its
   // turn ends aborted, and the Codex turn under it is interrupted.
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
+    if (e.agentId !== undefined) agentEndedAt.set(e.agentId, await $.clock.now())
     if (e.agentId === undefined || e.reason !== 'aborted') return done
     const agent = (await read($, agentsAtom))[e.agentId]
     if (agent?.status === 'running' && agent.currentTurnId) {

@@ -33,7 +33,9 @@
 //             POST /rpc   {method, params, timeoutMs?} -> {result} | {error}
 //             POST /reply {id, result} | {id, error}   answers a server request
 //             POST /wait  {threadId, msgKey?, timeoutMs} long-poll for turn end or a codex-msg message
-//             POST /msg   {key, text}                  bin/codex-msg: a message from a Codex job
+//             POST /msg   {key, text, to?}             bin/codex-msg: a message from a Codex job, to an agent or main
+//             POST /roster {text}                      the plugin: the agent list list_agents answers
+//             POST /agents {key}                       bin/codex-msg: that list, as plain text
 //           While no relay is attached it buffers events (so a plugin reload
 //           loses nothing) and exits, killing codex, after GRACE_MS alone. With a
 //           relay attached it exits after IDLE_MS with no turn running and no
@@ -207,7 +209,8 @@ async function daemon(codexPath, dir) {
   const lastTurn = new Map() // threadId -> last completed turn
   const failedHolds = new Map() // threadId -> timer of a failed turn/completed held back
   const waiters = new Map() // threadId -> Set<(value) => void>
-  const mailboxes = new Map() // codex-msg key -> texts not yet read
+  const mailboxes = new Map() // codex-msg key -> {text, to?} not yet read
+  let roster = 'No agent list yet: the Claude session has not sent one.'
   const mailWaiters = new Map() // codex-msg key -> Set<(value) => void>
   const drainMail = key => {
     const messages = mailboxes.get(key) ?? []
@@ -420,13 +423,14 @@ async function daemon(codexPath, dir) {
         return sendJson(res, 200, answer)
       }
       if (url.pathname === '/msg') {
-        const { key, text } = body
+        const { key, text, to } = body
         if (typeof key !== 'string' || key === '' || typeof text !== 'string' || text.trim() === '') {
           return sendJson(res, 400, { error: { message: 'key and text are required' } })
         }
+        if (to !== undefined && (typeof to !== 'string' || to.trim() === '')) return sendJson(res, 400, { error: { message: 'to, when given, names an agent' } })
         const box = mailboxes.get(key) ?? []
         if (box.length >= MAILBOX_CAP) return sendJson(res, 429, { error: { message: `${MAILBOX_CAP} messages are already waiting to be read` } })
-        box.push(text.slice(0, MESSAGE_CAP))
+        box.push(to === undefined ? { text: text.slice(0, MESSAGE_CAP) } : { text: text.slice(0, MESSAGE_CAP), to })
         mailboxes.set(key, box)
         const set = mailWaiters.get(key)
         if (set) {
@@ -434,6 +438,16 @@ async function daemon(codexPath, dir) {
           for (const done of set) done(MAIL)
         }
         return sendJson(res, 200, { ok: true })
+      }
+      if (url.pathname === '/roster') {
+        if (typeof body.text !== 'string') return sendJson(res, 400, { error: { message: 'text is required' } })
+        roster = body.text
+        return sendJson(res, 200, { ok: true })
+      }
+      if (url.pathname === '/agents') {
+        if (typeof body.key !== 'string' || body.key === '') return sendJson(res, 400, { error: { message: 'key is required' } })
+        res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' })
+        return res.end(roster)
       }
       return sendJson(res, 404, { error: { message: 'not found' } })
     } catch (error) {
