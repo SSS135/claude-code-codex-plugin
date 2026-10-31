@@ -2,7 +2,7 @@ import type { On, SessionMessage, TurnStepChunk, TurnStepResult } from 'claude-c
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
 
-import { agentDescription, agentSpecs, aliasOf, approvalAnswer, approvalOptions, bridgeTarget, codexVersionError, configDirs, describeAgent, effectiveDefaults, effortFor, listText, MIN_CODEX_VERSION, modelEffortError, modelFor, nodeOptionPreloads, parseHeader, permissionsFor, resultText, shortCommand, TOOL_SPECS, UPDATE_HINT, withoutPreloads, wrapperAnswer } from '../hooks/model'
+import { agentDescription, agentSpecs, aliasOf, aliasOfType, approvalAnswer, approvalOptions, bridgeTarget, codexVersionError, configDirs, describeAgent, effectiveDefaults, effortFor, listText, MIN_CODEX_VERSION, modelEffortError, modelFor, nodeOptionPreloads, parseHeader, permissionsFor, resultText, shortCommand, TOOL_SPECS, UPDATE_HINT, withoutPreloads, wrapperAnswer } from '../hooks/model'
 import type { CodexAgent } from '../types'
 
 // A fake bridge: the relay's stdout is a queue the test pushes NDJSON into,
@@ -136,6 +136,9 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
     value: fake.agentList.map(agent => ({ ...agent, description: '', status: 'running' as const })),
   }))
   on('session.messages', (_$, e) => ({ value: fake.messages[(e as { agentId?: string }).agentId ?? ''] ?? [] }))
+  // $.ui.ask's AskUserQuestion is the dialog itself: allowed here, so the test engine's
+  // headless decider does not deny it before the tool.call hook below answers as the person.
+  on('tool.check', { tool: 'AskUserQuestion' }, () => ({ decision: 'allow' as const, reason: 'the person answers below' }))
   on('tool.check', () => ({ decision: 'ask' as const, reason: 'beneath' }))
   on('session.send', (_$, e) => {
     fake.delivered.push({ to: e.to, text: e.text })
@@ -891,6 +894,11 @@ test('the agent listing: sol is the default, luna for searches and easy work, as
     expect(description).toContain(`the newest ${alias[0]?.toUpperCase()}${alias.slice(1)} model`)
     expect(description).not.toMatch(/gpt-|\b\d+(?:\.\d+)*\b/)
   }
+})
+
+test('only the four aliases are Codex agent types; Object.prototype keys are not', () => {
+  for (const alias of ['luna', 'sol', 'astra', 'terra']) expect(aliasOfType(`codex:${alias}`)).toBe(alias)
+  for (const type of ['codex:constructor', 'codex:toString', 'codex:__proto__', 'codex:nobody', 'general-purpose']) expect(aliasOfType(type)).toBeUndefined()
 })
 
 test('each alias selects the newest numeric version of its family in any list order; with none the error says to update', () => {

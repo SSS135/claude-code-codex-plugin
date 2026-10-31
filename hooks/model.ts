@@ -694,7 +694,7 @@ type AgentSpec = Parameters<EngineInterface['agent']['register']>[0]
 export const aliasOfType = (subagentType: string): string | undefined => {
   if (!subagentType.startsWith(AGENT_PREFIX)) return undefined
   const alias = subagentType.slice(AGENT_PREFIX.length)
-  return alias in MODEL_ALIASES ? alias : undefined
+  return Object.hasOwn(MODEL_ALIASES, alias) ? alias : undefined
 }
 
 /** When to pick each type: the main model reads this first in the agent listing. */

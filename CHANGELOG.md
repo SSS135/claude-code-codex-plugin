@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.2
+
+Fixed:
+
+- An agent type named after a built-in object key (`codex:constructor`, `codex:toString`) is no longer taken for a Codex agent; only `codex:luna`, `codex:sol`, `codex:astra` and `codex:terra` are. Found by @tahirmajid.
+
+Changed:
+
+- The README no longer says a job costs no Claude tokens: the plugin calls no Claude model, but Claude Code's own background-agent summarizer (a small Haiku call reading the wrapper's transcript) runs for these agents as for any background subagent.
+
 ## 1.0.1
 
 Fixed:
