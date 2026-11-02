@@ -71,6 +71,8 @@ type Fake = {
   fetchErrors: Record<string, string>
   /** Makes the engine's agent list fail with this. */
   listError: string | null
+  /** Makes every store write fail with this, as a store lock another session holds does. */
+  storeError: string | null
   /** Relay starts that exit at once, before any output. */
   failStarts: number
   /** Makes $.process.run (the plugin's budget-free pauses) fail with this. */
@@ -125,6 +127,7 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
     clock: mock.clock(on, { now }),
     fetchErrors: {},
     listError: null,
+    storeError: null,
     failStarts: 0,
     processRunError: null,
     turnStartRefusals: {},
@@ -181,6 +184,7 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
   // The store, answered here so the test can read what the plugin mirrors into it.
   on('store.get', (_$, e) => ({ value: fake.store[e.key] }))
   on('store.set', (_$, e) => {
+    if (fake.storeError !== null) return { deny: fake.storeError }
     fake.store[e.key] = JSON.parse(JSON.stringify(e.value))
     return { value: undefined }
   })
@@ -1562,6 +1566,37 @@ test("a relay's fatal line refuses the spawn with its message and the daemon log
   fake.closed = true
   const refused = await $.agent.spawn(spawnInput('sleep 20'))
   expect(refused.deny).toContain('codex bridge failed: cannot run the Codex CLI /nope/codex')
+})
+
+test('a busy store lock neither fails recovery nor a spawn; the next write catches the snapshot up', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  fake.storeError = 'Lock file is already being held'
+  await start($, fake)
+  const spawned = await $.agent.spawn(spawnInput('sleep 20'))
+  expect(spawned.deny).toBeUndefined()
+  // The record and the first turn are written once the spawn hook returned.
+  await until(fake, async () => fake.disk.a1?.status === 'running', 'the job record')
+  expect(fake.store.agents).toBeUndefined()
+
+  fake.storeError = null
+  push(fake, note('item/started', { threadId: 'th-1', item: { type: 'commandExecution', command: "/bin/zsh -lc 'sleep 20'" } }))
+  await until(fake, async () => (await agentsOf(fake)).a1?.activity === '$ sleep 20', 'the snapshot')
+  done(fake)
+})
+
+test('a failed recovery is retried on the running relay by the next call, not kept until a reload', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  fake.fetchErrors['/registry/read'] = 'registry unreadable'
+  await start($, fake)
+  const refused = await $.agent.spawn(spawnInput('sleep 20'))
+  expect(refused.deny).toContain('codex recovery failed')
+
+  delete fake.fetchErrors['/registry/read']
+  const spawned = await $.agent.spawn(spawnInput('sleep 20'))
+  expect(spawned.deny).toBeUndefined()
+  // The relay that failed recovery serves the retry: no second relay starts.
+  expect(fake.spawnEnvs.length).toBe(1)
+  done(fake)
 })
 
 test('the Codex CLI version: older than the minimum is refused with the found and needed versions and the fix; newer or unknown passes', () => {

@@ -131,6 +131,8 @@ let registryAddress: string | null = null
 let recovery: { reattached: boolean; active: Record<string, string> } | null = null
 let spawnsInFlight = 0
 let isBridgeRunning = false
+/** Handles the running relay's `ready` again after its handling failed, on a new start; null otherwise. */
+let retryReady: (() => Promise<void>) | null = null
 /** The userConfig the bridge starts with; set when the module registers. */
 let bridgeSettings: Settings | null = null
 /** Threads this app-server connection is subscribed to (thread/start or thread/resume). */
@@ -156,8 +158,20 @@ let askChain: Promise<unknown> = Promise.resolve()
 
 async function afterWrite($: Engine, agents: Record<string, CodexAgent>, agent: CodexAgent): Promise<void> {
   await post($, '/registry/write', { agent })
-  // A bounded compatibility snapshot; the separate agent files are authoritative.
-  await $.store.set(STORE_KEY, trim(agents))
+  await saveSnapshot($, agents)
+}
+
+/**
+ * A bounded compatibility snapshot; the separate agent files are authoritative, so a failed
+ * write (the store lock every session shares stayed busy past the host's short retry) is only
+ * logged and the next write catches it up.
+ */
+async function saveSnapshot($: Engine, agents: Record<string, CodexAgent>): Promise<void> {
+  try {
+    await $.store.set(STORE_KEY, trim(agents))
+  } catch (error) {
+    $.ui.log(`codex: saving the job snapshot failed: ${errorText(error)}`, { to: 'debug' })
+  }
 }
 
 /** Records a new job, its name made unique among the jobs at that moment; resolves the job as written. */
@@ -294,7 +308,13 @@ async function bridgeEnv($: Engine): Promise<Record<string, string> | undefined>
 
 /** Starts the relay, unless it runs; its events reach `onEvent` in order until the daemon exits (the session ended, or it sat idle). */
 async function startBridge($: Engine): Promise<void> {
-  if (isBridgeRunning) return
+  if (isBridgeRunning) {
+    // A relay whose recovery failed still runs: retry the recovery on it, not keep its rejected start.
+    const retry = retryReady
+    retryReady = null
+    if (retry) await retry()
+    return
+  }
   const settings = bridgeSettings
   if (!settings) throw new CodexError('the codex plugin is not registered')
   isBridgeRunning = true
@@ -319,8 +339,10 @@ async function startBridge($: Engine): Promise<void> {
 }
 
 /** Spawns one relay, at once; its events reach `onEvent` in order until it exits. */
-function runRelay($: Engine, { current, argv, env }: RelayRequest): void {
-  const handle = async (line: string) => {
+function runRelay($: Engine, { current: first, argv, env }: RelayRequest): void {
+  /** This relay's start; a retried recovery replaces it. */
+  let current = first
+  const handle = async (line: string): Promise<void> => {
     let event: BridgeEvent
     try {
       event = JSON.parse(line) as BridgeEvent
@@ -339,7 +361,14 @@ function runRelay($: Engine, { current, argv, env }: RelayRequest): void {
         hasBeenReady = true
       }
     } catch (error) {
-      if (event.type === 'ready') current.reject(new CodexError(`codex recovery failed: ${errorText(error)}`))
+      if (event.type === 'ready') {
+        current.reject(new CodexError(`codex recovery failed: ${errorText(error)}`))
+        retryReady = () => {
+          current = newSocket()
+          socket = current
+          return handle(line)
+        }
+      }
       $.ui.log(`codex: handling ${clip(line, 120)} failed: ${String(error)}`, { to: 'debug' })
     }
   }
@@ -373,6 +402,7 @@ function runRelay($: Engine, { current, argv, env }: RelayRequest): void {
       $.ui.log(`codex bridge stopped: ${String(error)}`)
     } finally {
       isBridgeRunning = false
+      retryReady = null
       loadedThreads.clear()
       startedTurns.clear()
       // Settles a start still waiting for `ready` with the reason; one that was ready is unaffected.
@@ -805,7 +835,7 @@ async function reconcileAgents($: Engine, address?: string, ref?: string): Promi
     return all
   })
   for (const id of changed) await postAt($, target, '/registry/write', { agent: agents[id] })
-  if (changed.length) await $.store.set(STORE_KEY, trim(agents))
+  if (changed.length) await saveSnapshot($, agents)
 }
 
 /** Records how the turn the bridge reported ended, if the registry has not yet. */
@@ -1142,7 +1172,7 @@ async function onReady($: Engine, address: string, reattached: boolean, active: 
   for (const agent of Object.values(agents)) {
     if (agent.sessionId === sessionId) await postAt($, registryAddress ?? address, '/registry/write', { agent })
   }
-  await $.store.set(STORE_KEY, trim(agents))
+  await saveSnapshot($, agents)
 }
 
 async function onEvent($: Engine, event: BridgeEvent): Promise<void> {
