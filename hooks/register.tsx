@@ -746,6 +746,9 @@ function sendMessage($: Engine, agent: CodexAgent, text: string): Promise<'steer
  */
 const sentToCodex = new Set<string>()
 
+/** Per job, the Codex job whose wrapper sent its latest SendMessage, read when that message resumes the job's wrapper (#18). */
+const resumers = new Map<string, string>()
+
 /**
  * A resumed job's message as a new turn, unless session.send put it to Codex or a
  * turn runs: decided on the thread's queue, behind sendMessage's own work.
@@ -1405,6 +1408,12 @@ export const register: Register = (on, options) => {
       } catch (error) {
         return { deny: `codex: Codex did not take the message: ${errorText(error)}` }
       }
+      // The engine makes the sender of the resuming message the wrapper's caller.
+      const resumedBy = resumers.get(id) ?? null
+      resumers.delete(id)
+      if ((agent.resumedBy ?? null) !== resumedBy) {
+        await patchAgent($, id, () => ({ resumedBy })).catch(error => $.ui.log(`codex: recording who resumed ${agent.name} failed: ${errorText(error)}`, { to: 'debug' }))
+      }
       return next(e)
     }
     // Agents address each other by name: a job needs one, and one name means one recent agent.
@@ -1508,6 +1517,14 @@ export const register: Register = (on, options) => {
       agent = (await read($, agentsAtom))[e.agentId]
     }
     if (agent && !isLive(agent)) {
+      // A peer job's message resumed this wrapper: its hand-back and task notification go to that job's
+      // wrapper, which never reads them (#18), so main gets the result first, as this agent's message.
+      if (agent.resumedBy && !isHandedBack(agent)) {
+        const peer = agent.resumedBy
+        await patchAgent($, agent.id, () => ({ resumedBy: null }))
+        const message = `${agent.name}'s Codex turn ended. ${peer}'s message resumed ${agent.name}, so Claude Code hands its result and task notification to ${peer}, not to you. Its result:\n\n${wrapperAnswer(agent)}`
+        return yield* toolStep(e, 'SendMessage', { to: 'main', summary: `${agent.name} finished`, message })
+      }
       const isRefused = await isHandbackRefused($, e.agentId)
       // Where the engine requires it (auto mode), the report goes back through SubagentHandback;
       // where that tool is not offered, its call fails and the final text is the report.
@@ -1560,6 +1577,9 @@ export const register: Register = (on, options) => {
     try {
       sent = await sendMessage($, agent, text)
       sentToCodex.add(agent.id)
+      const senderJob = e.agentId === undefined ? undefined : (await read($, agentsAtom))[e.agentId]
+      if (senderJob) resumers.set(agent.id, senderJob.name)
+      else resumers.delete(agent.id)
     } catch (error) {
       const now = await $.clock.now()
       const isRunning = agent.status === 'running'

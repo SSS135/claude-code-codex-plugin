@@ -47,6 +47,8 @@ export type CodexAgent = {
   handedBackTurnId?: string | null
   /** When the user stopped it (TaskStop, codex_stop): other agents' messages are refused until main's SendMessage resumes it. */
   stoppedAt?: number | null
+  /** The Codex job whose relayed message last resumed the wrapper: the engine hands the wrapper's report to that job's wrapper, which never reads it, so main gets a copy (#18). */
+  resumedBy?: string | null
   startedAt: number
   updatedAt: number
   turnStartedAt: number

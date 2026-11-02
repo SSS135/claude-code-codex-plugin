@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.6
+
+Fixed:
+
+- A job whose wrapper another Codex job's message resumed reports to main (#18). Claude Code makes the sender of a resuming message the wrapper's caller, so its hand-back and task notification went to that job's wrapper, which never reads them, and main heard nothing. Such a wrapper now first sends main its result as a message, then hands back as before.
+
 ## 1.0.5
 
 Added:

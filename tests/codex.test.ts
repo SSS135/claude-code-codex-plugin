@@ -1888,6 +1888,40 @@ test('peers reach a Codex job whose wrapper ended: list_agents shows it and mess
   done(fake)
 })
 
+test("a wrapper a peer job's message resumed sends main its result before the hand-back, which the engine gives that peer (#18)", { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake)
+  await spawn($, fake, 'sleep 20', { name: 'peer_a' })
+  await spawn($, fake, 'sleep 20', { name: 'lead' })
+  // lead's wrapper handed back an interruption while Codex kept working on the same turn.
+  push(fake, note('turn/completed', { threadId: 'th-2', turn: { id: 'turn-2', status: 'interrupted' } }))
+  await until(fake, async () => fake.disk.a2?.status === 'interrupted', 'interrupted')
+  expect(String(await finalOf($, 'a2', 1))).toContain('Codex turn interrupted')
+  push(fake, note('item/started', { threadId: 'th-2', turnId: 'turn-2', item: { type: 'reasoning' } }))
+  await until(fake, async () => fake.disk.a2?.status === 'running', 'running again')
+
+  // peer_a's relayed message resumes lead's wrapper: the engine makes peer_a its caller.
+  expect(await $.session.send({ to: 'lead', text: 'ping', origin: { kind: 'model' }, agentId: 'a1' } as never)).toEqual({ isDelivered: true })
+  expect(await $.agent.spawn(spawnInput('ping', { name: 'lead', resume: { agentId: 'a2' } }))).toMatchObject({ agentId: 'a2' })
+  fake.waitQueue = [completed('turn-2', 'DONE')]
+  expect((await awaitCall($, 'a2')).result).toBe('DONE')
+
+  // Main gets the result from lead itself, then the hand-back goes to the caller as always.
+  const copy = await step($, 'a2', 2)
+  expect(copy.chunks[0]).toMatchObject({ kind: 'tool', name: 'SendMessage' })
+  expect(inputOf(copy.chunks)).toMatchObject({ to: 'main', message: expect.stringContaining("peer_a's message resumed lead") })
+  expect(String(inputOf(copy.chunks).message)).toMatch(/\n\nDONE$/)
+  expect(await finalOf($, 'a2', 3)).toBe('DONE')
+
+  // A resume from main makes main the caller again: no copy.
+  expect(await send($, 'lead', 'more')).toEqual({ isDelivered: true })
+  expect(await $.agent.spawn(spawnInput('more', { name: 'lead', resume: { agentId: 'a2' } }))).toMatchObject({ agentId: 'a2' })
+  fake.waitQueue = [completed('turn-3', 'MORE')]
+  expect((await awaitCall($, 'a2')).result).toBe('MORE')
+  expect(await finalOf($, 'a2', 4)).toBe('MORE')
+  done(fake)
+})
+
 /** Moves the clock on in steps until `pending` settles, at most `ms`: how a test lets a wrapper's waits run. */
 async function advanceUntil(fake: Fake, pending: Promise<unknown>, ms: number): Promise<void> {
   let isSettled = false
