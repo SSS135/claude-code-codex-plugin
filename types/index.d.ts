@@ -39,12 +39,14 @@ export type CodexAgent = {
   outbox: OutboxItem[]
   /** Compact lines of the current or last turn: commands, file changes, messages. */
   digest: string[]
-  /** When a turn that failed at capacity is retried with "continue"; set while the job waits for that. */
+  /** Capacity-retry marker: when a turn that failed at capacity is retried with "continue"; set while the job waits for that. */
   capacityRetryAt?: number | null
-  /** The turn that retry started: a capacity failure of it ends the job. */
-  capacityRetryTurnId?: string | null
+  /** Capacity-retry marker: the retries made so far; a turn start other than such a retry, or a normal end, resets it to 0. */
+  capacityRetries?: number
   /** The ended turn (its lastTurnId, '' for none) whose result the wrapper handed back; null once a turn runs again. */
   handedBackTurnId?: string | null
+  /** When the user stopped it (TaskStop, codex_stop): other agents' messages are refused until main's SendMessage resumes it. */
+  stoppedAt?: number | null
   startedAt: number
   updatedAt: number
   turnStartedAt: number

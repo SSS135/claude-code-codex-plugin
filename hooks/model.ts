@@ -225,6 +225,10 @@ export const sanitize = (agent: CodexAgent): CodexAgent => ({
  */
 const SNAPSHOT_BLANKS = { digest: [], activity: '', tokens: 0, warning: null }
 
+/** The fields the snapshot blanks or clips (trim), as `agent` holds them: a disk copy's beat a snapshot copy's. */
+export const snapshotLossy = (agent: CodexAgent): Partial<CodexAgent> =>
+  ({ digest: agent.digest, activity: agent.activity, tokens: agent.tokens, warning: agent.warning ?? null, lastMessage: agent.lastMessage })
+
 /**
  * The $.store snapshot: the live agents and the most recently updated, up to
  * MAX_AGENTS, each final message clipped and its busy fields blank. The registry
@@ -440,30 +444,47 @@ export function afterTurn(agent: CodexAgent, turn: Record<string, unknown>, now:
   }
 }
 
-/** How long a turn that failed at capacity waits before its retry with "continue". */
-export const CAPACITY_RETRY_MS = 30_000
+/** The wait before each retry with "continue" of a turn that failed at capacity; when the last retry fails too, the job fails. */
+export const CAPACITY_RETRY_MS = [30_000, 60_000, 120_000, 240_000]
+
+const CAPACITY_TEXT = /at capacity|overloaded|\b(?:503|529)\b/i
+
+/**
+ * Whether the turn failed because the model was at capacity: codexErrorInfo
+ * serverOverloaded or an HTTP 503/529 nested in it, capacity in its message, or in
+ * the warning Codex's `error` notification left (the turn's own error may be generic).
+ */
+export function isCapacityFailure(agent: CodexAgent, turn: Record<string, unknown>): boolean {
+  if (turn.status !== 'failed') return false
+  const error = turn.error as { message?: string; codexErrorInfo?: unknown } | null | undefined
+  return /serverOverloaded|"httpStatusCode":(?:503|529)\b/.test(JSON.stringify(error?.codexErrorInfo ?? null))
+    || CAPACITY_TEXT.test(error?.message ?? '')
+    || CAPACITY_TEXT.test(agent.warning ?? '')
+}
 
 /**
  * The agent after its turn ended. A turn that failed because the model was at
- * capacity, unless it was itself that retry, leaves the job live, waiting
- * CAPACITY_RETRY_MS for one retry with "continue" on the same thread.
+ * capacity leaves the job live, waiting CAPACITY_RETRY_MS[retries so far] for a
+ * retry with "continue" on the same thread; past the last one the job fails.
  */
 export function afterTurnEnd(agent: CodexAgent, turn: Record<string, unknown>, now: number): Partial<CodexAgent> {
-  const error = turn.error as { message?: string; codexErrorInfo?: unknown } | null | undefined
-  const isCapacity = turn.status === 'failed' && (error?.codexErrorInfo === 'serverOverloaded' || /at capacity|overloaded/i.test(error?.message ?? ''))
-  if (!isCapacity || String(turn.id) === agent.capacityRetryTurnId) return afterTurn(agent, turn, now)
+  if (!isCapacityFailure(agent, turn)) return { ...afterTurn(agent, turn, now), capacityRetries: 0 }
   // Both the turn/completed notification and a codex_await poll report the end.
   if (agent.capacityRetryAt && agent.lastTurnId === String(turn.id)) return {}
+  const retries = agent.capacityRetries ?? 0
+  const wait = CAPACITY_RETRY_MS[retries]
+  const reason = (turn.error as { message?: string } | null | undefined)?.message ?? 'the model is at capacity'
+  if (wait === undefined) return { ...afterTurn(agent, turn, now), error: `${reason} (still at capacity after ${retries} retries with "continue")` }
   return {
     status: 'starting',
     currentTurnId: null,
     lastTurnId: String(turn.id),
     lastTurnStatus: 'failed',
     activity: 'waiting to retry',
-    error: error?.message ?? 'the model is at capacity',
-    warning: `capacity: retrying with "continue" in ${CAPACITY_RETRY_MS / 1000} s`,
-    capacityRetryAt: now + CAPACITY_RETRY_MS,
-    digest: [...agent.digest, 'capacity: retrying with continue'],
+    error: reason,
+    warning: `capacity: retrying with "continue" in ${wait / 1000} s`,
+    capacityRetryAt: now + wait,
+    digest: [...agent.digest, `capacity: retry ${retries + 1} of ${CAPACITY_RETRY_MS.length} with continue in ${wait / 1000} s`],
   }
 }
 
@@ -846,7 +867,7 @@ export function resultText(agent: CodexAgent, full: boolean, now: number): strin
 
 // ------------------------------------------------------------ transcript rows
 
-export type ToolName = 'codex_list' | 'codex_result' | 'codex_await'
+export type ToolName = 'codex_list' | 'codex_result' | 'codex_stop' | 'codex_await'
 
 /** The short task label: the spawn's `description`, else its prompt's first line. */
 export const taskLabel = (input: { description?: string; prompt?: string }): string =>
@@ -882,6 +903,8 @@ export function rowResult(tool: ToolName, text: string): { main: string; dim: st
       const final = /^Final message:\n(.*)$/m.exec(text)?.[1]
       return { main: status === 'idle' ? 'done' : status, dim: final ? ` · ${firstLine(final)}` : '' }
     }
+    case 'codex_stop':
+      return { main: firstLine(text), dim: '' }
     case 'codex_await':
       return text.startsWith(STILL_RUNNING) ? { main: 'still running', dim: '' } : { main: 'done', dim: ` · ${firstLine(text)}` }
   }
@@ -914,6 +937,12 @@ export const TOOL_SPECS: ToolSpec[] = [
       properties: { id: ID_PARAM, full: { type: 'boolean', description: 'Include the turn digest.' } },
       required: ['id'],
     },
+  },
+  {
+    name: 'codex_stop',
+    description:
+      "Stop a Codex job: interrupt its running Codex turn, or cancel a turn about to start, also when its codex:* agent already ended. Other agents' messages then do not restart it; a SendMessage from the main session does.",
+    inputSchema: { type: 'object', properties: { id: ID_PARAM }, required: ['id'] },
   },
   {
     name: 'codex_await',
