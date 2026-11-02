@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.0.3
+
+Fixed:
+
+- Wrapper agents no longer fail en masse under load, losing turns (#7, #12, #14). A wrapper step whose `turn.step` hook fails or runs out of time is answered with another `codex_await` call instead of falling to the wrapper's Claude model, whose prompt now says to call `codex_await` again on an error and never to compose a message or report of its own.
+- `codex_await` rides out a bridge outage: while the relay is down or restarting it tries again every 10 s within its wait instead of ending the job. A daemon that stops mid-turn still ends the job as interrupted.
+- The relay is started from the session's `session.start` hook, so one restarted during a short hook (such as `codex_await`) is no longer killed when that hook ends. After an outage each call starts it up to 3 times.
+- Hooks wait for the bridge without spending their time budget. Agent spawns, `codex_list`, `codex_result` and `SendMessage` retry while the bridge restarts; only a refused connection is retried, so a request that reached the daemon is never sent twice.
+- Refusals say why: "the message did not reach Codex", "the Codex job did not start" and the `codex_await`, `codex_list` and `codex_result` refusals now carry the hook failure's kind and message (#11).
+- `SendMessage` to a finished or interrupted job, also one Claude Code no longer lists as an agent, starts a new turn on its thread (#8, #14). Where `SendMessage`'s hook did not start it, the resume starts the turn from the message. A resumed wrapper never hands back the previous result again; when no new turn ran, it says so.
+- Jobs whose wrapper ended stay reachable while they run or within 30 minutes of finishing: `list_agents` shows them, `message_agent` reaches them, and their names count as taken for new Agent calls.
+- The final message is no longer cut at 20,000 characters: the hand-back and `codex_result` carry it whole (#9). The 20,000-character cap on `message_agent` messages is unchanged.
+- The daemon no longer ends Codex and its running turns when the relay goes away while Claude Code still runs: it keeps them while the Claude Code process lives, and exits 20 s after that process is gone. The 10-minute idle exit (no turn running, no request) now applies with or without a relay.
+- A job started while another spawn or a cold bridge kept the plugin busy no longer stays `starting` forever: the spawn hook returns once the subagent exists and the first turn starts after it, outside the hook's time budget. When that start fails or hangs for 60 s, `codex_await` starts the turn itself; a start lost to a plugin reload ends the job as failed with the reason.
+- A relay no longer starts a second daemon over a busy one: it asks `/health` 3 times, 5 s each, and when the daemon's pid lives, waits up to 30 s more, then fails with a message to end that process. A daemon's cleanup removes only its own directory.
+
+Changed:
+
+- `codex_await`'s answer for a Codex message carries each message's recipient and full text, so the wrapper relays the real text.
+- Codex's own sub-agents (helpers a job starts with Codex's agent tools) are told to report to their lead through Codex's tools and not to use the `claude_agents` tools; only the job itself messages Claude-side agents (#10).
+- The daemon log moved from `<dir>/daemon.log` to `<dir>.log` beside the daemon directory (`/tmp/cxb-<uid>/`, on Windows `%TEMP%\cxb\`), so it survives the daemon's shutdown. It has one timestamped line per lifecycle event: relay attach and detach, the Claude Code pid watched and gone, Codex start and exit (with code and stderr tail), grace, shutdown reason, health waits and relaunches, idle exit. Over 1 MiB at launch it is cut to its last 256 KiB.
+
 ## 1.0.2
 
 Fixed:

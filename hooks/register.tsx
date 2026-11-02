@@ -13,11 +13,13 @@
 // one file); hooks/model.ts holds the pure logic it calls.
 
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, TurnStepChunk, TurnStepResult } from 'claude-code'
+import type { EngineInterface, HookFailure, Register, TurnStepChunk, TurnStepResult } from 'claude-code'
 
 import type { CodexAgent, CodexApprovals, CodexSandbox, OutboxItem } from '../types'
 import {
+  AGENT_PREFIX,
   agentSpecs,
+  aliasOf,
   aliasOfType,
   afterTurnEnd,
   approvalAnswer,
@@ -45,6 +47,11 @@ import {
   findIn,
   firstLine,
   fromAgent,
+  handBackKey,
+  isHandedBack,
+  isRecent,
+  noNewTurn,
+  sessionJob,
   RECENT_FINISHED_MS,
   rosterText,
   isLive,
@@ -110,11 +117,16 @@ const AWAIT_MS = 3_600_000
 const SETTLE_MS = 100
 /** At most this much of an await's budget goes to such short waits. */
 const SETTLE_BUDGET_MS = 5_000
+/** How long codex_await pauses (free of its budget) before it tries a bridge that could not be reached again. */
+const BRIDGE_RETRY_MS = 10_000
 
 // Module state starts over on a reload, which is right: a reload ends every
 // in-flight wait, dialog and the bridge relay along with it.
-type Socket = { promise: Promise<string>; resolve: (path: string) => void; reject: (error: Error) => void }
+/** A relay's start: `address` is its daemon's once `ready` was handled, null before. */
+type Socket = { promise: Promise<string>; resolve: (path: string) => void; reject: (error: Error) => void; address: string | null }
 let socket: Socket | null = null
+/** Whether a relay of this module was ever ready: a later one that does not come up is an outage, waited out (bridgeSocket). */
+let hasBeenReady = false
 let registryAddress: string | null = null
 let recovery: { reattached: boolean; active: Record<string, string> } | null = null
 let spawnsInFlight = 0
@@ -170,7 +182,9 @@ async function patchAgent(
   const agents = await update($, agentsAtom, all => {
     const agent = all[id]
     if (!agent) return all
-    written = sanitize({ ...agent, ...change(agent), updatedAt: Math.max(now, agent.updatedAt + 1) })
+    const next = { ...agent, ...change(agent), updatedAt: Math.max(now, agent.updatedAt + 1) }
+    // A job that runs again has no handed-back result: its next end is handed back.
+    written = sanitize(isLive(next) ? { ...next, handedBackTurnId: null } : next)
     return { ...all, [id]: written }
   })
   if (written) await afterWrite($, agents, written)
@@ -193,7 +207,66 @@ function newSocket(): Socket {
     reject = fail
   })
   promise.catch(() => undefined)
-  return { promise, resolve, reject }
+  let isSettled = false
+  const current: Socket = {
+    promise,
+    address: null,
+    resolve: path => {
+      if (!isSettled) current.address = path
+      isSettled = true
+      resolve(path)
+    },
+    reject: error => {
+      isSettled = true
+      reject(error)
+    },
+  }
+  return current
+}
+
+/** Whether the bridge runs and is ready, so a call on it does not wait for a start. */
+const isBridgeReady = () => isBridgeRunning && socket?.address != null
+
+/** How long one budget-free pause lasts (see pause). */
+const PAUSE_MS = 2_000
+
+/**
+ * Waits about `ms` inside a `$` call, which stops the hook's budget clock while it
+ * runs ($.clock.sleep would spend the budget: HookBudget). Node sleeping in a child
+ * is the one such call that waits without a server to answer it.
+ */
+async function pause($: Engine, ms: number): Promise<void> {
+  try {
+    await $.process.run([nodeBinary, '-e', `setTimeout(() => {}, ${ms})`], { timeoutMs: ms + 10_000 })
+  } catch {
+    // No node to run: a short sleep, which the budget pays, so a caller's loop does not spin.
+    await $.clock.sleep(SETTLE_MS)
+  }
+}
+
+/** The relay start a hook asked for, run by superviseRelays. */
+type RelayRequest = { current: Socket; argv: string[]; env: Record<string, string> | undefined }
+const relayRequests: RelayRequest[] = []
+/** Wakes superviseRelays for a queued request; null until session.start started it. */
+let wakeSupervisor: (() => void) | null = null
+
+/**
+ * Runs every relay start from the session.start dispatch, which returned and is never
+ * aborted after: a $.process.spawn child dies when the dispatch that spawned it aborts
+ * (its hook overran its budget or was interrupted), so a relay restarted inside a short
+ * hook such as codex_await's would die with that hook. The engine offers no spawn
+ * that outlives its dispatch; a session.start loop is the one long-lived context
+ * (process.spawn's own example: "a child for the session's life").
+ */
+async function superviseRelays($: Engine): Promise<void> {
+  for (;;) {
+    const request = relayRequests.shift()
+    if (request) {
+      runRelay($, request)
+      continue
+    }
+    await new Promise<void>(resolve => (wakeSupervisor = resolve))
+  }
 }
 
 /** The configured binary when it is on disk, else (an empty setting too) its bare name, which the spawn finds on PATH. */
@@ -235,7 +308,18 @@ async function startBridge($: Engine): Promise<void> {
   const codex = await resolveBinary($, settings.codexPath, 'codex')
   const argv = [node, `${$.plugin.root}/bin/bridge.mjs`, codex, key]
   const env = await bridgeEnv($)
+  const request = { current, argv, env }
+  // Without a supervisor (session.start did not fire after a reload) the relay is this hook's child.
+  if (!wakeSupervisor) {
+    runRelay($, request)
+    return
+  }
+  relayRequests.push(request)
+  wakeSupervisor()
+}
 
+/** Spawns one relay, at once; its events reach `onEvent` in order until it exits. */
+function runRelay($: Engine, { current, argv, env }: RelayRequest): void {
   const handle = async (line: string) => {
     let event: BridgeEvent
     try {
@@ -250,7 +334,10 @@ async function startBridge($: Engine): Promise<void> {
     }
     try {
       await onEvent($, event)
-      if (event.type === 'ready') current.resolve(event.socket)
+      if (event.type === 'ready') {
+        current.resolve(event.socket)
+        hasBeenReady = true
+      }
     } catch (error) {
       if (event.type === 'ready') current.reject(new CodexError(`codex recovery failed: ${errorText(error)}`))
       $.ui.log(`codex: handling ${clip(line, 120)} failed: ${String(error)}`, { to: 'debug' })
@@ -300,16 +387,51 @@ async function startBridge($: Engine): Promise<void> {
   })()
 }
 
-/** The daemon's socket, starting the bridge when none runs (the daemon exits when idle). */
-async function bridgeSocket($: Engine): Promise<string> {
-  await startBridge($)
-  if (!socket) throw new CodexError('the codex bridge is not running')
-  return socket.promise
+/** Relay starts one bridgeSocket call makes after an outage: a bridge that never came up refuses at once. */
+const RELAY_STARTS = 3
+
+/** Resolves the relay's daemon address once it is ready; rejects with why it stopped. Waits in pauses, free of the hook's budget. */
+async function whenReady($: Engine, current: Socket): Promise<string> {
+  while (current.address === null) await Promise.race([current.promise, pause($, PAUSE_MS)])
+  return current.address
 }
 
+/**
+ * The daemon's socket, starting the bridge when none runs (the daemon exits when idle).
+ * After an outage (a bridge that had been ready stopped) the relay is started again
+ * up to RELAY_STARTS times before the call fails.
+ */
+async function bridgeSocket($: Engine): Promise<string> {
+  for (let attempt = 1; ; attempt += 1) {
+    await startBridge($)
+    const current = socket
+    if (!current) throw new CodexError('the codex bridge is not running')
+    try {
+      return await whenReady($, current)
+    } catch (error) {
+      if (!hasBeenReady || attempt >= RELAY_STARTS) throw error
+      $.ui.log(`codex: the bridge stopped before it was ready again (${errorText(error)}); starting it again`, { to: 'debug' })
+    }
+  }
+}
+
+/** Requests one post sends while the daemon refuses connections (it is gone and a new one starts). */
+const POST_ATTEMPTS = 5
+
+/** A connection the daemon refused: the request never reached it, so sending it again cannot repeat it. */
+const isUndelivered = (error: unknown) => !(error instanceof CodexError) && /ECONNREFUSED|ENOENT/.test(errorText(error))
+
 async function post($: Engine, endpoint: string, body: unknown): Promise<Record<string, unknown>> {
-  const address = await bridgeSocket($)
-  return postAt($, endpoint.startsWith('/registry/') ? registryAddress ?? address : address, endpoint, body)
+  for (let attempt = 1; ; attempt += 1) {
+    const address = await bridgeSocket($)
+    try {
+      return await postAt($, endpoint.startsWith('/registry/') ? registryAddress ?? address : address, endpoint, body)
+    } catch (error) {
+      if (attempt >= POST_ATTEMPTS || !isUndelivered(error)) throw error
+      // The relay notices its daemon is gone and exits; the next bridgeSocket starts a new one.
+      await pause($, PAUSE_MS)
+    }
+  }
 }
 
 async function postAt($: Engine, address: string, endpoint: string, body: unknown): Promise<Record<string, unknown>> {
@@ -550,6 +672,68 @@ function sendMessage($: Engine, agent: CodexAgent, text: string): Promise<'steer
   })
 }
 
+/**
+ * Jobs whose latest SendMessage session.send already put to Codex (a steer or a
+ * new turn): the engine's resume that delivers it starts no turn of its own. Not
+ * startedTurns against lastTurnId: an interrupted job's lost turn never becomes
+ * its lastTurnId, so that check would hold its next message back.
+ */
+const sentToCodex = new Set<string>()
+
+/**
+ * A resumed job's message as a new turn, unless session.send put it to Codex or a
+ * turn runs: decided on the thread's queue, behind sendMessage's own work.
+ */
+function resumeTurn($: Engine, agent: CodexAgent, text: string): Promise<void> {
+  const isSent = sentToCodex.delete(agent.id)
+  return onThread(agent.threadId, async () => {
+    const current = (await read($, agentsAtom))[agent.id] ?? agent
+    if (isSent || text.trim() === '' || current.status === 'running') return
+    await startTurnOnQueue($, current, text)
+  })
+}
+
+/** A spawned job until its first turn started: what its record and that turn are made from. */
+type FirstTurn = { threadId: string; input: JobInput; body: string; isStarting: boolean; since: number; tries: number }
+
+/**
+ * Spawned jobs whose first turn has not started, by subagent id. The spawn hook starts it
+ * once the hook returned, free of its budget (a hook that overran it was cut between the
+ * subagent's start and the turn's, and the job stayed `starting`); codex_await starts it
+ * again when that start failed, or hangs past FIRST_TURN_GRACE_MS. A reload loses them.
+ */
+const firstTurns = new Map<string, FirstTurn>()
+/** How long a first turn's start may run, past the bridge's 25 s rpc timeout and the host's 30 s fetch cap, before codex_await takes it over. */
+const FIRST_TURN_GRACE_MS = 60_000
+
+/** Writes the spawned job's record and starts its first turn; a refused turn ends the job failed with why. */
+async function startFirstTurn($: Engine, id: string, job: FirstTurn): Promise<void> {
+  job.isStarting = true
+  job.tries += 1
+  try {
+    job.since = await $.clock.now()
+    const agent = (await read($, agentsAtom))[id] ?? (await putAgent($, await newAgent($, id, job.threadId, job.input)))
+    const started = job.tries > 1 ? startedTurns.get(job.threadId) : undefined
+    if (started !== undefined) {
+      // An earlier try's turn/start went through and only its record write was lost.
+      await patchAgent($, id, current => (current.status === 'starting' ? { status: 'running', currentTurnId: started } : {}))
+    } else {
+      try {
+        await startTurn($, agent, job.body)
+      } catch (error) {
+        // The subagent runs: it ends at once with this reason as its answer.
+        const now = await $.clock.now()
+        await patchAgent($, id, () => ({ status: 'failed', error: `the Codex turn did not start: ${errorText(error)}`, turnEndedAt: now }))
+        void releaseThread($, job.threadId)
+      }
+    }
+    if (firstTurns.get(id) === job) firstTurns.delete(id)
+    await pushRoster($)
+  } finally {
+    job.isStarting = false
+  }
+}
+
 // ------------------------------------------------------------ native agents
 
 /** Whether a subagent no record names yet is a codex:* agent (its spawn hook is still starting the turn). */
@@ -558,14 +742,20 @@ async function isCodexType($: Engine, agentId: string): Promise<boolean> {
   return info !== undefined && aliasOfType(info.type) !== undefined
 }
 
-/** The Codex job a SendMessage recipient names: an agentId, or the name the Agent call gave. */
+/**
+ * The Codex job a SendMessage recipient names: an agentId, or the name the Agent
+ * call gave. Matched over the plugin's records too, so a job the engine no longer
+ * lists (finished, or its wrapper ended) gets its turn before the engine resumes it.
+ */
 async function recipient($: Engine, to: string): Promise<CodexAgent | undefined> {
   const info = (await $.agent.list()).find(agent => agent.id === to || agent.name === to)
-  if (!(await read($, agentsAtom))[to] && (!info || aliasOfType(info.type) === undefined)) return undefined
-  await reconcileAgents($)
-  const agents = await read($, agentsAtom)
-  if (agents[to]) return agents[to]
-  return info ? agents[info.id] : undefined
+  // A listed agent of another type holds the name.
+  if (info && aliasOfType(info.type) === undefined) return undefined
+  const sessionId = await $.session.id()
+  const match = (agents: Record<string, CodexAgent>) => (info ? agents[info.id] : undefined) ?? sessionJob(agents, sessionId, to)
+  if (!info && !match(await read($, agentsAtom))) return undefined
+  await reconcileAgents($, undefined, to)
+  return match(await read($, agentsAtom))
 }
 
 const missingThread = (id: string) => `No saved Codex thread for agent ${id}. Its job record is missing; start a new codex:* agent. Do not retry codex_await.`
@@ -581,7 +771,7 @@ async function reconcileAgents($: Engine, address?: string, ref?: string): Promi
   const missing: Record<string, CodexAgent> = {}
   const held = await read($, agentsAtom)
   for (const info of native) {
-    if (held[info.id] || disk[info.id] || spawnsInFlight > 0) continue
+    if (held[info.id] || disk[info.id] || spawnsInFlight > 0 || firstTurns.has(info.id)) continue
     const alias = aliasOfType(info.type) as string
     missing[info.id] = {
       ...(await newAgent($, info.id, '', {
@@ -598,7 +788,8 @@ async function reconcileAgents($: Engine, address?: string, ref?: string): Promi
     changed = Object.keys(missing)
     const all = { ...missing, ...live }
     for (const [id, agent] of Object.entries(disk)) {
-      if (!all[id]?.threadId || agent.updatedAt > (all[id]?.updatedAt ?? -1)) all[id] = agent
+      // The same write on disk wins too: the store snapshot's copy has its final message clipped (trim).
+      if (!all[id]?.threadId || agent.updatedAt >= (all[id]?.updatedAt ?? -1)) all[id] = agent
     }
     for (const id of nativeIds) {
       const agent = all[id]
@@ -655,6 +846,15 @@ async function isHandbackRefused($: Engine, agentId: string): Promise<boolean> {
   return last?.toolUses.some(use => use.tool === HANDBACK_TOOL && use.isError === true) ?? false
 }
 
+/** Per wrapper, the report its last SubagentHandback call carried: where the engine refuses that call, the same text follows as the final answer. */
+const handBackTexts = new Map<string, string>()
+
+/** Whether `to` names a Codex job of this session that runs or finished recently, its wrapper ended or not: a peer's message reaches it. */
+async function isReachableJob($: Engine, to: string): Promise<boolean> {
+  const job = sessionJob(await read($, agentsAtom), await $.session.id(), to)
+  return job !== undefined && job.threadId !== '' && isRecent(job, await $.clock.now())
+}
+
 /** A bridge or record from before 1.0 holds bare texts, all for main. */
 const outboxItem = (item: OutboxItem | string): OutboxItem => (typeof item === 'string' ? { text: item } : item)
 
@@ -668,10 +868,12 @@ async function queueMessages($: Engine, agentId: string, messages: readonly (Out
   }))
 }
 
-const messagesText = (messages: readonly (OutboxItem | string)[]) => {
-  const to = [...new Set(messages.map(item => outboxItem(item).to ?? 'main'))]
-  return `Codex sent ${messages.length === 1 ? 'a message' : `${messages.length} messages`} for ${to.join(', ')}.`
-}
+/** codex_await's answer for codex-msg messages: each one's recipient and whole text, so even the wrapper's model relays the real text. */
+const messagesText = (messages: readonly (OutboxItem | string)[]) =>
+  messages
+    .map(outboxItem)
+    .map((item, index) => `Codex sent ${messages.length === 1 ? 'a message' : `message ${index + 1} of ${messages.length}`} for ${item.to ?? 'main'}:\n\n${item.text}`)
+    .join('\n\n')
 
 /** When each subagent's last turn ended, as turn.complete saw it: list_agents hides one finished longer ago than RECENT_FINISHED_MS. */
 const agentEndedAt = new Map<string, number>()
@@ -680,14 +882,21 @@ const agentEndedAt = new Map<string, number>()
 async function recentAgents($: Engine): Promise<{ name: string; type: string; status: string; description: string }[]> {
   const now = await $.clock.now()
   const jobs = await read($, agentsAtom)
-  return (await $.agent.list()).flatMap(info => {
+  const listed = await $.agent.list()
+  const jobStatus = (job: CodexAgent) => (isLive(job) ? 'running' : (job.lastTurnStatus ?? job.status))
+  const agents = listed.flatMap(info => {
     const job = jobs[info.id]
     const live = job ? isLive(job) : ['pending', 'running', 'waiting', 'idle'].includes(info.status)
     const endedAt = job ? job.turnEndedAt : (agentEndedAt.get(info.id) ?? 0)
     if (!live && endedAt < now - RECENT_FINISHED_MS) return []
-    const status = job ? (isLive(job) ? 'running' : (job.lastTurnStatus ?? job.status)) : info.status
+    const status = job ? jobStatus(job) : info.status
     return [{ name: info.name ?? info.id, type: info.type, status, description: info.description }]
   })
+  // This session's jobs the engine no longer lists (their wrapper ended), while they run or finished recently.
+  const sessionId = await $.session.id()
+  const listedIds = new Set(listed.map(info => info.id))
+  const orphans = Object.values(jobs).filter(job => job.sessionId === sessionId && job.threadId && !listedIds.has(job.id) && isRecent(job, now))
+  return [...agents, ...orphans.map(job => ({ name: job.name, type: `${AGENT_PREFIX}${aliasOf(job.model)}`, status: jobStatus(job), description: job.description }))]
 }
 
 /** Sends a running bridge the agents list_agents shows; a failure only leaves the previous list standing. */
@@ -709,9 +918,20 @@ async function pushRoster($: Engine): Promise<void> {
 async function awaitJob($: Engine, agentId: string | undefined, signal: AbortSignal): Promise<string> {
   if (agentId === undefined) throw new CodexError('codex_await serves codex:* agents only')
   if (!(await read($, agentsAtom))[agentId] && !(await isCodexType($, agentId))) throw new CodexError('codex_await serves codex:* agents only')
-  await reconcileAgents($)
   const startedAt = await $.clock.now()
   const deadline = startedAt + AWAIT_MS
+  // A bridge outage is waited out, never answered: the job may run on in the daemon.
+  for (;;) {
+    try {
+      await reconcileAgents($)
+      break
+    } catch (error) {
+      if (signal.aborted) throw error
+      if ((await $.clock.now()) >= deadline) return `${STILL_RUNNING}: the Codex bridge is not reachable (${errorText(error)}).`
+      $.ui.log(`codex: ${agentId} waits for the Codex bridge: ${errorText(error)}`, { to: 'debug' })
+      await pause($, BRIDGE_RETRY_MS)
+    }
+  }
   let settling = 0
   for (;;) {
     let agent = (await read($, agentsAtom))[agentId]
@@ -720,6 +940,8 @@ async function awaitJob($: Engine, agentId: string | undefined, signal: AbortSig
       await retryWithContinue($, agent)
       agent = (await read($, agentsAtom))[agentId]
     }
+    // A resumed wrapper whose message ran no new turn (one it started shows as running): never the old result again.
+    if (agent && isHandedBack(agent)) return noNewTurn(agent)
     if (agent && !isLive(agent)) {
       // A message sent just before the turn ended still goes out, ahead of the result;
       // with the bridge gone there is none to read, and the result goes alone.
@@ -732,7 +954,24 @@ async function awaitJob($: Engine, agentId: string | undefined, signal: AbortSig
       return wrapperAnswer(agent)
     }
     if (!agent || agent.status === 'starting') {
-      // The spawn hook is between the subagent's start and the Codex turn's.
+      const now = await $.clock.now()
+      const job = firstTurns.get(agentId)
+      // The spawn's start of the first turn failed, or hangs: this wrapper starts it.
+      if (job && (!job.isStarting || now - job.since >= FIRST_TURN_GRACE_MS)) {
+        // A hung start holds the thread's queue: the turn starts on a new one.
+        if (job.isStarting) threadQueues.delete(job.threadId)
+        await startFirstTurn($, agentId, job)
+        continue
+      }
+      // No start of this module will run its first turn (the plugin reloaded since its spawn): it ends failed, with why.
+      if (agent && !job && !agent.currentTurnId && !agent.capacityRetryAt && now - agent.updatedAt >= FIRST_TURN_GRACE_MS) {
+        await patchAgent($, agentId, () => ({
+          status: 'failed', lastTurnStatus: 'failed', activity: 'failed', turnEndedAt: now,
+          error: 'the Codex turn never started: its start was lost before Codex took the prompt (the plugin reloaded); start the job again',
+        }))
+        continue
+      }
+      // The spawn is between the subagent's start and the Codex turn's.
       if (settling >= SETTLE_BUDGET_MS) {
         if (agent) return `${STILL_RUNNING}: its turn is still starting.`
         throw new CodexError('codex_await serves codex:* agents only, and no Codex job runs under this agent')
@@ -743,6 +982,15 @@ async function awaitJob($: Engine, agentId: string | undefined, signal: AbortSig
     }
     const left = deadline - (await $.clock.now())
     if (left <= 0) return `${STILL_RUNNING}: ${describeAgent(agent, await $.clock.now())}`
+    // A relay that stopped starts again here; until it is back the job is not judged lost.
+    try {
+      await bridgeSocket($)
+    } catch (error) {
+      if (signal.aborted) throw error
+      $.ui.log(`codex: ${agent.name} waits for the Codex bridge: ${errorText(error)}`, { to: 'debug' })
+      await pause($, BRIDGE_RETRY_MS)
+      continue
+    }
     // Each poll refreshes the list a running job's list_agents reads.
     await pushRoster($)
     let answer: WaitAnswer
@@ -962,6 +1210,9 @@ async function runTool($: Engine, name: 'codex_list' | 'codex_result', e: unknow
 
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error))
 
+/** Why a hook failed, as its `.catch` reads it on next.error: the kind (throw, timeout, re-entry) and the message. */
+const failureText = (failure: HookFailure) => (failure.message ? `${failure.kind}: ${failure.message}` : failure.kind)
+
 export const register: Register = (on, options) => {
   const settings: Settings = {
     codexPath: String(options.codexPath),
@@ -983,6 +1234,7 @@ export const register: Register = (on, options) => {
     for (const tool of TOOL_SPECS) await $.tool.register(tool)
     for (const spec of agentSpecs(effectiveDefaults(settings, project))) await $.agent.register(spec)
     await loadFromStore($)
+    if (!wakeSupervisor) void superviseRelays($)
     await startBridge($)
     return started
   })
@@ -1000,13 +1252,20 @@ export const register: Register = (on, options) => {
       return spawned
     }
     // A resume (SendMessage to a finished job) keeps the job and its thread: session.send
-    // started the turn on it, and the resumed subagent's loop awaits that turn.
+    // started the turn on it, or, where its hook did not match the job, the message starts
+    // it here; the resumed subagent's loop awaits that turn.
     const resume = (e as { resume?: { agentId?: string } }).resume
     if (resume) {
       const id = String(resume.agentId)
       // The saved record, also when this hook does not hold it yet.
       await reconcileAgents($, undefined, id)
-      if (!(await read($, agentsAtom))[id]?.threadId) return { deny: `codex: no saved Codex thread for agent ${id}; start a new codex:* agent` }
+      const agent = (await read($, agentsAtom))[id]
+      if (!agent?.threadId) return { deny: `codex: no saved Codex thread for agent ${id}; start a new codex:* agent` }
+      try {
+        await resumeTurn($, agent, e.prompt)
+      } catch (error) {
+        return { deny: `codex: Codex did not take the message: ${errorText(error)}` }
+      }
       return next(e)
     }
     // Agents address each other by name: a job needs one, and one name means one recent agent.
@@ -1051,35 +1310,30 @@ export const register: Register = (on, options) => {
     } catch (error) {
       return { deny: `codex: ${errorText(error)}` }
     }
+    const job: FirstTurn = { threadId, input, body, isStarting: true, since: await $.clock.now(), tries: 0 }
     spawnsInFlight += 1
+    let spawned: Awaited<ReturnType<typeof next>>
     try {
-      let spawned: Awaited<ReturnType<typeof next>>
-      try {
-        spawned = await next({ ...e, background: true })
-      } catch (error) {
-        // No subagent will run on the thread.
-        void releaseThread($, threadId)
-        throw error
-      }
-      if (spawned.agentId === undefined) {
-        void releaseThread($, threadId)
-        return spawned
-      }
-      const agent = await putAgent($, await newAgent($, spawned.agentId, threadId, input))
-      try {
-        await startTurn($, agent, body)
-      } catch (error) {
-        // The subagent runs: it ends at once with this reason as its answer.
-        const now = await $.clock.now()
-        await patchAgent($, agent.id, () => ({ status: 'failed', error: `the Codex turn did not start: ${errorText(error)}`, turnEndedAt: now }))
-        void releaseThread($, threadId)
-      }
-      await pushRoster($)
-      return spawned
+      spawned = await next({ ...e, background: true })
+      if (spawned.agentId !== undefined) firstTurns.set(spawned.agentId, job)
+    } catch (error) {
+      // No subagent will run on the thread.
+      void releaseThread($, threadId)
+      throw error
     } finally {
       spawnsInFlight -= 1
     }
-  }).catch(($, e, next) => (next.called ? next(e) : { deny: 'codex: the Codex job did not start (the hook failed or ran out of time)' }))
+    if (spawned.agentId === undefined) {
+      void releaseThread($, threadId)
+      return spawned
+    }
+    // The record and the turn are written once this hook returned: no budget cuts them off
+    // with the subagent already running (codex_await finishes a start that failed or hangs).
+    void startFirstTurn($, spawned.agentId, job).catch(error =>
+      $.ui.log(`codex: starting ${input.name}'s first turn failed: ${errorText(error)}; codex_await starts it again`, { to: 'debug' }),
+    )
+    return spawned
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: `codex: the Codex job did not start (its hook failed: ${failureText(next.error)})` }))
 
   // The codex:* subagent's loop: every model request is answered here and no
   // Claude model runs. While the Codex turn runs, the answer is a codex_await
@@ -1092,13 +1346,15 @@ export const register: Register = (on, options) => {
       foreignAgents.add(e.agentId)
       return yield* next(e)
     }
+    // While the bridge (re)starts the job cannot be read: codex_await waits for it, free of a hook's budget.
+    if (!isBridgeReady()) return yield* toolStep(e, AWAIT_TOOL, {})
     await reconcileAgents($)
     agent = (await read($, agentsAtom))[e.agentId]
     while (agent && agent.outbox.length > 0) {
       // A codex-msg message goes out as this agent's own SendMessage, verbatim.
       const { text, to = 'main' } = outboxItem(agent.outbox[0] as OutboxItem | string)
       agent = (await patchAgent($, agent.id, current => ({ outbox: current.outbox.slice(1) }))) ?? agent
-      if (to === 'main' || (await $.agent.list()).some(info => info.id === to || info.name === to)) {
+      if (to === 'main' || (await $.agent.list()).some(info => info.id === to || info.name === to) || (await isReachableJob($, to))) {
         return yield* toolStep(e, 'SendMessage', { to, summary: messageSummary(text), message: text })
       }
       // The engine would refuse it after the call, out of Codex's sight: Codex hears it instead.
@@ -1108,14 +1364,32 @@ export const register: Register = (on, options) => {
       agent = (await read($, agentsAtom))[e.agentId]
     }
     if (agent && !isLive(agent)) {
-      const text = wrapperAnswer(agent)
+      const isRefused = await isHandbackRefused($, e.agentId)
       // Where the engine requires it (auto mode), the report goes back through SubagentHandback;
       // where that tool is not offered, its call fails and the final text is the report.
-      if (!(await isHandbackRefused($, e.agentId))) return yield* toolStep(e, HANDBACK_TOOL, { message: text })
+      if (!isRefused) {
+        // Never the same turn's result twice: a resume whose message started a turn finds the job running
+        // (the resume hook started it before the wrapper's loop), so one that finds it handed back ran none.
+        const report = isHandedBack(agent) ? noNewTurn(agent) : wrapperAnswer(agent)
+        handBackTexts.set(e.agentId, report)
+        const key = handBackKey(agent)
+        await patchAgent($, agent.id, () => ({ handedBackTurnId: key }))
+        return yield* toolStep(e, HANDBACK_TOOL, { message: report })
+      }
+      const text = handBackTexts.get(e.agentId) ?? wrapperAnswer(agent)
       yield { kind: 'text' as const, index: 0, text }
       yield { kind: 'stop' as const, stopReason: 'end_turn' as const, usage: null }
       return { turnId: e.turnId, index: e.index, answer: text, toolUses: [], stopReason: 'end_turn' as const, usage: null }
     }
+    return yield* toolStep(e, AWAIT_TOOL, {})
+  }).catch(async function* ($, e, next) {
+    // A step the hook had passed on (another subagent's) is answered beneath, as it was.
+    if (next.called || e.agentId === undefined || foreignAgents.has(e.agentId)) return yield* next(e)
+    const isCodex = (await read($, agentsAtom))[e.agentId] !== undefined || (await isCodexType($, e.agentId).catch(() => false))
+    if (!isCodex) return yield* next(e)
+    // A codex:* wrapper whose step failed never falls to its Claude model, which would hand back while
+    // the job runs: it waits on codex_await again, which reads the job afresh.
+    $.ui.log(`codex: ${e.agentId}'s step failed (${failureText(next.error)}); it calls codex_await again`, { to: 'debug' })
     return yield* toolStep(e, AWAIT_TOOL, {})
   })
 
@@ -1123,7 +1397,12 @@ export const register: Register = (on, options) => {
   // runs, a new turn on the thread once it ended (the delivery then resumes the
   // subagent, whose loop waits for that turn). Refused when Codex refuses it.
   on('session.send', async ($, e, next) => {
-    const agent = await recipient($, e.to)
+    let agent: CodexAgent | undefined
+    try {
+      agent = await recipient($, e.to)
+    } catch (error) {
+      return { isDelivered: false as const, reason: `codex: could not read whether ${e.to} is a Codex job (${errorText(error)}); send it again` }
+    }
     if (!agent) return next(e)
     if (!agent.threadId) return { isDelivered: false as const, reason: missingThread(agent.id) }
     // From another agent, Codex is told whom to answer; main's messages arrive as they are.
@@ -1131,16 +1410,19 @@ export const register: Register = (on, options) => {
     const text = e.agentId === undefined ? e.text : fromAgent(sender?.name ?? e.agentId, e.text)
     try {
       await sendMessage($, agent, text)
+      sentToCodex.add(agent.id)
     } catch (error) {
       const now = await $.clock.now()
+      const isRunning = agent.status === 'running'
+      // The refusal states why either way; a record that cannot be written now only loses the error line.
       await patchAgent($, agent.id, () => ({
-        ...(agent.status === 'running' ? {} : { status: 'failed' as const, currentTurnId: null, turnEndedAt: now }),
+        ...(isRunning ? {} : { status: 'failed' as const, currentTurnId: null, turnEndedAt: now }),
         error: `the Codex message did not start or resume a turn: ${errorText(error)}`,
-      }))
+      })).catch(failure => $.ui.log(`codex: recording the refused message to ${e.to} failed: ${errorText(failure)}`, { to: 'debug' }))
       return { isDelivered: false as const, reason: `Codex did not take the message: ${errorText(error)}` }
     }
     return next(e)
-  }).catch(($, e, next) => (next.called ? next(e) : { isDelivered: false as const, reason: 'codex: the message did not reach Codex' }))
+  }).catch(($, e, next) => (next.called ? next(e) : { isDelivered: false as const, reason: `codex: the message did not reach Codex (its hook failed: ${failureText(next.error)})` }))
 
   // The wrapper's SendMessage relays of Codex messages: the plugin made the call, so it allows it.
   // (SubagentHandback is left to the engine: only auto mode's classifier may allow it.)
@@ -1185,7 +1467,7 @@ export const register: Register = (on, options) => {
     } catch (error) {
       return { deny: errorText(error) }
     }
-  }).catch(($, e, next) => (next.called ? next(e) : { deny: 'codex: codex_await did not finish (its hook failed or ran out of time)' }))
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: `codex: codex_await did not finish (its hook failed: ${failureText(next.error)}); call codex_await again` }))
 
   // One hook for both: a matcher over a union of names does not type-check.
   const toolPattern = new RegExp(`^${PREFIX}(codex_list|codex_result)$`)
@@ -1195,7 +1477,7 @@ export const register: Register = (on, options) => {
     } catch (error) {
       return { deny: errorText(error) }
     }
-  }).catch(($, e, next) => (next.called ? next(e) : { deny: `codex: ${e.tool.slice(PREFIX.length)} did not finish (its hook failed or ran out of time)` }))
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: `codex: ${e.tool.slice(PREFIX.length)} did not finish (its hook failed: ${failureText(next.error)})` }))
 
   // List codex_list and codex_result up front rather than behind ToolSearch; codex_await stays behind it.
   on('tool.describe', async ($, e, next) => {

@@ -210,26 +210,34 @@ export class LineBuffer {
 // ------------------------------------------------------------ registry
 
 const MAX_DIGEST = 60
-const MAX_MESSAGE = 20_000
+/** The final message's length in the $.store snapshot alone, which holds MAX_AGENTS jobs under the store's 4 MiB. */
+const MAX_SNAPSHOT_MESSAGE = 20_000
 
+/** The record as written: the final message whole (the hand-back and codex_result carry it all), the digest bounded. */
 export const sanitize = (agent: CodexAgent): CodexAgent => ({
   ...agent,
-  lastMessage: clip(agent.lastMessage, MAX_MESSAGE),
   digest: agent.digest.slice(-MAX_DIGEST),
 })
 
-/** Keeps the live agents and the most recently updated, up to MAX_AGENTS. */
+/**
+ * The $.store snapshot: the live agents and the most recently updated, up to
+ * MAX_AGENTS, each final message clipped. The registry file holds it whole and
+ * wins over a snapshot copy of the same write (reconcileAgents).
+ */
 export const trim = (agents: Record<string, CodexAgent>): Record<string, CodexAgent> => {
   const list = Object.values(agents)
-  if (list.length <= MAX_AGENTS) return agents
-  const keep = list
+  const keep = list.length <= MAX_AGENTS ? list : list
     .sort((a, b) => Number(isLive(b)) - Number(isLive(a)) || b.updatedAt - a.updatedAt)
     .slice(0, MAX_AGENTS)
-  return Object.fromEntries(keep.map(agent => [agent.id, agent]))
+  return Object.fromEntries(keep.map(agent => [agent.id, { ...agent, lastMessage: clip(agent.lastMessage, MAX_SNAPSHOT_MESSAGE) }]))
 }
 
 export const findIn = (agents: Record<string, CodexAgent>, ref: string): CodexAgent | undefined =>
   agents[ref] ?? Object.values(agents).find(agent => agent.name === ref)
+
+/** findIn for an address: by id any job, by name only one of this session (another session's job by that name is not its agent). */
+export const sessionJob = (agents: Record<string, CodexAgent>, sessionId: string, ref: string): CodexAgent | undefined =>
+  agents[ref] ?? Object.values(agents).find(agent => agent.sessionId === sessionId && agent.name === ref)
 
 export const byThread = (agents: Record<string, CodexAgent>, threadId: string): CodexAgent | undefined =>
   Object.values(agents).find(agent => agent.threadId === threadId)
@@ -659,6 +667,7 @@ export const messagingParams = (node: string, root: string, socketPath: string, 
     'To message another agent of the session (another Codex job or a Claude subagent), pass its name as `to`: the name your task gives, or one the list_agents tool of the same server shows.',
     'Use it for a question you need answered, a blocker, an important interim finding, or coordination with a peer; never for progress updates, and never for your final result.',
     'A reply arrives as a new user message in your turn; one from another agent starts with "Message from agent <name>:". Keep working on what you can while you wait for it.',
+    `An agent that another Codex agent started (a Codex sub-agent or helper) reports to its lead through Codex's own agent tools and never calls the ${MSG_SERVER} tools.`,
   ].join('\n'),
 })
 
@@ -727,10 +736,11 @@ export function agentDescription(alias: string, defaults: Defaults): string {
 export const WRAPPER_PROMPT = [
   'You relay one OpenAI Codex job that the codex plugin has already started with your task.',
   `Call the ${AWAIT_TOOL} tool with no arguments: it blocks until the Codex turn ends. While it says the job is still running, call it again.`,
-  'When it returns a message from Codex, send exactly that text with SendMessage to the agent it names, then call it again.',
+  'When it returns a message from Codex, send exactly the message text it returned with SendMessage to the agent it names, then call it again.',
   `When it returns the result, deliver exactly that text, nothing added, removed or reworded: with ${HANDBACK_TOOL} when you have that tool, else as your reply.`,
   'Never do the task yourself and never call any other tool.',
-  'If codex_await fails, report its error and stop. Never retry a missing job or diagnose the tool yourself.',
+  `If ${AWAIT_TOOL} fails or returns an error, call it again: the Codex job may still run, and only the result it returns ends your work.`,
+  'Never compose a message, status or report of your own: relay only text the tool returned, and never diagnose the tool yourself.',
 ].join(' ')
 
 export const agentSpecs = (defaults: Defaults): AgentSpec[] =>
@@ -774,6 +784,17 @@ export function wrapperAnswer(agent: CodexAgent): string {
   return agent.lastMessage || '(Codex finished without a final message.)'
 }
 
+/** What handedBackTurnId records for the ended turn whose result the wrapper hands back. */
+export const handBackKey = (agent: CodexAgent): string => agent.lastTurnId ?? ''
+
+/** Whether the wrapper already handed back the last ended turn: a resumed wrapper waits for a new turn rather than hand it back twice. */
+export const isHandedBack = (agent: CodexAgent): boolean =>
+  !isLive(agent) && agent.handedBackTurnId != null && agent.handedBackTurnId === handBackKey(agent)
+
+/** A resumed wrapper's answer when no new Codex turn ran for the message that resumed it. */
+export const noNewTurn = (agent: CodexAgent): string =>
+  `No new Codex turn ran for this message. ${agent.name}'s last result was handed back already; codex_result ${agent.name} reads it again.`
+
 // ------------------------------------------------------------ texts
 
 export function describeAgent(agent: CodexAgent, now: number): string {
@@ -785,6 +806,9 @@ export function describeAgent(agent: CodexAgent, now: number): string {
 }
 
 export const RECENT_FINISHED_MS = 30 * 60_000
+
+/** Whether a job runs or finished within RECENT_FINISHED_MS: list_agents shows it and peers reach it, its wrapper ended or not. */
+export const isRecent = (agent: CodexAgent, now: number): boolean => isLive(agent) || agent.turnEndedAt >= now - RECENT_FINISHED_MS
 
 /** codex_list: active and recently finished session jobs, or all with `all`, newest first (`agents` sorted so). */
 export function listText(agents: readonly CodexAgent[], sessionId: string, now: number, all = false): string {

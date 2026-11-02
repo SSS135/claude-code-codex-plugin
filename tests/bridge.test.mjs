@@ -3,6 +3,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
+import { createHash, randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import http from 'node:http'
 import os from 'node:os'
@@ -51,7 +52,10 @@ async function startDaemon(env = {}) {
   fs.mkdirSync(dir)
   const fake = path.join(base, 'fake-codex.mjs')
   fs.writeFileSync(fake, FAKE_CODEX, { mode: 0o755 })
-  const daemon = spawn(process.execPath, [BRIDGE, '--daemon', fake, dir], { stdio: 'ignore', windowsHide: true, env: { ...process.env, ...env } })
+  const daemon = spawn(process.execPath, [BRIDGE, '--daemon', fake, dir], { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true, env: { ...process.env, ...env } })
+  // The daemon's stderr is its lifecycle log.
+  let log = ''
+  daemon.stderr.setEncoding('utf8').on('data', chunk => (log += chunk))
   const stop = async () => {
     daemon.kill()
     await new Promise(resolve => setTimeout(resolve, 300))
@@ -62,7 +66,7 @@ async function startDaemon(env = {}) {
     await new Promise(resolve => setTimeout(resolve, 100))
     try {
       const candidate = process.platform === 'win32' ? fs.readFileSync(file, 'utf8') : file
-      if ((await call(candidate, 'GET', '/health')).ok) return { address: candidate, daemon, stop }
+      if ((await call(candidate, 'GET', '/health')).ok) return { address: candidate, daemon, stop, dir, fake, log: () => log }
     } catch {}
   }
   await stop()
@@ -174,4 +178,140 @@ test('a relay whose Codex CLI does not run says so and what to do in its first l
   assert.equal(first.type, 'fatal')
   assert.match(first.message, /cannot run the Codex CLI .*no-such-codex-cli/)
   assert.match(first.message, /npm i -g @openai\/codex@latest/)
+})
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+const isAlive = pid => {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Opens the daemon's event stream as a relay would; resolves once the hello line came, with a detach that closes it. */
+const attach = (address, query) => new Promise((resolve, reject) => {
+  const urlPath = `/events?${query}`
+  const req = http.request(...(address.startsWith('http') ? [new URL(address + urlPath), { method: 'GET' }] : [{ socketPath: address, path: urlPath, method: 'GET' }]), res => {
+    res.once('data', () => resolve(() => req.destroy()))
+  })
+  req.on('error', reject)
+  req.end()
+})
+
+test('with no relay the daemon keeps a running turn while the named Claude Code process lives, and exits after it ends', async () => {
+  const claude = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', windowsHide: true })
+  const { address, daemon, stop, log } = await startDaemon({ CODEX_BRIDGE_GRACE_MS: '300', CODEX_BRIDGE_WATCH_MS: '100' })
+  try {
+    const exited = new Promise(resolve => daemon.on('exit', resolve))
+    await call(address, 'POST', '/rpc', { method: 'test/emit', params: { messages: [note('turn/started', { threadId: 'th-1', turn: { id: 't1' } })] } })
+    const detach = await attach(address, `relay=4242&claude=${claude.pid}`)
+    detach()
+
+    // Many grace periods with no relay: codex and the turn are still there.
+    await sleep(1500)
+    assert.equal(daemon.exitCode, null)
+    assert.deepEqual((await call(address, 'GET', '/health')).active, { 'th-1': 't1' })
+
+    claude.kill()
+    const code = await Promise.race([exited, sleep(5000).then(() => 'still running')])
+    assert.equal(code, 0)
+    const text = log()
+    assert.match(text, /relay 4242 attached/)
+    assert.match(text, new RegExp(`watching Claude Code pid ${claude.pid}`))
+    assert.match(text, /relay 4242 detached; codex and 1 running turn\(s\) stay/)
+    assert.match(text, new RegExp(`Claude Code pid ${claude.pid} is gone`))
+    assert.match(text, new RegExp(`shutting down: grace of 300 ms over: Claude Code pid ${claude.pid} is gone and no relay is attached; 1 turn\\(s\\) running`))
+    assert.match(text, /^\d{4}-\d\d-\d\dT\S+ daemon \d+: /m)
+  } finally {
+    claude.kill()
+    await stop()
+  }
+})
+
+test("a daemon's cleanup removes its directory only while the recorded pid is its own", async () => {
+  for (const isOwn of [true, false]) {
+    const { address, daemon, stop, dir, log } = await startDaemon()
+    try {
+      // Another daemon a relay started in the same directory recorded its pid there.
+      fs.writeFileSync(path.join(dir, 'pid'), String(isOwn ? daemon.pid : process.pid))
+      const exited = new Promise(resolve => daemon.on('exit', resolve))
+      await call(address, 'POST', '/rpc', { method: 'test/exit', timeoutMs: 1000 })
+      await exited
+      assert.equal(fs.existsSync(dir), !isOwn)
+      if (!isOwn) {
+        assert.equal(fs.readFileSync(path.join(dir, 'pid'), 'utf8'), String(process.pid))
+        assert.match(log(), new RegExp(`left .* in place: it belongs to pid ${process.pid}`))
+      }
+      assert.match(log(), /codex app-server exited \(code 0/)
+    } finally {
+      await stop()
+    }
+  }
+})
+
+test('a relay waits for a slow daemon whose pid lives instead of starting another over it', async () => {
+  // The relay's daemon directory: <private base>/<session key>-<BUILD>.
+  const build = createHash('sha256').update(BRIDGE).update(fs.readFileSync(BRIDGE)).digest('hex').slice(0, 8)
+  const base = process.platform === 'win32' ? path.join(os.tmpdir(), 'cxb') : `/tmp/cxb-${process.getuid()}`
+  fs.mkdirSync(base, { recursive: true, mode: 0o700 })
+  const key = randomBytes(8).toString('hex')
+  const dir = path.join(base, `${key}-${build}`)
+  fs.mkdirSync(dir, { mode: 0o700 })
+  // Its daemon: alive (this process's pid is recorded), but /health hangs while `isSlow`.
+  fs.writeFileSync(path.join(dir, 'pid'), String(process.pid))
+  let isSlow = true
+  let eventsUrl = null
+  const server = http.createServer((req, res) => {
+    if (req.url.endsWith('/health')) {
+      if (isSlow) return
+      res.writeHead(200, { 'content-type': 'application/json' })
+      return res.end(JSON.stringify({ ok: true, pid: process.pid, active: { 'th-1': 't1' } }))
+    }
+    if (req.url.includes('/events')) {
+      eventsUrl = req.url
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' })
+      return res.write(JSON.stringify({ type: 'hello', reattached: true, active: { 'th-1': 't1' } }) + '\n')
+    }
+    res.writeHead(404).end()
+  })
+  if (process.platform === 'win32') {
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+    fs.writeFileSync(path.join(dir, 's'), `http://127.0.0.1:${server.address().port}/secret`)
+  } else await new Promise(resolve => server.listen(path.join(dir, 's'), resolve))
+
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-bridge-relay-'))
+  const fake = path.join(scratch, 'fake-codex.mjs')
+  fs.writeFileSync(fake, FAKE_CODEX, { mode: 0o755 })
+  const relay = spawn(process.execPath, [BRIDGE, fake, key], {
+    stdio: ['ignore', 'pipe', 'ignore'],
+    windowsHide: true,
+    env: { ...process.env, CLAUDE_CONFIG_DIR: scratch, CODEX_BRIDGE_HEALTH_TIMEOUT_MS: '200', CODEX_BRIDGE_LIVE_WAIT_MS: '20000' },
+  })
+  const lines = []
+  readline.createInterface({ input: relay.stdout }).on('line', line => lines.push(JSON.parse(line)))
+  try {
+    await sleep(2000)
+    assert.equal(relay.exitCode, null)
+    assert.deepEqual(lines, [])
+    assert.equal(fs.readFileSync(path.join(dir, 'pid'), 'utf8'), String(process.pid))
+    const waiting = fs.readFileSync(`${dir}.log`, 'utf8')
+    assert.match(waiting, new RegExp(`relay ${relay.pid}: daemon ${process.pid} did not answer /health 3 times in 200 ms; its pid lives, waiting for it`))
+    assert.doesNotMatch(waiting, /launching/)
+
+    isSlow = false
+    for (let i = 0; i < 50 && lines.length === 0; i += 1) await sleep(100)
+    assert.equal(lines[0]?.type, 'ready')
+    assert.deepEqual(lines[0].active, { 'th-1': 't1' })
+    // The relay names its parent, here this process, as the Claude Code process to watch.
+    assert.match(eventsUrl, new RegExp(`relay=${relay.pid}&claude=${process.pid}$`))
+    assert.match(fs.readFileSync(`${dir}.log`, 'utf8'), new RegExp(`daemon ${process.pid} answered`))
+  } finally {
+    relay.kill()
+    server.closeAllConnections()
+    server.close()
+    await sleep(300)
+    for (const leftover of [dir, `${dir}.log`, scratch]) fs.rmSync(leftover, { recursive: true, force: true, maxRetries: 5 })
+  }
 })

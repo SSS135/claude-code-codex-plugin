@@ -43,6 +43,8 @@ export type CodexAgent = {
   capacityRetryAt?: number | null
   /** The turn that retry started: a capacity failure of it ends the job. */
   capacityRetryTurnId?: string | null
+  /** The ended turn (its lastTurnId, '' for none) whose result the wrapper handed back; null once a turn runs again. */
+  handedBackTurnId?: string | null
   startedAt: number
   updatedAt: number
   turnStartedAt: number

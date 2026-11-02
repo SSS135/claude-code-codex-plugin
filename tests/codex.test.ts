@@ -67,6 +67,16 @@ type Fake = {
   /** What model/list answers: [id, efforts], in any order. */
   models: [string, string[]][]
   clock: MockClock
+  /** Bridge paths whose fetch the host refuses with this message, as a dead connection does. */
+  fetchErrors: Record<string, string>
+  /** Makes the engine's agent list fail with this. */
+  listError: string | null
+  /** Relay starts that exit at once, before any output. */
+  failStarts: number
+  /** Makes $.process.run (the plugin's budget-free pauses) fail with this. */
+  processRunError: string | null
+  /** Per thread, how many of its turn/start requests the daemon refuses, as a dead connection does. */
+  turnStartRefusals: Record<string, number>
 }
 
 /** The engine resolves a path on the host's root: on Windows '/work/x' arrives as 'C:\work\x'. */
@@ -113,6 +123,11 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
       ['gpt-6.1-sol', [...EFFORTS, 'ultra']],
     ],
     clock: mock.clock(on, { now }),
+    fetchErrors: {},
+    listError: null,
+    failStarts: 0,
+    processRunError: null,
+    turnStartRefusals: {},
   }
   // The engine beneath the plugin.
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
@@ -132,7 +147,7 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
     fake.agentList.push({ id: agentId, type: e.subagentType, ...(e.name ? { name: e.name } : {}) })
     return { model: 'claude-haiku-4-5', agentId }
   })
-  on('agent.list', () => ({
+  on('agent.list', () => (fake.listError !== null ? { deny: fake.listError } : {
     value: fake.agentList.map(agent => ({ ...agent, description: '', status: 'running' as const })),
   }))
   on('session.messages', (_$, e) => ({ value: fake.messages[(e as { agentId?: string }).agentId ?? ''] ?? [] }))
@@ -171,9 +186,17 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
   })
 
   on('env.get', (_$, e) => ({ value: fake.env[e.name] }))
+  // The plugin's budget-free pauses (node sleeping in a child) end at once here.
+  on('process.run', () => (fake.processRunError !== null ? { deny: fake.processRunError } : {
+    value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
+  }))
   on('process.spawn', async function* (_$, e) {
     fake.argv = e.argv
     fake.spawnEnvs.push(e.env ? { ...e.env } : undefined)
+    if (fake.failStarts > 0) {
+      fake.failStarts -= 1
+      return { value: { code: 1, signal: null } }
+    }
     for (;;) {
       const text = fake.queue.shift()
       if (typeof text === 'object') {
@@ -211,6 +234,8 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
     // A Windows bridge's paths sit under its secret (see the Windows test).
     const path = new URL(e.url).pathname.replace(/^\/s3cret(?=\/)/, '')
     const body = JSON.parse(e.init?.body ?? '{}') as Record<string, unknown>
+    const refused = fake.fetchErrors[path]
+    if (refused !== undefined) return { deny: refused }
     let reply: unknown = { ok: true }
     if (path === '/registry/read') {
       const ids = (body.ids ?? []) as string[]
@@ -222,6 +247,11 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
     }
     if (path === '/rpc') {
       const rpc = { method: String(body.method), params: (body.params ?? {}) as Record<string, unknown> }
+      const threadId = String(rpc.params.threadId)
+      if (rpc.method === 'turn/start' && (fake.turnStartRefusals[threadId] ?? 0) > 0) {
+        fake.turnStartRefusals[threadId] -= 1
+        return { deny: 'connect ECONNREFUSED 127.0.0.1:5001' }
+      }
       fake.rpcs.push(rpc)
       const error = fake.rpcErrors[rpc.method]
       if (error !== undefined) {
@@ -305,6 +335,8 @@ const send = ($: Engine, to: string, text: string) => $.session.send({ to, text,
 async function spawn($: Engine, fake: Fake, prompt = 'sleep 20', extra: Record<string, unknown> = {}) {
   const spawned = await $.agent.spawn(spawnInput(prompt, extra))
   expect(spawned.deny).toBeUndefined()
+  // The record and the first turn are written once the spawn hook returned.
+  await fake.clock.settle()
   return (await agentsOf(fake))[spawned.agentId as string] as Record<string, unknown>
 }
 
@@ -506,7 +538,7 @@ test('a codex-msg message returns codex_await early and goes to main as the agen
   const agent = await spawn($, fake)
   const question = 'Which DB should I use?\n\n  keep *this* exactly '
   fake.waitQueue = [{ status: 'timeout' }, { status: 'message', messages: [question] }]
-  expect((await awaitCall($, 'a1')).result).toBe('Codex sent a message for main.')
+  expect((await awaitCall($, 'a1')).result).toBe(`Codex sent a message for main:\n\n${question}`)
   expect(fake.waits.map(wait => wait.msgKey)).toEqual([agent.msgKey, agent.msgKey])
 
   const relay = await step($, 'a1', 1)
@@ -556,7 +588,7 @@ test('message_agent with `to` goes to that agent as the job\'s own SendMessage; 
   await spawn($, fake, 'sleep 20', { name: 'peer_a' })
   await spawn($, fake, 'sleep 20', { name: 'peer_b' })
   fake.waitQueue = [{ status: 'message', messages: [{ text: 'ping', to: 'peer_b' }] }]
-  expect((await awaitCall($, 'a1')).result).toBe('Codex sent a message for peer_b.')
+  expect((await awaitCall($, 'a1')).result).toBe('Codex sent a message for peer_b:\n\nping')
   const relay = await step($, 'a1', 1)
   expect(inputOf(relay.chunks)).toEqual({ to: 'peer_b', summary: 'Codex: ping', message: 'ping' })
   expect(await $.tool.check({ tool: 'SendMessage', input: inputOf(relay.chunks), tool_use_id: (relay.chunks[0] as { id: string }).id, agentId: 'a1' } as never)).toMatchObject({ decision: 'allow' })
@@ -1518,6 +1550,7 @@ test('a bridge that stops before it is ready refuses the spawn with why and what
   push(fake, { type: 'ready', socket: '/tmp/cxb-test/s', reattached: false, active: {} })
   const spawned = await $.agent.spawn(spawnInput('sleep 20'))
   expect(spawned.deny).toBeUndefined()
+  await fake.clock.settle()
   expect(fake.spawnEnvs.length).toBe(2)
   expect(fake.rpcs.map(rpc => rpc.method)).toContain('turn/start')
   done(fake)
@@ -1557,5 +1590,212 @@ test('a current Codex CLI version lets the spawn run', { timeoutMs: 20_000 }, as
   await start($, fake, { codexVersion: 'codex-cli 0.162.0-alpha.2' })
   await spawn($, fake)
   expect(fake.rpcs.map(rpc => rpc.method)).toContain('turn/start')
+  done(fake)
+})
+
+/** Ends the running relay, as its process dying does, and lets the plugin see it. */
+async function stopRelay(fake: Fake) {
+  done(fake)
+  await fake.clock.settle()
+  await fake.clock.settle()
+  fake.closed = false
+}
+
+test('a wrapper step that fails, or finds the bridge restarting, waits on codex_await again and never falls to its Claude model', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake)
+  await spawn($, fake)
+  // The step's registry read fails (#7): the hook's failure is answered with codex_await, not the wrapper's model.
+  fake.fetchErrors['/registry/read'] = 'registry unreadable'
+  const failed = await step($, 'a1')
+  expect(failed.chunks[0]).toMatchObject({ kind: 'tool', name: 'mcp__codex__codex_await' })
+  delete fake.fetchErrors['/registry/read']
+
+  // The relay stopped: the step does not start or wait for a new one inside its budget; codex_await does that.
+  await stopRelay(fake)
+  const starts = fake.spawnEnvs.length
+  const restarting = await step($, 'a1', 1)
+  expect(restarting.chunks[0]).toMatchObject({ kind: 'tool', name: 'mcp__codex__codex_await' })
+  expect(fake.spawnEnvs.length).toBe(starts)
+  expect(fake.modelSteps).toBe(0)
+  push(fake, { type: 'ready', socket: '/tmp/cxb-test/s', reattached: true, active: { 'th-1': 'turn-1' } })
+  fake.waitQueue = [completed('turn-1', 'DONE')]
+  expect((await awaitCall($, 'a1')).result).toBe('DONE')
+  expect(await finalOf($, 'a1', 2)).toBe('DONE')
+  expect(fake.modelSteps).toBe(0)
+  done(fake)
+})
+
+test("a failed hook's refusal names its failure kind and message; a SendMessage whose recipient cannot be read is refused with why", { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake)
+  fake.listError = 'agent list unavailable'
+  const refused = await $.agent.spawn(spawnInput('sleep 20'))
+  expect(refused.deny).toContain('the Codex job did not start (its hook failed: throw')
+  expect(refused.deny).toContain('agent list unavailable')
+  const sent = await send($, 'someone', 'hello')
+  expect(sent).toMatchObject({ isDelivered: false })
+  expect(String((sent as { reason?: string }).reason)).toContain('agent list unavailable')
+  done(fake)
+})
+
+test('after a relay outage codex_list and a spawn wait for a new relay, past one that stops before it is ready', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake)
+  const agent = await spawn($, fake)
+  await stopRelay(fake)
+  // The next relay exits at once; the one after it comes up and reattaches to the daemon, the turn still running.
+  fake.failStarts = 1
+  push(fake, { type: 'ready', socket: '/tmp/cxb-test/s', reattached: true, active: { 'th-1': 'turn-1' } })
+  const listed = await $.tool.call({ tool: 'mcp__codex__codex_list' } as never)
+  expect(listed.deny).toBeUndefined()
+  expect(String(listed.result)).toContain(String(agent.name))
+  expect(fake.spawnEnvs.length).toBe(3)
+  expect((await agentsOf(fake)).a1).toMatchObject({ status: 'running', currentTurnId: 'turn-1' })
+
+  await stopRelay(fake)
+  fake.failStarts = 1
+  push(fake, { type: 'ready', socket: '/tmp/cxb-test/s', reattached: true, active: { 'th-1': 'turn-1' } })
+  await spawn($, fake)
+  expect(fake.spawnEnvs.length).toBe(5)
+  done(fake)
+})
+
+const startTexts = (fake: Fake) =>
+  fake.rpcs.filter(rpc => rpc.method === 'turn/start').map(rpc => (rpc.params.input as { text: string }[])[0]?.text)
+
+test('SendMessage by name to a finished job the engine no longer lists starts one turn; the resumed wrapper waits for it, never the old report', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake)
+  await spawn($, fake, 'task', { name: 'finished_job' })
+  fake.waitQueue = [completed('turn-1', 'OLD REPORT')]
+  expect((await awaitCall($, 'a1')).result).toBe('OLD REPORT')
+  expect(await finalOf($, 'a1', 1)).toBe('OLD REPORT')
+  expect((await agentsOf(fake)).a1).toMatchObject({ handedBackTurnId: 'turn-1' })
+
+  // The engine dropped the ended wrapper from its list (#8): the name still reaches the job.
+  fake.agentList = []
+  expect(await send($, 'finished_job', 'next task')).toEqual({ isDelivered: true })
+  expect(startTexts(fake)).toEqual(['task', 'next task'])
+  expect((await agentsOf(fake)).a1).toMatchObject({ status: 'running', currentTurnId: 'turn-2', handedBackTurnId: null })
+
+  // The engine then resumes the wrapper with the message: session.send's turn is not started twice.
+  expect(await $.agent.spawn(spawnInput('next task', { name: 'finished_job', resume: { agentId: 'a1' } }))).toMatchObject({ agentId: 'a1' })
+  expect(startTexts(fake)).toEqual(['task', 'next task'])
+  const waiting = await step($, 'a1', 2)
+  expect(waiting.chunks[0]).toMatchObject({ kind: 'tool', name: 'mcp__codex__codex_await' })
+  fake.waitQueue = [completed('turn-2', 'NEW REPORT')]
+  expect((await awaitCall($, 'a1')).result).toBe('NEW REPORT')
+  expect(await finalOf($, 'a1', 3)).toBe('NEW REPORT')
+  expect(fake.modelSteps).toBe(0)
+  done(fake)
+})
+
+test('a resume the send hook did not match starts the turn from its message, interrupted jobs too; a resume that runs none never hands the old report back', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake)
+  await spawn($, fake, 'task')
+  // The bridge was lost mid-turn (#14.1): the job is interrupted and its wrapper ends with why.
+  fake.waitError = 'ECONNRESET'
+  const lost = 'Codex turn interrupted: the Codex bridge was lost (ECONNRESET); a SendMessage to its agent starts a new turn on the thread'
+  expect((await awaitCall($, 'a1')).result).toBe(lost)
+  expect(await finalOf($, 'a1', 1)).toBe(lost)
+  fake.waitError = null
+
+  // The engine resumes the wrapper with the message, which no session.send hook turned into a turn.
+  expect(await $.agent.spawn(spawnInput('carry on', { resume: { agentId: 'a1' } }))).toMatchObject({ agentId: 'a1' })
+  expect(startTexts(fake)).toEqual(['task', 'carry on'])
+  expect((await agentsOf(fake)).a1).toMatchObject({ status: 'running', currentTurnId: 'turn-2' })
+  expect((await step($, 'a1', 2)).chunks[0]).toMatchObject({ kind: 'tool', name: 'mcp__codex__codex_await' })
+  fake.waitQueue = [completed('turn-2', 'CARRIED ON')]
+  expect((await awaitCall($, 'a1')).result).toBe('CARRIED ON')
+  expect(await finalOf($, 'a1', 3)).toBe('CARRIED ON')
+
+  // A resume with no message runs no turn: the wrapper says so instead of handing CARRIED ON back again.
+  expect(await $.agent.spawn(spawnInput('', { resume: { agentId: 'a1' } }))).toMatchObject({ agentId: 'a1' })
+  expect(startTexts(fake)).toHaveLength(2)
+  const none = "No new Codex turn ran for this message. job_"
+  expect(String(await finalOf($, 'a1', 4))).toContain(none)
+  expect(String((await awaitCall($, 'a1')).result)).toContain(none)
+
+  // A turn start Codex refuses refuses the resume, with why.
+  fake.rpcErrors['turn/start'] = 'thread busy'
+  expect((await $.agent.spawn(spawnInput('again', { resume: { agentId: 'a1' } }))).deny).toBe('codex: Codex did not take the message: thread busy')
+  done(fake)
+})
+
+test('a final message over 20,000 characters arrives whole in the hand-back and codex_result; only the store snapshot clips it', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake)
+  await spawn($, fake)
+  const long = `START\n${'0123456789'.repeat(3_000)}\nEND`
+  fake.waitQueue = [completed('turn-1', long)]
+  expect((await awaitCall($, 'a1')).result).toBe(long)
+  expect(await finalOf($, 'a1', 1)).toBe(long)
+  expect(String((await $.tool.call({ tool: 'mcp__codex__codex_result', id: 'a1' } as never)).result)).toContain(`Final message:\n${long}`)
+  expect(fake.disk.a1?.lastMessage).toBe(long)
+  // The store holds up to 40 jobs under its 4 MiB; the registry file, which wins over it, holds the whole text.
+  expect(String((await agentsOf(fake)).a1?.lastMessage)).toHaveLength(20_000)
+  done(fake)
+})
+
+test('peers reach a Codex job whose wrapper ended: list_agents shows it and message_agent goes to it', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake)
+  await spawn($, fake, 'sleep 20', { name: 'peer_a' })
+  await spawn($, fake, 'sleep 20', { name: 'orphan' })
+  // The orphan's wrapper ended while its Codex turn runs (#12): the engine lists it no more.
+  fake.agentList = fake.agentList.filter(info => info.name !== 'orphan')
+  fake.waitQueue = [{ status: 'message', messages: [{ text: 'ping', to: 'orphan' }] }]
+  expect((await awaitCall($, 'a1')).result).toBe('Codex sent a message for orphan:\n\nping')
+  expect(fake.rosters.at(-1)).toBe('- main (the Claude Code session that started the jobs)\n- peer_a (codex:luna, running)\n- orphan (codex:luna, running): Sleep a while')
+  const relay = await step($, 'a1', 1)
+  expect(relay.chunks[0]).toMatchObject({ kind: 'tool', name: 'SendMessage' })
+  expect(inputOf(relay.chunks)).toEqual({ to: 'orphan', summary: 'Codex: ping', message: 'ping' })
+
+  // The delivery steers the orphan's running turn.
+  expect(await $.session.send({ to: 'orphan', text: 'ping', origin: { kind: 'model' }, agentId: 'a1' } as never)).toEqual({ isDelivered: true })
+  expect(fake.rpcs.filter(rpc => rpc.method === 'turn/steer').map(rpc => rpc.params)).toMatchObject([
+    { threadId: 'th-2', expectedTurnId: 'turn-2', input: [{ text: 'Message from agent peer_a:\n\nping' }] },
+  ])
+  done(fake)
+})
+
+/** Moves the clock on in steps until `pending` settles, at most `ms`: how a test lets a wrapper's waits run. */
+async function advanceUntil(fake: Fake, pending: Promise<unknown>, ms: number): Promise<void> {
+  let isSettled = false
+  void pending.then(() => (isSettled = true), () => (isSettled = true))
+  for (let moved = 0; moved < ms && !isSettled; moved += 1_000) await fake.clock.advance(1_000)
+}
+
+test('two spawns while the bridge starts: a first turn whose start outlasts a hook budget still starts', { timeoutMs: 40_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
+  // No node for budget-free pauses, and the daemon refuses the second job's first turn/start once:
+  // its retry waits on $.clock, which a hook pays out of its budget.
+  fake.processRunError = 'node is not on PATH'
+  fake.turnStartRefusals['th-2'] = 1
+  const spawning = [$.agent.spawn(spawnInput('task a', { name: 'job_a' })), $.agent.spawn(spawnInput('task b', { name: 'job_b' }))]
+  push(fake, { type: 'ready', socket: '/tmp/cxb-test/s', reattached: false, active: {} })
+  expect((await Promise.all(spawning)).map(spawned => spawned.deny)).toEqual([undefined, undefined])
+  await fake.clock.advance(1_000)
+  const second = Object.values(await agentsOf(fake)).find(agent => agent.threadId === 'th-2')
+  expect(second).toBeDefined()
+  fake.waitQueue = [completed('turn-2', 'B DONE')]
+  const awaiting = awaitCall($, String(second?.id))
+  await advanceUntil(fake, awaiting, 120_000)
+  expect((await awaiting).result).toBe('B DONE')
+  expect(startTexts(fake).sort()).toEqual(['task a', 'task b'])
+  done(fake)
+})
+
+test('a job left starting by a start the plugin lost (a reload) ends failed with why, not still starting', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on, { agents: { a9: savedAgent('a9', { status: 'starting', currentTurnId: null, sessionId: 'session-1' }) } })
+  fake.agentList.push({ id: 'a9', type: 'codex:sol', name: 'lost_start' })
+  await start($, fake, { reattached: true })
+  const awaiting = awaitCall($, 'a9')
+  await advanceUntil(fake, awaiting, 120_000)
+  expect(String((await awaiting).result)).toContain('Codex failed: the Codex turn never started')
+  expect(fake.rpcs.filter(rpc => rpc.method === 'turn/start')).toEqual([])
   done(fake)
 })

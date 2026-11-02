@@ -7,7 +7,9 @@
 //           daemon for this Claude session and this build of the bridge (the
 //           daemon's directory is <sessionKey>-<BUILD>, so a reload onto another
 //           plugin version or path starts a new daemon instead of driving an old
-//           one), then copies its event stream to stdout as NDJSON. Only while
+//           one; a daemon that answers late while its recorded pid lives is
+//           waited for, never replaced), then copies its event stream to stdout
+//           as NDJSON, naming its parent (Claude Code) to the daemon. Only while
 //           the session's daemon of another build runs turns does it drive that
 //           one instead, until it is idle; it then stops it and exits, so no
 //           reload loses a turn. It first runs `codex --version` (a CLI that
@@ -17,7 +19,8 @@
 //           expected and harmless.
 //   launch: node bridge.mjs --launch <codexPath> <dir>
 //           Started detached by the relay; starts the daemon detached, writes
-//           its pid to <dir>/pid and exits at once. The daemon is thus never a
+//           its pid to <dir>/pid (which marks the directory as that daemon's:
+//           no other daemon removes it) and exits at once. The daemon is thus never a
 //           descendant of the relay: the engine kills the relay's whole tree
 //           when the plugin reloads, and the daemon (with codex and its
 //           running turns) must outlive that.
@@ -37,10 +40,14 @@
 //             POST /roster {text}                      the plugin: the agent list list_agents answers
 //             POST /agents {key}                       bin/codex-msg: that list, as plain text
 //           While no relay is attached it buffers events (so a plugin reload
-//           loses nothing) and exits, killing codex, after GRACE_MS alone. With a
-//           relay attached it exits after IDLE_MS with no turn running and no
-//           request in flight; the plugin starts a new one when it next needs
-//           Codex. Codex stops a thread's MCP servers (bin/codex-msg among them)
+//           loses nothing) and keeps codex and its running turns while the
+//           Claude Code process the last relay named lives (its parent, passed
+//           as /events?claude=<pid>); once that process is gone, or none was
+//           named, it exits, killing codex, after GRACE_MS alone. It exits after
+//           IDLE_MS with no turn running and no request in flight; the plugin
+//           starts a new one when it next needs Codex. Lifecycle events go, one
+//           timestamped line each, to <dir>.log beside the directory, so the log
+//           outlives the daemon that wrote it. Codex stops a thread's MCP servers (bin/codex-msg among them)
 //           when it unloads the thread, and all of them when it exits; off
 //           Windows the daemon then ends what is left of codex's process group. It also
 //           stops daemons of bridge builds that predate this lifecycle (their
@@ -57,7 +64,18 @@ import readline from 'node:readline'
 import { fileURLToPath } from 'node:url'
 import { serveRegistry } from './registry.mjs'
 
-const GRACE_MS = 20_000
+/** How long a daemon with no relay and no live Claude Code process waits for a relay before it exits. */
+const GRACE_MS = Number(process.env.CODEX_BRIDGE_GRACE_MS) || 20_000
+/** How often a daemon with no relay checks that the Claude Code process it was given still lives. */
+const WATCH_MS = Number(process.env.CODEX_BRIDGE_WATCH_MS) || 2_000
+/** A busy daemon may answer /health late: each ask waits this long, HEALTH_TRIES times, before the relay looks at its pid. */
+const HEALTH_TIMEOUT_MS = Number(process.env.CODEX_BRIDGE_HEALTH_TIMEOUT_MS) || 5_000
+const HEALTH_TRIES = 3
+/** How long a relay waits for a daemon that does not answer but whose pid lives, before it gives up (never starting another over it). */
+const LIVE_WAIT_MS = Number(process.env.CODEX_BRIDGE_LIVE_WAIT_MS) || 30_000
+/** The log beside a daemon directory is cut to its last LOG_KEEP bytes once it passes LOG_CAP. */
+const LOG_CAP = 1024 * 1024
+const LOG_KEEP = 256 * 1024
 const IDLE_MS = 10 * 60_000
 const IDLE_CHECK_MS = 60_000
 /** Half the idle window, so a daemon about to idle out itself still stops an idle legacy one. */
@@ -139,6 +157,27 @@ const isAlive = pid => {
   }
 }
 
+/** The lifecycle log of the daemon in `dir`: beside the directory, which a daemon's cleanup removes. */
+const logPathOf = dir => `${dir}.log`
+
+const stamp = text => `${new Date().toISOString()} ${text}\n`
+
+/** Appends a timestamped line to the log of the daemon in `dir` (the relay's side; the daemon writes its stderr there). */
+const note = (dir, text) => {
+  try {
+    fs.appendFileSync(logPathOf(dir), stamp(text), { mode: 0o600 })
+  } catch {}
+}
+
+/** The pid the launcher recorded for the daemon in `dir`, or null. */
+const recordedPid = dir => {
+  try {
+    return Number(fs.readFileSync(path.join(dir, 'pid'), 'utf8').trim()) || null
+  } catch {
+    return null
+  }
+}
+
 /**
  * The codex.exe of the Codex desktop app (Store package OpenAI.Codex), or null.
  * Its folder name carries the app version and WindowsApps cannot be listed, so
@@ -216,6 +255,8 @@ const sendJson = (res, status, value) => {
 async function daemon(codexPath, dir) {
   const socketPath = path.join(dir, 's')
   const secret = IS_WINDOWS ? randomBytes(16).toString('hex') : null
+  // stderr is the log beside the directory (launch opens it).
+  const log = text => process.stderr.write(stamp(`daemon ${process.pid}: ${text}`))
   const [file, leading] = codexCommand(codexPath)
   const codex = spawn(file, [...leading, 'app-server', '--listen', 'stdio://'], {
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -224,10 +265,11 @@ async function daemon(codexPath, dir) {
     detached: !IS_WINDOWS,
     windowsHide: true,
   })
-  // A codex that cannot start: say why in daemon.log (the relay reports its tail).
+  log(`started in ${dir}; codex app-server pid ${codex.pid ?? 'none'}: ${[file, ...leading].join(' ')}`)
+  // A codex that cannot start: say why in the log (the relay reports its tail).
   codex.on('error', error => {
     const hint = error.code === 'ENOENT' ? ' (not found: install the Codex app, or `npm install -g @openai/codex` for the node on PATH, or set the codexPath plugin option)' : ''
-    process.stderr.write(`cannot start ${codexPath}: ${error.message}${hint}\n`)
+    log(`cannot start ${codexPath}: ${error.message}${hint}`)
     process.exit(1)
   })
   const stderrTail = []
@@ -253,6 +295,10 @@ async function daemon(codexPath, dir) {
   }
   let buffer = []
   let subscriber = null
+  /** The pid of the attached relay, for the log. */
+  let relayPid = null
+  /** The Claude Code process the last relay named: while it lives, codex runs on with no relay attached. */
+  let claudePid = null
   let graceTimer = null
   let everSubscribed = false
   /** Requests other than /events being served, and when the daemon was last in use. */
@@ -340,13 +386,21 @@ async function daemon(codexPath, dir) {
     onCodexMessage(message)
   })
 
+  let isCleanedUp = false
   const cleanup = () => {
+    // Shutdown and codex's exit both get here.
+    if (isCleanedUp) return
+    isCleanedUp = true
+    // A relay that took this daemon for gone may have started another in the directory: that one owns it now.
+    const owner = recordedPid(dir)
+    if (owner !== process.pid) return log(`left ${dir} in place: it belongs to pid ${owner ?? 'none'}`)
     try {
       fs.rmSync(dir, { recursive: true, force: true })
     } catch {}
   }
 
-  const shutdown = async code => {
+  const shutdown = async (code, reason) => {
+    log(`shutting down: ${reason}; ${active.size} turn(s) running`)
     const stopping = stopCodex(codex)
     cleanup()
     // End the relay's stream before exiting, so the relay reads an ordinary end, not a reset.
@@ -356,12 +410,25 @@ async function daemon(codexPath, dir) {
     setTimeout(() => process.exit(code), 100)
   }
 
-  const armGrace = () => {
+  const armGrace = reason => {
     clearTimeout(graceTimer)
-    graceTimer = setTimeout(() => shutdown(0), GRACE_MS)
+    log(`${reason}; exiting in ${GRACE_MS} ms unless a relay attaches`)
+    graceTimer = setTimeout(() => shutdown(0, `grace of ${GRACE_MS} ms over: ${reason}`), GRACE_MS)
   }
 
+  const disarmGrace = () => {
+    clearTimeout(graceTimer)
+    graceTimer = null
+  }
+
+  // With no relay attached, codex and its turns stay while Claude Code runs; its exit starts the grace.
+  setInterval(() => {
+    if (subscriber || graceTimer || claudePid === null || isAlive(claudePid)) return
+    armGrace(`Claude Code pid ${claudePid} is gone and no relay is attached`)
+  }, WATCH_MS)
+
   codex.on('exit', async (code, signal) => {
+    log(`codex app-server exited (code ${code}, signal ${signal})${stderrTail.length ? `; stderr: ${stderrTail.slice(-3).join(' | ').slice(-500)}` : ''}`)
     emit({ type: 'exit', code, signal, stderrTail })
     for (const { resolve, timer } of pending.values()) {
       clearTimeout(timer)
@@ -373,14 +440,12 @@ async function daemon(codexPath, dir) {
     await stopCodex(codex)
     setTimeout(() => process.exit(code ?? 1), 100)
   })
-  for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => shutdown(0))
+  for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => shutdown(0, `${signal} received`))
 
   const init = await rpc('initialize', { clientInfo: { name: 'claude-code-codex-plugin', version: '0.1.0' } }, 30_000)
-  if (init.error) {
-    process.stderr.write(`initialize failed: ${JSON.stringify(init.error)}\n`)
-    return shutdown(1)
-  }
+  if (init.error) return shutdown(1, `initialize failed: ${JSON.stringify(init.error)}`)
   writeCodex({ method: 'initialized' })
+  log(`codex initialized${init.result?.userAgent ? ` (${init.result.userAgent})` : ''}`)
 
   const server = http.createServer(async (req, res) => {
     try {
@@ -402,8 +467,16 @@ async function daemon(codexPath, dir) {
         return sendJson(res, 200, { ok: true, pid: process.pid, codexPid: codex.pid, build: BUILD, active: Object.fromEntries(active) })
       }
       if (req.method === 'GET' && url.pathname === '/events') {
+        const attaching = Number(url.searchParams.get('relay')) || null
+        log(`relay ${attaching ?? '?'} attached${subscriber ? `, replacing relay ${relayPid ?? '?'}` : ''}`)
         if (subscriber) subscriber.end()
-        clearTimeout(graceTimer)
+        disarmGrace()
+        relayPid = attaching
+        const named = Number(url.searchParams.get('claude')) || null
+        if (named !== null && named !== claudePid) {
+          claudePid = named
+          log(`watching Claude Code pid ${claudePid}`)
+        }
         res.writeHead(200, { 'content-type': 'application/x-ndjson' })
         res.write(JSON.stringify({ type: 'hello', reattached: everSubscribed, active: Object.fromEntries(active) }) + '\n')
         for (const event of outstanding.values()) res.write(JSON.stringify(event) + '\n')
@@ -412,10 +485,10 @@ async function daemon(codexPath, dir) {
         subscriber = res
         everSubscribed = true
         res.on('close', () => {
-          if (subscriber === res) {
-            subscriber = null
-            armGrace()
-          }
+          if (subscriber !== res) return
+          subscriber = null
+          if (claudePid !== null && isAlive(claudePid)) log(`relay ${attaching ?? '?'} detached; codex and ${active.size} running turn(s) stay while Claude Code pid ${claudePid} lives`)
+          else armGrace(`relay ${attaching ?? '?'} detached and ${claudePid === null ? 'no Claude Code pid was given' : `Claude Code pid ${claudePid} is gone`}`)
         })
         return
       }
@@ -496,7 +569,7 @@ async function daemon(codexPath, dir) {
   if (secret) {
     server.listen(0, '127.0.0.1', () => {
       fs.writeFileSync(socketPath, `http://127.0.0.1:${server.address().port}/${secret}`)
-      armGrace()
+      armGrace('no relay attached yet')
     })
   } else {
     try {
@@ -504,7 +577,7 @@ async function daemon(codexPath, dir) {
     } catch {}
     server.listen(socketPath, () => {
       fs.chmodSync(socketPath, 0o600)
-      armGrace()
+      armGrace('no relay attached yet')
     })
   }
 
@@ -523,13 +596,13 @@ async function daemon(codexPath, dir) {
       legacyIdleSince.set(name, since)
       if (now - since < LEGACY_IDLE_MS) continue
       legacyIdleSince.delete(name)
-      if (stopDaemon(path.join(base, name), health)) process.stderr.write(`stopped idle daemon ${name} (pid ${health.pid}) of an older bridge build\n`)
+      if (stopDaemon(path.join(base, name), health)) log(`stopped idle daemon ${name} (pid ${health.pid}) of an older bridge build`)
     }
   }
   setInterval(() => {
     if (active.size > 0 || inFlight > 0) lastUse = Date.now()
-    else if (subscriber && Date.now() - lastUse >= IDLE_MS) shutdown(0)
-    stopIdleLegacy().catch(error => process.stderr.write(`legacy daemon sweep failed: ${error.message}\n`))
+    else if (Date.now() - lastUse >= IDLE_MS) shutdown(0, `idle: no turn ran and no request came for ${IDLE_MS / 60_000} min`)
+    stopIdleLegacy().catch(error => log(`legacy daemon sweep failed: ${error.message}`))
   }, IDLE_CHECK_MS)
 }
 
@@ -560,21 +633,55 @@ const request = (socketPath, method, urlPath, timeoutMs) =>
     req.end()
   })
 
+/** A daemon's /health answer; throws when none comes (`code` ECONNREFUSED: nothing listens there). */
+const askHealth = async socketPath => {
+  const res = await request(socketPath, 'GET', '/health', HEALTH_TIMEOUT_MS)
+  res.setEncoding('utf8')
+  let text = ''
+  for await (const chunk of res) text += chunk
+  if (res.statusCode !== 200) throw new Error(`status ${res.statusCode}`)
+  return JSON.parse(text)
+}
+
 /** A daemon's /health answer, or null when none answers on the socket. */
 const readHealth = async socketPath => {
   if (!socketPath) return null
   try {
-    const res = await request(socketPath, 'GET', '/health', 1000)
-    res.setEncoding('utf8')
-    let text = ''
-    for await (const chunk of res) text += chunk
-    return res.statusCode === 200 ? JSON.parse(text) : null
+    return await askHealth(socketPath)
   } catch {
     return null
   }
 }
 
-const isHealthy = async socketPath => (await readHealth(socketPath)) !== null
+/**
+ * Whether the daemon in `dir` answers, asked up to `tries` times: `up`;
+ * `refused` when nothing listens at its address (it is gone, even if its pid
+ * was reused); `silent` when it has no address yet or did not answer in time.
+ */
+const probe = async (dir, tries) => {
+  for (let i = 0; i < tries; i += 1) {
+    const address = addressOf(dir)
+    try {
+      if (address) {
+        await askHealth(address)
+        return 'up'
+      }
+    } catch (error) {
+      if (error.code === 'ECONNREFUSED') return 'refused'
+    }
+  }
+  return 'silent'
+}
+
+/** Waits up to `ms` for the daemon in `dir` (pid `pid`) to answer: `up`, `gone` (it exited or stopped listening) or `timeout`. */
+const untilUp = async (dir, pid, ms) => {
+  for (const deadline = Date.now() + ms; ; await new Promise(resolve => setTimeout(resolve, 100))) {
+    const state = await probe(dir, 1)
+    if (state === 'up') return 'up'
+    if (state === 'refused' || !isAlive(pid)) return 'gone'
+    if (Date.now() > deadline) return 'timeout'
+  }
+}
 
 const isBusy = health => Object.keys(health?.active ?? {}).length > 0
 
@@ -585,6 +692,7 @@ const stopDaemon = (dir, health) => {
     recorded = fs.readFileSync(path.join(dir, 'pid'), 'utf8').trim()
   } catch {}
   if (recorded !== String(health.pid)) return false
+  note(dir, `pid ${process.pid} (build ${BUILD}) stopped daemon ${health.pid} of another bridge build`)
   stopTree(health.pid)
   // A daemon stopped by force (Windows) cleans up nothing itself.
   fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 })
@@ -594,7 +702,7 @@ const stopDaemon = (dir, health) => {
 /** This session's live daemon of another bridge build (a plugin reload onto another version or path, or a legacy one): `{dir, health}`, or null. */
 const otherDaemon = async (base, key) => {
   for (const name of fs.readdirSync(base)) {
-    if ((name !== key && !name.startsWith(`${key}-`)) || name === `${key}-${BUILD}`) continue
+    if ((name !== key && !name.startsWith(`${key}-`)) || name === `${key}-${BUILD}` || name.endsWith('.log')) continue
     const health = await readHealth(addressOf(path.join(base, name)))
     if (health) return { dir: path.join(base, name), health }
   }
@@ -655,35 +763,49 @@ async function relay(codexPath, sessionKey) {
   const base = privateBase()
   const dir = path.join(base, `${key}-${BUILD}`)
 
-  const other = (await isHealthy(addressOf(dir))) ? null : await otherDaemon(base, key)
+  const logTail = () => {
+    try {
+      return fs.readFileSync(logPathOf(dir), 'utf8').slice(-2000)
+    } catch {
+      return ''
+    }
+  }
+  const me = `relay ${process.pid}`
+
+  let state = await probe(dir, HEALTH_TRIES)
+  const other = state === 'up' ? null : await otherDaemon(base, key)
   // A reload onto another build while turns run on the old build's daemon: drive that one, so no turn is lost.
   const target = isBusy(other?.health) ? other.dir : dir
   if (target !== dir) drain(other)
-  else if (!(await isHealthy(addressOf(dir)))) {
-    // An idle one would only hold threads this build's daemon must resume.
-    if (other) stopDaemon(other.dir, other.health)
-    // Retries: on Windows an exiting daemon may still hold its log open for a moment.
-    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 })
-    fs.mkdirSync(dir, { mode: 0o700 })
-    const launcher = spawn(process.execPath, [SELF, '--launch', codexPath, dir], { detached: true, stdio: 'ignore', windowsHide: true })
-    await new Promise(resolve => launcher.on('exit', resolve))
-    const daemonPid = Number(fs.readFileSync(path.join(dir, 'pid'), 'utf8'))
-    const deadline = Date.now() + 30_000
-    while (!(await isHealthy(addressOf(dir)))) {
-      const isRunning = isAlive(daemonPid)
-      if (!isRunning || Date.now() > deadline) {
-        let logTail = ''
-        try {
-          logTail = fs.readFileSync(path.join(dir, 'daemon.log'), 'utf8').slice(-2000)
-        } catch {}
-        await fail(!isRunning ? 'the daemon exited' : 'daemon did not start in 30 s', logTail)
+  else if (state !== 'up') {
+    // A daemon whose pid lives but that does not answer is busy, not gone: starting another over it would lose its turns.
+    const owner = recordedPid(dir)
+    if (state === 'silent' && owner !== null && isAlive(owner)) {
+      note(dir, `${me}: daemon ${owner} did not answer /health ${HEALTH_TRIES} times in ${HEALTH_TIMEOUT_MS} ms; its pid lives, waiting for it`)
+      state = await untilUp(dir, owner, LIVE_WAIT_MS)
+      note(dir, `${me}: daemon ${owner} ${state === 'up' ? 'answered' : state === 'gone' ? 'is gone' : `still has not answered after ${LIVE_WAIT_MS} ms; not starting another over it`}`)
+      if (state === 'timeout') await fail(`the daemon (pid ${owner}) runs but has not answered for ${(HEALTH_TRIES * HEALTH_TIMEOUT_MS + LIVE_WAIT_MS) / 1000} s; the next codex call tries again. If it stays stuck, end that process.`, logTail())
+    }
+    if (state !== 'up') {
+      note(dir, `${me}: ${owner === null ? 'no daemon' : `daemon ${owner} is gone (${state})`}; launching one for Codex ${version ?? '(unknown version)'}`)
+      // An idle one would only hold threads this build's daemon must resume.
+      if (other) stopDaemon(other.dir, other.health)
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 })
+      fs.mkdirSync(dir, { mode: 0o700 })
+      const launcher = spawn(process.execPath, [SELF, '--launch', codexPath, dir], { detached: true, stdio: 'ignore', windowsHide: true })
+      await new Promise(resolve => launcher.on('exit', resolve))
+      const daemonPid = recordedPid(dir)
+      const started = daemonPid === null ? 'gone' : await untilUp(dir, daemonPid, 30_000)
+      if (started !== 'up') {
+        note(dir, `${me}: daemon ${daemonPid} ${started === 'gone' ? 'exited' : 'did not start in 30 s'}`)
+        await fail(started === 'gone' ? 'the daemon exited' : 'daemon did not start in 30 s', logTail())
       }
-      await new Promise(resolve => setTimeout(resolve, 100))
     }
   }
 
   const socketPath = addressOf(target)
-  const res = await request(socketPath, 'GET', '/events', 0)
+  // The relay's parent is Claude Code itself: the daemon keeps codex while that process lives, relay or not.
+  const res = await request(socketPath, 'GET', `/events?relay=${process.pid}&claude=${parent}`, 0)
   res.setEncoding('utf8')
   const lines = readline.createInterface({ input: res })
   let first = true
@@ -700,7 +822,17 @@ async function relay(codexPath, sessionKey) {
 }
 
 function launch(codexPath, dir) {
-  const log = fs.openSync(path.join(dir, 'daemon.log'), 'a', 0o600)
+  try {
+    const size = fs.statSync(logPathOf(dir)).size
+    if (size > LOG_CAP) {
+      const kept = Buffer.alloc(LOG_KEEP)
+      const fd = fs.openSync(logPathOf(dir), 'r')
+      fs.readSync(fd, kept, 0, LOG_KEEP, size - LOG_KEEP)
+      fs.closeSync(fd)
+      fs.writeFileSync(logPathOf(dir), kept)
+    }
+  } catch {}
+  const log = fs.openSync(logPathOf(dir), 'a', 0o600)
   const daemonChild = spawn(process.execPath, [SELF, '--daemon', codexPath, dir], { detached: true, stdio: ['ignore', log, log], windowsHide: true })
   fs.writeFileSync(path.join(dir, 'pid'), String(daemonChild.pid), { mode: 0o600 })
   daemonChild.unref()
