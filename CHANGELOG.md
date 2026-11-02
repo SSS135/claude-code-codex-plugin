@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.4
+
+Fixed:
+
+- A `Codex(...)` row in the transcript has the blank line above it that native tool rows have.
+
 ## 1.0.3
 
 Fixed:

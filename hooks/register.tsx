@@ -1497,7 +1497,8 @@ export const register: Register = (on, options) => {
       const result = isRunning || isInterrupted || isErrored ? null : rowResult(tool, text)
       const dot = isErrored || isInterrupted ? 'error' : isRunning ? 'inactive' : 'success'
       return (
-        <Box flexDirection="column">
+        // The blank line above it that native tool rows draw.
+        <Box flexDirection="column" marginTop={1}>
           <Text wrap="truncate-end">
             <Text color={dot}>{DOT} </Text>
             <Text bold>Codex</Text>({rowArgs(tool, (e.props.input ?? {}) as Record<string, unknown>)})
