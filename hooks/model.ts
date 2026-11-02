@@ -220,16 +220,31 @@ export const sanitize = (agent: CodexAgent): CodexAgent => ({
 })
 
 /**
+ * Fields a turn updates many times and recovery never reads: the snapshot holds them
+ * empty, so the store (one lock every session shares) is not rewritten for them.
+ */
+const SNAPSHOT_BLANKS = { digest: [], activity: '', tokens: 0, warning: null }
+
+/**
  * The $.store snapshot: the live agents and the most recently updated, up to
- * MAX_AGENTS, each final message clipped. The registry file holds it whole and
- * wins over a snapshot copy of the same write (reconcileAgents).
+ * MAX_AGENTS, each final message clipped and its busy fields blank. The registry
+ * file holds it whole and wins over a snapshot copy of the same write (reconcileAgents).
  */
 export const trim = (agents: Record<string, CodexAgent>): Record<string, CodexAgent> => {
   const list = Object.values(agents)
   const keep = list.length <= MAX_AGENTS ? list : list
     .sort((a, b) => Number(isLive(b)) - Number(isLive(a)) || b.updatedAt - a.updatedAt)
     .slice(0, MAX_AGENTS)
-  return Object.fromEntries(keep.map(agent => [agent.id, { ...agent, lastMessage: clip(agent.lastMessage, MAX_SNAPSHOT_MESSAGE) }]))
+  return Object.fromEntries(keep.map(agent => [agent.id, { ...agent, ...SNAPSHOT_BLANKS, lastMessage: clip(agent.lastMessage, MAX_SNAPSHOT_MESSAGE) }]))
+}
+
+/**
+ * Whether a write changes what recovery reads (status, turn ids, thread, session, hand-back, outbox...).
+ * The latest message alone does not count: the snapshot written as the turn ends carries its final one.
+ */
+export const snapshotChanged = (before: CodexAgent, after: CodexAgent): boolean => {
+  const key = (agent: CodexAgent) => JSON.stringify({ ...agent, ...SNAPSHOT_BLANKS, lastMessage: '', updatedAt: 0 })
+  return key(before) !== key(after)
 }
 
 export const findIn = (agents: Record<string, CodexAgent>, ref: string): CodexAgent | undefined =>

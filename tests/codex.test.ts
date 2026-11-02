@@ -424,12 +424,12 @@ test('a codex:* spawn starts the Codex turn with the exact prompt, keyed by the 
 
   push(fake, note('turn/started', { threadId: 'th-1', turn: { id: 'turn-1' } }))
   push(fake, note('item/started', { threadId: 'th-1', item: { type: 'commandExecution', command: "/bin/zsh -lc 'sleep 20'" } }))
-  await until(fake, async () => (await agentsOf(fake)).a1?.activity === '$ sleep 20', 'activity')
+  await until(fake, async () => fake.disk.a1?.activity === '$ sleep 20', 'activity')
   push(fake, note('item/completed', { threadId: 'th-1', item: { type: 'commandExecution', command: "/bin/zsh -lc 'sleep 20'", exitCode: 0, status: 'completed' } }))
   push(fake, note('item/completed', { threadId: 'th-1', item: { type: 'agentMessage', text: 'DONE', phase: 'final_answer' } }))
   push(fake, note('thread/tokenUsage/updated', { threadId: 'th-1', tokenUsage: { total: { totalTokens: 1234 } } }))
-  await until(fake, async () => (await agentsOf(fake)).a1?.tokens === 1234, 'tokens')
-  expect((await agentsOf(fake)).a1?.digest).toEqual(['$ sleep 20 -> exit 0', 'answer: DONE'])
+  await until(fake, async () => fake.disk.a1?.tokens === 1234, 'tokens')
+  expect(fake.disk.a1?.digest).toEqual(['$ sleep 20 -> exit 0', 'answer: DONE'])
   done(fake)
 })
 
@@ -557,7 +557,7 @@ test('a codex-msg message returns codex_await early and goes to main as the agen
   expect(await check(relayId)).toMatchObject({ decision: 'ask' })
   expect(await check('toolu_other')).toMatchObject({ decision: 'ask' })
   expect((await agentsOf(fake)).a1?.outbox).toEqual([])
-  expect((await agentsOf(fake)).a1?.digest).toEqual(['message to main: Which DB should I use?'])
+  expect(fake.disk.a1?.digest).toEqual(['message to main: Which DB should I use?'])
 
   // Back to waiting; a message sent just before the turn ended goes out ahead of the result.
   expect((await step($, 'a1', 2)).result.toolUses[0]?.name).toBe('mcp__codex__codex_await')
@@ -596,7 +596,7 @@ test('message_agent with `to` goes to that agent as the job\'s own SendMessage; 
   const relay = await step($, 'a1', 1)
   expect(inputOf(relay.chunks)).toEqual({ to: 'peer_b', summary: 'Codex: ping', message: 'ping' })
   expect(await $.tool.check({ tool: 'SendMessage', input: inputOf(relay.chunks), tool_use_id: (relay.chunks[0] as { id: string }).id, agentId: 'a1' } as never)).toMatchObject({ decision: 'allow' })
-  expect((await agentsOf(fake)).a1?.digest).toEqual(['message to peer_b: ping'])
+  expect(fake.disk.a1?.digest).toEqual(['message to peer_b: ping'])
 
   // The engine delivers it from a1's loop: Codex peer_b reads who wrote.
   expect(await $.session.send({ to: 'peer_b', text: 'ping', origin: { kind: 'model' }, agentId: 'a1' } as never)).toEqual({ isDelivered: true })
@@ -851,8 +851,8 @@ test('an approval asks the person and posts the reply; a dismissed dialog declin
 
   // Codex's reviewer (approvals: auto) is recorded too.
   push(fake, note('item/autoApprovalReview/completed', { threadId: 'th-1', review: { status: 'approved', riskLevel: 'low', rationale: 'benign' }, action: { type: 'command', command: "/bin/zsh -lc 'echo hi > ~/x'" } }))
-  await until(fake, async () => ((await agentsOf(fake)).a1?.digest as string[]).length === 5, 'review digest')
-  expect((await agentsOf(fake)).a1?.digest).toEqual([
+  await until(fake, async () => (fake.disk.a1?.digest as string[]).length === 5, 'review digest')
+  expect(fake.disk.a1?.digest).toEqual([
     'approval: $ touch /x -> approved by user (once)',
     'approval: file change -> declined by user',
     'approval: $ ls -> approved by user (session)',
@@ -1295,8 +1295,8 @@ test('a model-capacity error is a warning: the job runs on to its real end', { t
   await spawn($, fake)
   push(fake, note('error', { threadId: 'th-1', turnId: 'turn-1', willRetry: false, error: { message: CAPACITY } }))
   push(fake, note('item/started', { threadId: 'th-1', turnId: 'turn-1', item: { type: 'commandExecution', command: 'blender -b' } }))
-  await until(fake, async () => (await agentsOf(fake)).a1?.warning === CAPACITY, 'the warning')
-  expect((await agentsOf(fake)).a1).toMatchObject({ status: 'running', error: null })
+  await until(fake, async () => fake.disk.a1?.warning === CAPACITY, 'the warning')
+  expect(fake.disk.a1).toMatchObject({ status: 'running', error: null })
   expect(String((await $.tool.call({ tool: 'mcp__codex__codex_list' } as never)).result)).toContain(`running 0s, 0 tok: $ blender -b (warning: ${CAPACITY})`)
   expect((await step($, 'a1')).chunks[0]).toMatchObject({ kind: 'tool', name: 'mcp__codex__codex_await' })
   push(fake, finished('DONE'))
@@ -1312,14 +1312,14 @@ test('a failed compaction, even a reported failed turn, does not end a job whose
   const compact = `Error running remote compact task: ${CAPACITY}`
   push(fake, note('error', { threadId: 'th-1', turnId: 'turn-1', willRetry: false, error: { message: compact } }))
   push(fake, note('item/completed', { threadId: 'th-1', turnId: 'turn-1', item: { type: 'agentMessage', text: 'compaction failed, going on', phase: 'commentary' } }))
-  await until(fake, async () => (await agentsOf(fake)).a1?.warning === compact, 'the warning')
-  expect((await agentsOf(fake)).a1).toMatchObject({ status: 'running', error: null })
+  await until(fake, async () => fake.disk.a1?.warning === compact, 'the warning')
+  expect(fake.disk.a1).toMatchObject({ status: 'running', error: null })
   // Liveness: work after a reported failure (at capacity: the job waits to retry) revives the job.
   push(fake, note('turn/completed', { threadId: 'th-1', turn: { id: 'turn-1', status: 'failed', error: { message: compact }, items: [] } }))
   await until(fake, async () => (await agentsOf(fake)).a1?.status === 'starting', 'waiting to retry')
   push(fake, note('item/started', { threadId: 'th-1', turnId: 'turn-1', item: { type: 'commandExecution', command: 'blender -b' } }))
   await until(fake, async () => (await agentsOf(fake)).a1?.status === 'running', 'running again')
-  expect((await agentsOf(fake)).a1).toMatchObject({ currentTurnId: 'turn-1', error: null, warning: `Codex kept working after its turn was reported failed: ${compact}` })
+  expect(fake.disk.a1).toMatchObject({ currentTurnId: 'turn-1', error: null, warning: `Codex kept working after its turn was reported failed: ${compact}` })
   push(fake, finished('DONE'))
   await until(fake, async () => (await agentsOf(fake)).a1?.status === 'idle', 'idle')
   expect(await finalOf($, 'a1')).toBe('DONE')
@@ -1334,7 +1334,7 @@ test('a turn that failed at capacity is retried once with "continue" on its thre
   const starts = () => fake.rpcs.filter(rpc => rpc.method === 'turn/start')
   push(fake, note('turn/completed', { threadId: 'th-1', turn: { id: 'turn-1', status: 'failed', error: { message: CAPACITY, codexErrorInfo: 'serverOverloaded' }, items: [] } }))
   await until(fake, async () => (await agentsOf(fake)).a1?.status === 'starting', 'waiting to retry')
-  expect((await agentsOf(fake)).a1).toMatchObject({ currentTurnId: null, lastTurnId: 'turn-1', digest: ['capacity: retrying with continue'] })
+  expect(fake.disk.a1).toMatchObject({ currentTurnId: null, lastTurnId: 'turn-1', digest: ['capacity: retrying with continue'] })
 
   // The wrapper keeps awaiting; nothing is retried before the 30 s are up.
   const early = awaitCall($, 'a1')
@@ -1579,8 +1579,28 @@ test('a busy store lock neither fails recovery nor a spawn; the next write catch
   expect(fake.store.agents).toBeUndefined()
 
   fake.storeError = null
+  push(fake, note('turn/completed', { threadId: 'th-1', turn: { id: 'turn-1', status: 'completed', items: [] } }))
+  await until(fake, async () => (await agentsOf(fake)).a1?.status === 'idle', 'the snapshot')
+  done(fake)
+})
+
+test('digest, activity and token updates leave the store snapshot alone; a status change rewrites it', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake)
+  await spawn($, fake)
+  const writes = () => (fake.store.agents as Record<string, CodexAgent> | undefined)?.a1?.updatedAt
+  const before = writes()
   push(fake, note('item/started', { threadId: 'th-1', item: { type: 'commandExecution', command: "/bin/zsh -lc 'sleep 20'" } }))
-  await until(fake, async () => (await agentsOf(fake)).a1?.activity === '$ sleep 20', 'the snapshot')
+  push(fake, note('item/completed', { threadId: 'th-1', item: { type: 'commandExecution', command: "/bin/zsh -lc 'sleep 20'", exitCode: 0, status: 'completed' } }))
+  push(fake, note('thread/tokenUsage/updated', { threadId: 'th-1', tokenUsage: { total: { totalTokens: 1234 } } }))
+  await until(fake, async () => fake.disk.a1?.tokens === 1234, 'tokens on disk')
+  expect(fake.disk.a1?.digest).toEqual(['$ sleep 20 -> exit 0'])
+  expect(writes()).toBe(before)
+  expect((await agentsOf(fake)).a1).toMatchObject({ status: 'running', digest: [], activity: '', tokens: 0 })
+
+  push(fake, note('turn/completed', { threadId: 'th-1', turn: { id: 'turn-1', status: 'completed', items: [] } }))
+  await until(fake, async () => (await agentsOf(fake)).a1?.status === 'idle', 'the snapshot')
+  expect(writes()).toBeGreaterThan(before as number)
   done(fake)
 })
 

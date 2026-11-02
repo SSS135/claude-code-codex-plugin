@@ -77,6 +77,7 @@ import {
   sandboxMode,
   approvalParams,
   sanitize,
+  snapshotChanged,
   messagingParams,
   type MessagingParams,
   messageSummary,
@@ -156,15 +157,16 @@ let askChain: Promise<unknown> = Promise.resolve()
 
 // ------------------------------------------------------------ registry
 
-async function afterWrite($: Engine, agents: Record<string, CodexAgent>, agent: CodexAgent): Promise<void> {
+/** Writes the agent's file; the snapshot only when recovery's view of it changed (`before` absent: a new job). */
+async function afterWrite($: Engine, agents: Record<string, CodexAgent>, agent: CodexAgent, before?: CodexAgent): Promise<void> {
   await post($, '/registry/write', { agent })
-  await saveSnapshot($, agents)
+  if (!before || snapshotChanged(before, agent)) await saveSnapshot($, agents)
 }
 
 /**
  * A bounded compatibility snapshot; the separate agent files are authoritative, so a failed
  * write (the store lock every session shares stayed busy past the host's short retry) is only
- * logged and the next write catches it up.
+ * logged and the next snapshot write catches it up.
  */
 async function saveSnapshot($: Engine, agents: Record<string, CodexAgent>): Promise<void> {
   try {
@@ -192,16 +194,18 @@ async function patchAgent(
   change: (agent: CodexAgent) => Partial<CodexAgent>,
 ): Promise<CodexAgent | undefined> {
   const now = await $.clock.now()
+  let before: CodexAgent | undefined
   let written: CodexAgent | undefined
   const agents = await update($, agentsAtom, all => {
     const agent = all[id]
+    before = agent
     if (!agent) return all
     const next = { ...agent, ...change(agent), updatedAt: Math.max(now, agent.updatedAt + 1) }
     // A job that runs again has no handed-back result: its next end is handed back.
     written = sanitize(isLive(next) ? { ...next, handedBackTurnId: null } : next)
     return { ...all, [id]: written }
   })
-  if (written) await afterWrite($, agents, written)
+  if (written) await afterWrite($, agents, written, before)
   return written
 }
 
