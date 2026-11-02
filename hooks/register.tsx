@@ -464,13 +464,17 @@ const POST_ATTEMPTS = 5
 /** A connection the daemon refused: the request never reached it, so sending it again cannot repeat it. */
 const isUndelivered = (error: unknown) => !(error instanceof CodexError) && /ECONNREFUSED|ENOENT/.test(errorText(error))
 
+/** A registry read or write is safe to repeat (a write keeps the newer record), so a reset connection is retried too. */
+const isRegistryRetryable = (error: unknown) => !(error instanceof CodexError) && /ECONNRESET/.test(errorText(error))
+
 async function post($: Engine, endpoint: string, body: unknown): Promise<Record<string, unknown>> {
+  const isRegistry = endpoint.startsWith('/registry/')
   for (let attempt = 1; ; attempt += 1) {
     const address = await bridgeSocket($)
     try {
-      return await postAt($, endpoint.startsWith('/registry/') ? registryAddress ?? address : address, endpoint, body)
+      return await postAt($, isRegistry ? registryAddress ?? address : address, endpoint, body)
     } catch (error) {
-      if (attempt >= POST_ATTEMPTS || !isUndelivered(error)) throw error
+      if (attempt >= POST_ATTEMPTS || !(isUndelivered(error) || (isRegistry && isRegistryRetryable(error)))) throw error
       // The relay notices its daemon is gone and exits; the next bridgeSocket starts a new one.
       await pause($, PAUSE_MS)
     }
@@ -886,9 +890,11 @@ const missingThread = (id: string) => `No saved Codex thread for agent ${id}. It
 async function reconcileAgents($: Engine, address?: string, ref?: string): Promise<void> {
   const sessionId = await $.session.id()
   const native = (await $.agent.list()).filter(agent => aliasOfType(agent.type) !== undefined)
-  const bridge = address ?? await bridgeSocket($)
-  const target = registryAddress ?? bridge
-  const disk = (await postAt($, target, '/registry/read', { sessionId, ids: native.map(agent => agent.id), ref })).agents as Record<string, CodexAgent>
+  // Without an address, post re-resolves the registry on each try: during a reload handover
+  // the previous relay's registry refuses the first connection.
+  const registry = (endpoint: string, body: unknown) =>
+    address === undefined ? post($, endpoint, body) : postAt($, registryAddress ?? address, endpoint, body)
+  const disk = (await registry('/registry/read', { sessionId, ids: native.map(agent => agent.id), ref })).agents as Record<string, CodexAgent>
   const now = await $.clock.now()
   const missing: Record<string, CodexAgent> = {}
   const held = await read($, agentsAtom)
@@ -928,7 +934,7 @@ async function reconcileAgents($: Engine, address?: string, ref?: string): Promi
     }
     return all
   })
-  for (const id of changed) await postAt($, target, '/registry/write', { agent: agents[id] })
+  for (const id of changed) await registry('/registry/write', { agent: agents[id] })
   if (changed.length) await saveSnapshot($, agents)
 }
 
@@ -1260,7 +1266,17 @@ async function onReady($: Engine, address: string, reattached: boolean, active: 
     }]
   })))
   for (const agent of Object.values(agents)) {
-    if (agent.sessionId === sessionId) await postAt($, registryAddress ?? address, '/registry/write', { agent })
+    if (agent.sessionId !== sessionId) continue
+    // A reset or refused write is repeated (it keeps the newer record) rather than failing the whole recovery.
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        await postAt($, registryAddress ?? address, '/registry/write', { agent })
+        break
+      } catch (error) {
+        if (attempt >= POST_ATTEMPTS || !(isUndelivered(error) || isRegistryRetryable(error))) throw error
+        await pause($, PAUSE_MS)
+      }
+    }
   }
   await saveSnapshot($, agents)
 }

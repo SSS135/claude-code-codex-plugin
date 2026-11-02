@@ -67,6 +67,8 @@ type Fake = {
   clock: MockClock
   /** Bridge paths whose fetch the host refuses with this message, as a dead connection does. */
   fetchErrors: Record<string, string>
+  /** Like fetchErrors, for the next fetch of the path only. */
+  fetchErrorsOnce: Record<string, string>
   /** Bridge paths whose fetch waits for this promise first. */
   fetchHolds: Record<string, Promise<void>>
   /** Daemon sockets whose fetches the host refuses, as a daemon that exited does. */
@@ -129,6 +131,7 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
     ],
     clock: mock.clock(on, { now }),
     fetchErrors: {},
+    fetchErrorsOnce: {},
     listError: null,
     storeError: null,
     failStarts: 0,
@@ -244,7 +247,8 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
     const hold = fake.fetchHolds[path]
     if (hold) await hold
     if (fake.deadSockets.includes(e.init?.socketPath ?? '')) return { deny: 'connect ECONNREFUSED' }
-    const refused = fake.fetchErrors[path]
+    const refused = fake.fetchErrors[path] ?? fake.fetchErrorsOnce[path]
+    delete fake.fetchErrorsOnce[path]
     if (refused !== undefined) return { deny: refused }
     let reply: unknown = { ok: true }
     if (path === '/registry/read') {
@@ -1873,7 +1877,10 @@ test('peers reach a Codex job whose wrapper ended: list_agents shows it and mess
   expect(relay.chunks[0]).toMatchObject({ kind: 'tool', name: 'SendMessage' })
   expect(inputOf(relay.chunks)).toEqual({ to: 'orphan', summary: 'Codex: ping', message: 'ping' })
 
-  // The delivery steers the orphan's running turn.
+  // The delivery steers the orphan's running turn, also when the registry refuses the first
+  // read, as the previous relay's does during a reload handover.
+  fake.fetchErrorsOnce['/registry/read'] = 'connect ECONNREFUSED'
+  fake.fetchErrorsOnce['/registry/write'] = 'ECONNRESET: The socket connection was closed unexpectedly'
   expect(await $.session.send({ to: 'orphan', text: 'ping', origin: { kind: 'model' }, agentId: 'a1' } as never)).toEqual({ isDelivered: true })
   expect(fake.rpcs.filter(rpc => rpc.method === 'turn/steer').map(rpc => rpc.params)).toMatchObject([
     { threadId: 'th-2', expectedTurnId: 'turn-2', input: [{ text: 'Message from agent peer_a:\n\nping' }] },
