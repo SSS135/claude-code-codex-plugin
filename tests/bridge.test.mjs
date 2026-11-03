@@ -315,3 +315,30 @@ test('a relay waits for a slow daemon whose pid lives instead of starting anothe
     for (const leftover of [dir, `${dir}.log`, scratch]) fs.rmSync(leftover, { recursive: true, force: true, maxRetries: 5 })
   }
 })
+
+test("a sub-agent's note after its parent's turn ended does not revive the parent; /subagents lists running sub-agent turns at any depth (#19)", async () => {
+  const { address, stop } = await startDaemon()
+  try {
+    const emit = messages => call(address, 'POST', '/rpc', { method: 'test/emit', params: { messages } })
+    const spawned = (parent, turnId, child) => note('item/completed', { threadId: parent, turnId, item: { type: 'subAgentActivity', id: `s-${child}`, kind: 'started', agentThreadId: child, agentPath: '/root/x' } })
+    await emit([
+      note('turn/started', { threadId: 'lead', turn: { id: 't1' } }),
+      spawned('lead', 't1', 'kid'),
+      note('turn/started', { threadId: 'kid', turn: { id: 'k1' } }),
+      spawned('kid', 'k1', 'grandkid'),
+      note('turn/started', { threadId: 'grandkid', turn: { id: 'g1' } }),
+      spawned('lead', 't1', 'done-kid'),
+      note('turn/started', { threadId: 'done-kid', turn: { id: 'd1' } }),
+      turn('done-kid', 'd1', 'completed'),
+      turn('lead', 't1', 'interrupted'),
+      // The finished sub-agent reports on the lead's thread under its ended turn; an "interacted" note names the parent.
+      note('item/completed', { threadId: 'lead', turnId: 't1', item: { type: 'subAgentActivity', id: 's9', kind: 'completed', agentThreadId: 'done-kid', agentPath: '/root/x' } }),
+      note('item/completed', { threadId: 'kid', turnId: 'k1', item: { type: 'subAgentActivity', id: 's8', kind: 'interacted', agentThreadId: 'lead', agentPath: '/root' } }),
+    ])
+    assert.equal((await call(address, 'POST', '/wait', { threadId: 'lead', timeoutMs: 1 })).status, 'idle')
+    assert.deepEqual((await call(address, 'POST', '/subagents', { threadId: 'lead' })).active, { kid: 'k1', grandkid: 'g1' })
+    assert.deepEqual((await call(address, 'POST', '/subagents', { threadId: 'kid' })).active, { grandkid: 'g1' })
+  } finally {
+    await stop()
+  }
+})

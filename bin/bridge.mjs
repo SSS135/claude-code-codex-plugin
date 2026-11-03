@@ -36,6 +36,7 @@
 //             POST /rpc   {method, params, timeoutMs?} -> {result} | {error}
 //             POST /reply {id, result} | {id, error}   answers a server request
 //             POST /wait  {threadId, msgKey?, timeoutMs} long-poll for turn end or a codex-msg message
+//             POST /subagents {threadId}              -> {active: {threadId: turnId}} the running turns of the sub-agents it spawned, at any depth
 //             POST /msg   {key, text, to?}             bin/codex-msg: a message from a Codex job, to an agent or main
 //             POST /roster {text}                      the plugin: the agent list list_agents answers
 //             POST /agents {key}                       bin/codex-msg: that list, as plain text
@@ -283,6 +284,7 @@ async function daemon(codexPath, dir) {
   const outstanding = new Map() // server request id -> event
   const active = new Map() // threadId -> running turnId
   const lastTurn = new Map() // threadId -> last completed turn
+  const subAgents = new Map() // threadId -> Set of the sub-agent threads it spawned (Codex's spawn_agent)
   const failedHolds = new Map() // threadId -> timer of a failed turn/completed held back
   const waiters = new Map() // threadId -> Set<(value) => void>
   const mailboxes = new Map() // codex-msg key -> {text, to?} not yet read
@@ -350,13 +352,20 @@ async function daemon(codexPath, dir) {
     }
     const { method, params = {} } = message
     const isTurnEnd = method === 'turn/completed' && params.turn
-    if ((isTurnEnd || method === 'turn/started' || method.startsWith('item/')) && failedHolds.has(params.threadId)) {
+    // A sub-agent's activity note lands on its parent's thread, tagged with the parent's last turn even after that
+    // turn ended: it is the sub-agent's work, not the parent's (#19).
+    const isSubAgentNote = method.startsWith('item/') && params.item?.type === 'subAgentActivity'
+    if (isSubAgentNote && params.item.kind === 'started' && typeof params.item.agentThreadId === 'string') {
+      subAgents.set(params.threadId, (subAgents.get(params.threadId) ?? new Set()).add(params.item.agentThreadId))
+    }
+    const isWork = isTurnEnd || method === 'turn/started' || (method.startsWith('item/') && !isSubAgentNote)
+    if (isWork && failedHolds.has(params.threadId)) {
       clearTimeout(failedHolds.get(params.threadId))
       failedHolds.delete(params.threadId)
     }
     if (method === 'turn/started' && params.turn?.id) active.set(params.threadId, params.turn.id)
     // Work after the thread's turn ended: follow it as a running turn again.
-    if (method.startsWith('item/') && typeof params.turnId === 'string' && !active.has(params.threadId)) active.set(params.threadId, params.turnId)
+    if (method.startsWith('item/') && !isSubAgentNote && typeof params.turnId === 'string' && !active.has(params.threadId)) active.set(params.threadId, params.turnId)
     if (method === 'serverRequest/resolved' && params.requestId !== undefined) outstanding.delete(params.requestId)
     if (isTurnEnd && params.turn.status === 'failed') {
       failedHolds.set(params.threadId, setTimeout(() => {
@@ -531,6 +540,20 @@ async function daemon(codexPath, dir) {
           mail?.add(done)
         })
         return sendJson(res, 200, answer)
+      }
+      if (url.pathname === '/subagents') {
+        // Turn/interrupt ends a thread's turn alone: its sub-agents, and theirs, run on.
+        const running = {}
+        const seen = new Set([body.threadId])
+        for (const queue = [body.threadId]; queue.length > 0; ) {
+          for (const child of subAgents.get(queue.shift()) ?? []) {
+            if (seen.has(child)) continue
+            seen.add(child)
+            queue.push(child)
+            if (active.has(child)) running[child] = active.get(child)
+          }
+        }
+        return sendJson(res, 200, { active: running })
       }
       if (url.pathname === '/msg') {
         const { key, text, to } = body

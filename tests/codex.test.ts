@@ -83,6 +83,8 @@ type Fake = {
   processRunError: string | null
   /** Per thread, how many of its turn/start requests the daemon refuses, as a dead connection does. */
   turnStartRefusals: Record<string, number>
+  /** What /subagents answers: the running turns of the sub-agents a job's thread spawned, by thread. */
+  subAgents: Record<string, string>
 }
 
 /** The engine resolves a path on the host's root: on Windows '/work/x' arrives as 'C:\work\x'. */
@@ -137,6 +139,7 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
     failStarts: 0,
     processRunError: null,
     turnStartRefusals: {},
+    subAgents: {},
   }
   // The engine beneath the plugin.
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
@@ -273,6 +276,7 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
         reply = { error: { message: error } }
       } else reply = { result: answer(rpc) }
     }
+    if (path === '/subagents') reply = { active: fake.subAgents }
     if (path === '/reply') fake.replies.push(body)
     if (path === '/roster') fake.rosters.push(String(body.text))
     if (path === '/wait') {
@@ -2086,5 +2090,70 @@ test('codex_stop interrupts the turn the bridge runs for a job with no wrapper a
   expect(String((await $.tool.call({ tool: 'mcp__codex__codex_stop', id: 'a1' } as never)).result)).toMatch(/^orphan was not running\. It is marked stopped/)
   expect(interruptsOf(fake)).toHaveLength(1)
   expect((await $.tool.call({ tool: 'mcp__codex__codex_stop', id: 'ghost' } as never)).deny).toBe('No Codex agent "ghost". codex_list shows them.')
+  done(fake)
+})
+
+const subAgentNote = (kind: string, child: string) =>
+  note('item/completed', { threadId: 'th-1', turnId: 'turn-1', item: { type: 'subAgentActivity', id: `sub-${kind}`, kind, agentThreadId: child, agentPath: '/root/worker' } })
+
+test("codex_stop stops a lead's sub-agents too; their notes and turns Codex starts itself never revive the stopped job (#19)", { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake)
+  await spawn($, fake, 'lead', { name: 'lead' })
+  push(fake, note('item/completed', { threadId: 'th-1', turnId: 'turn-1', item: { type: 'subAgentActivity', id: 's1', kind: 'started', agentThreadId: 'th-child', agentPath: '/root/worker' } }))
+  // The lead's turn ends at the first interrupt; its sub-agent's at the second.
+  fake.subAgents = { 'th-child': 'turn-c' }
+  fake.waitQueue = [{ status: 'timeout', turnId: 'turn-1' }, { status: 'idle', turn: null }, { status: 'timeout', turnId: 'turn-c' }, { status: 'idle', turn: null }]
+  expect((await $.tool.call({ tool: 'mcp__codex__codex_stop', id: 'lead' } as never)).result).toBe('Stopped lead: its Codex turn was interrupted, and 1 sub-agent(s) it spawned.')
+  expect(interruptsOf(fake)).toEqual([{ threadId: 'th-1', turnId: 'turn-1' }, { threadId: 'th-child', turnId: 'turn-c' }])
+  push(fake, note('turn/completed', { threadId: 'th-1', turn: { id: 'turn-1', status: 'interrupted', items: [] } }))
+  await until(fake, async () => fake.disk.a1?.status === 'interrupted', 'the interrupted end')
+
+  // A sub-agent finishing later reports on the lead's thread under its ended turn: the job stays interrupted.
+  push(fake, subAgentNote('completed', 'th-child'))
+  await fake.clock.settle()
+  expect(fake.disk.a1).toMatchObject({ status: 'interrupted', currentTurnId: null, warning: null })
+  expect(interruptsOf(fake)).toHaveLength(2)
+  // Work on the stopped job's ended turn is interrupted (once), not followed as running.
+  push(fake, note('item/completed', { threadId: 'th-1', turnId: 'turn-1', item: { type: 'commandExecution', command: 'sleep 99', exitCode: 0 } }))
+  push(fake, note('item/started', { threadId: 'th-1', turnId: 'turn-1', item: { type: 'reasoning' } }))
+  await until(fake, async () => interruptsOf(fake).length === 3, 'the interrupt of the work after the stop')
+  expect(interruptsOf(fake)[2]).toEqual({ threadId: 'th-1', turnId: 'turn-1' })
+  expect(fake.disk.a1).toMatchObject({ status: 'interrupted', currentTurnId: null, warning: null })
+  // A turn Codex starts by itself on the stopped job is interrupted at once.
+  push(fake, note('turn/started', { threadId: 'th-1', turn: { id: 'turn-7' } }))
+  await until(fake, async () => interruptsOf(fake).length === 4, 'the interrupt of the self-started turn')
+  expect(interruptsOf(fake)[3]).toEqual({ threadId: 'th-1', turnId: 'turn-7' })
+  push(fake, note('turn/completed', { threadId: 'th-1', turn: { id: 'turn-7', status: 'interrupted', items: [] } }))
+  await until(fake, async () => fake.disk.a1?.status === 'interrupted', 'the second interrupted end')
+
+  // Main's SendMessage resumes it: the turn it starts is not interrupted.
+  expect(await send($, 'lead', 'resume')).toEqual({ isDelivered: true })
+  push(fake, note('turn/started', { threadId: 'th-1', turn: { id: 'turn-2' } }))
+  await fake.clock.settle()
+  expect(fake.disk.a1).toMatchObject({ status: 'running', currentTurnId: 'turn-2', stoppedAt: null })
+  expect(interruptsOf(fake)).toHaveLength(4)
+  done(fake)
+})
+
+test('codex_stop says when Codex still runs the turn or a sub-agent after its interrupts, never that it stopped (#19)', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake)
+  await spawn($, fake, 'lead', { name: 'stubborn' })
+  // The bridge reports the turn running through every wait.
+  fake.waitAnswer = { status: 'timeout', turnId: 'turn-1' }
+  expect((await $.tool.call({ tool: 'mcp__codex__codex_stop', id: 'stubborn' } as never)).result).toBe(
+    "stubborn is not stopped: Codex still runs its own turn after 3 interrupts. It is marked stopped (other agents' messages do not start it); codex_stop again, or check codex_list.",
+  )
+  expect(interruptsOf(fake)).toHaveLength(3)
+
+  // Its turn ended, but a sub-agent it spawned runs on.
+  fake.subAgents = { 'th-child': 'turn-c' }
+  fake.waitQueue = [{ status: 'idle', turn: null }]
+  fake.waitAnswer = { status: 'timeout', turnId: 'turn-c' }
+  expect(String((await $.tool.call({ tool: 'mcp__codex__codex_stop', id: 'stubborn' } as never)).result)).toBe(
+    "stubborn is not stopped: Codex still runs its sub-agent thread(s) th-child after 3 interrupts. It is marked stopped (other agents' messages do not start it); codex_stop again, or check codex_list.",
+  )
+  expect(interruptsOf(fake).slice(3)).toEqual([0, 1, 2].map(() => ({ threadId: 'th-child', turnId: 'turn-c' })))
   done(fake)
 })

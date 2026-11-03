@@ -148,6 +148,10 @@ const threadQueues = new Map<string, Promise<unknown>>()
  * not show that turn yet.
  */
 const startedTurns = new Map<string, string>()
+/** Threads with a turn/start of this module in flight: their turn/started is this module's, not one Codex started itself. */
+const turnStarts = new Set<string>()
+/** `<threadId> <turnId>` of turns Codex ran on a stopped job that were interrupted, each once. */
+const stopInterrupts = new Set<string>()
 /** The node binary the bridge runs on, which Codex runs bin/codex-msg on too. */
 let nodeBinary = 'node'
 /** Subagents seen at turn.step that are not codex:* agents. */
@@ -654,8 +658,14 @@ function startTurn($: Engine, agent: CodexAgent, text: string): Promise<CodexAge
 async function startTurnOnQueue($: Engine, agent: CodexAgent, text: string, capacityRetries = 0): Promise<CodexAgent> {
   await ensureLoaded($, agent)
   const now = await $.clock.now()
-  const started = await rpc<{ turn: { id: string } }>($, 'turn/start', turnStartParams(agent, text))
-  startedTurns.set(agent.threadId, started.turn.id)
+  let started: { turn: { id: string } }
+  turnStarts.add(agent.threadId)
+  try {
+    started = await rpc<{ turn: { id: string } }>($, 'turn/start', turnStartParams(agent, text))
+    startedTurns.set(agent.threadId, started.turn.id)
+  } finally {
+    turnStarts.delete(agent.threadId)
+  }
   const written = await patchAgent($, agent.id, current => ({
     status: 'running',
     // turn/started may already have landed with the same id
@@ -824,20 +834,41 @@ const stoppedBeforeTurn = (now: number): Partial<CodexAgent> => ({
  */
 async function interruptTurn($: Engine, agent: CodexAgent): Promise<boolean> {
   if (!agent.threadId) return false
-  let turnId = agent.status === 'running' ? agent.currentTurnId : null
+  return (await interruptThread($, agent.name, agent.threadId, agent.status === 'running' ? agent.currentTurnId : null)).isSent
+}
+
+/** interruptTurn on one thread: whether an interrupt was sent, and whether the bridge still runs a turn there after the last. */
+async function interruptThread($: Engine, name: string, threadId: string, turnId: string | null): Promise<{ isSent: boolean; isRunning: boolean }> {
   let isSent = false
-  for (let attempt = 0; attempt < INTERRUPT_ATTEMPTS; attempt += 1) {
-    const answer = (await post($, '/wait', { threadId: agent.threadId, timeoutMs: attempt === 0 ? 1 : INTERRUPT_WAIT_MS }).catch(() => null)) as WaitAnswer | null
+  // One more wait than interrupts: it reads whether the last one took.
+  for (let attempt = 0; attempt <= INTERRUPT_ATTEMPTS; attempt += 1) {
+    const answer = (await post($, '/wait', { threadId, timeoutMs: attempt === 0 ? 1 : INTERRUPT_WAIT_MS }).catch(() => null)) as WaitAnswer | null
     // The turn ended. A bridge that does not answer leaves the record's turn to interrupt, once.
-    if (answer ? answer.status !== 'timeout' : attempt > 0) break
+    if (answer ? answer.status !== 'timeout' : attempt > 0) return { isSent, isRunning: false }
     if (answer?.status === 'timeout') turnId = answer.turnId ?? turnId
-    if (!turnId) break
-    await rpc($, 'turn/interrupt', { threadId: agent.threadId, turnId }).catch(error =>
-      $.ui.log(`codex: interrupting ${agent.name} failed: ${errorText(error)}`),
+    if (!turnId || attempt === INTERRUPT_ATTEMPTS) return { isSent, isRunning: answer !== null }
+    await rpc($, 'turn/interrupt', { threadId, turnId }).catch(error =>
+      $.ui.log(`codex: interrupting ${name} failed: ${errorText(error)}`),
     )
     isSent = true
   }
-  return isSent
+  return { isSent, isRunning: false }
+}
+
+/**
+ * Interrupts the running turns of the sub-agents the job's thread spawned with Codex's own
+ * spawn_agent, at any depth: turn/interrupt on the job's thread leaves them running (#19).
+ * Resolves how many were interrupted and the threads of those still running.
+ */
+async function stopSubAgents($: Engine, agent: CodexAgent): Promise<{ stopped: number; running: string[] }> {
+  // A daemon of an older bridge build has no /subagents: it tracks no sub-agents to stop.
+  const answer = await post($, '/subagents', { threadId: agent.threadId }).catch(() => null)
+  const turns = Object.entries((answer?.active ?? {}) as Record<string, string>)
+  const results = await Promise.all(turns.map(([threadId, turnId]) => interruptThread($, `${agent.name}'s sub-agent ${threadId}`, threadId, turnId)))
+  return {
+    stopped: results.filter(result => result.isSent && !result.isRunning).length,
+    running: turns.filter((_, index) => results[index]!.isRunning).map(([threadId]) => threadId),
+  }
 }
 
 /**
@@ -858,9 +889,27 @@ async function stopJob($: Engine, id: string): Promise<string | undefined> {
   })
   if (!agent) return job ? `Stopped ${id}: its first turn will not start.` : undefined
   if (wasStarting) void releaseThread($, agent.threadId)
-  if (await interruptTurn($, agent)) return `Stopped ${agent.name}: its Codex turn was interrupted.`
+  const own = agent.threadId ? await interruptThread($, agent.name, agent.threadId, agent.status === 'running' ? agent.currentTurnId : null) : { isSent: false, isRunning: false }
+  const subAgents = agent.threadId ? await stopSubAgents($, agent) : { stopped: 0, running: [] }
+  const stillRunning = [...(own.isRunning ? ['its own turn'] : []), ...(subAgents.running.length ? [`its sub-agent thread(s) ${subAgents.running.join(', ')}`] : [])]
+  if (stillRunning.length) {
+    return `${agent.name} is not stopped: Codex still runs ${stillRunning.join(' and ')} after ${INTERRUPT_ATTEMPTS} interrupts. It is marked stopped (other agents' messages do not start it); codex_stop again, or check codex_list.`
+  }
+  const spawned = subAgents.stopped ? `, and ${subAgents.stopped} sub-agent(s) it spawned` : ''
+  if (own.isSent) return `Stopped ${agent.name}: its Codex turn was interrupted${spawned}.`
+  if (subAgents.stopped) return `Stopped ${agent.name}: its own turn had ended; ${subAgents.stopped} sub-agent(s) it spawned were interrupted.`
   if (wasStarting) return `Stopped ${agent.name}: its turn will not start.`
   return `${agent.name} was not running. It is marked stopped: other agents' messages do not start it; a SendMessage from the main session does.`
+}
+
+/** Interrupts, once, a turn Codex runs on a job the user stopped; not awaited, so the event loop is never held on it. */
+function interruptStopped($: Engine, agent: CodexAgent, turnId: string): void {
+  const key = `${agent.threadId} ${turnId}`
+  if (stopInterrupts.has(key)) return
+  stopInterrupts.add(key)
+  void rpc($, 'turn/interrupt', { threadId: agent.threadId, turnId }).catch(error =>
+    $.ui.log(`codex: interrupting ${agent.name}'s turn after its stop failed: ${errorText(error)}`),
+  )
 }
 
 // ------------------------------------------------------------ native agents
@@ -1154,7 +1203,13 @@ async function onNotification($: Engine, method: string, params: Record<string, 
   const agent = byThread(await read($, agentsAtom), params.threadId)
   if (!agent) return
   const turn = params.turn as Record<string, unknown> | undefined
-  if (method.startsWith('item/') && typeof params.turnId === 'string' && (!isLive(agent) || agent.capacityRetryAt)) {
+  // A sub-agent's activity note (Codex's spawn_agent) lands on this thread tagged with its last turn, also after that
+  // turn ended: it is the sub-agent's work, not this job's (#19).
+  const isSubAgentNote = (params.item as Item | undefined)?.type === 'subAgentActivity'
+  if (method.startsWith('item/') && !isSubAgentNote && typeof params.turnId === 'string' && agent.stoppedAt && !isLive(agent)) {
+    // Work on a job the user stopped is interrupted, not followed: a turn that really runs ends interrupted again.
+    interruptStopped($, agent, params.turnId)
+  } else if (method.startsWith('item/') && !isSubAgentNote && typeof params.turnId === 'string' && (!isLive(agent) || agent.capacityRetryAt)) {
     // The thread still works after its job was settled, or while it waits for a capacity retry: the job runs again.
     const turnId = params.turnId
     await patchAgent($, agent.id, current => isLive(current) && !current.capacityRetryAt ? {} : {
@@ -1166,6 +1221,9 @@ async function onNotification($: Engine, method: string, params: Record<string, 
   switch (method) {
     case 'turn/started': {
       const now = await $.clock.now()
+      // A turn Codex started itself on a job the user stopped is interrupted at once: only main's SendMessage resumes it.
+      const isOwn = turnStarts.has(params.threadId) || startedTurns.get(params.threadId) === turn?.id
+      if (agent.stoppedAt && !isOwn && turn?.id) interruptStopped($, agent, String(turn.id))
       // A turn Codex started itself counts too, so an older one this module started holds no capacity retry back.
       if (turn?.id) startedTurns.set(params.threadId, String(turn.id))
       await patchAgent($, agent.id, current => ({

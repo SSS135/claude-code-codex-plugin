@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.7
+
+Fixed:
+
+- `codex_stop` and TaskStop also stop the sub-agents a job started with Codex's own agent tools (#19). Interrupting a lead's turn left its sub-agents running and editing files, and each sub-agent's completion note revived the stopped job as running. A stop now interrupts every sub-agent turn below the job's thread, sub-agent notes never revive a job, and a turn Codex starts by itself on a stopped job is interrupted at once (main's resuming `SendMessage` still starts one). When anything still runs after the interrupts, `codex_stop` says so instead of reporting success. Background commands a turn left running can outlive the interrupt; the plugin cannot kill them.
+
 ## 1.0.6
 
 Fixed:
