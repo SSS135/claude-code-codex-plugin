@@ -2,7 +2,7 @@ import type { On, SessionMessage, TurnStepChunk, TurnStepResult } from 'claude-c
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
 
-import { agentDescription, agentSpecs, aliasOf, aliasOfType, approvalAnswer, approvalOptions, bridgeTarget, codexVersionError, configDirs, describeAgent, effectiveDefaults, effortFor, listText, MIN_CODEX_VERSION, modelEffortError, modelFor, nodeOptionPreloads, parseHeader, permissionsFor, resultText, shortCommand, TOOL_SPECS, UPDATE_HINT, withoutPreloads, wrapperAnswer, isCapacityFailure } from '../hooks/model'
+import { agentDescription, agentSpecs, aliasOf, aliasOfType, approvalAnswer, approvalOptions, bridgeTarget, codexVersionError, configDirs, describeAgent, effectiveDefaults, effortFor, listText, MIN_CODEX_VERSION, modelEffortError, modelFor, nodeOptionPreloads, oldBuildNotice, parseHeader, permissionsFor, resultText, shortCommand, TOOL_SPECS, UPDATE_HINT, withoutPreloads, wrapperAnswer, isCapacityFailure } from '../hooks/model'
 import type { CodexAgent } from '../types'
 
 // A fake bridge: the relay's stdout is a queue the test pushes NDJSON into,
@@ -1008,6 +1008,23 @@ test('a spawn runs the newest available model even when only older family versio
   const agent = await spawn($, fake, 'x')
   expect(agent.model).toBe('gpt-5.6-luna')
   expect(fake.shown.filter(line => line.includes(UPDATE_HINT))).toEqual([])
+  done(fake)
+})
+
+test("a relay driving the previous build's daemon tells the person once that the update waits for its running turns", { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake, { oldBuild: { build: 'abcd1234', turns: 2 } })
+  await spawn($, fake, 'x')
+  expect(fake.shown.filter(line => line.includes('Codex plugin updated'))).toEqual([oldBuildNotice(2)])
+  expect(oldBuildNotice(2)).toContain('for the 2 Codex turn(s) running now')
+  done(fake)
+})
+
+test('a relay on the same build shows no update notice', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake)
+  await spawn($, fake, 'x')
+  expect(fake.shown.filter(line => line.includes('Codex plugin updated'))).toEqual([])
   done(fake)
 })
 

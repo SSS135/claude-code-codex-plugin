@@ -17,7 +17,7 @@ export type Settings = {
 }
 
 export type BridgeEvent =
-  | { type: 'ready'; socket: string; registry?: string; reattached: boolean; active: Record<string, string>; codexVersion?: string | null }
+  | { type: 'ready'; socket: string; registry?: string; reattached: boolean; active: Record<string, string>; codexVersion?: string | null; oldBuild?: { build: string | null; turns: number } }
   | { type: 'notification'; method: string; params: Record<string, unknown> }
   | { type: 'request'; id: number | string; method: string; params: Record<string, unknown> }
   | { type: 'exit'; code: number | null; signal: string | null; stderrTail: string[] }
@@ -52,6 +52,11 @@ export const aliasOf = (model: string): string =>
   Object.keys(MODEL_ALIASES).find(alias => model === MODEL_ALIASES[alias] || model.endsWith(`-${alias}`)) ?? model
 
 export const UPDATE_HINT = 'Update the Codex CLI: npm i -g @openai/codex@latest, or update the ChatGPT app on macOS.'
+
+/** What the person is told when a reload's relay drives the previous build's daemon (bin/bridge.mjs drain) while `turns` turns run on it. */
+export const oldBuildNotice = (turns: number): string =>
+  `Codex plugin updated, but its bridge still runs the previous version for the ${turns} Codex turn(s) running now; the update applies once they end. ` +
+  'To apply it now, restart Claude Code (those turns are lost; a SendMessage to each job resumes it afterwards).'
 
 /** The oldest Codex CLI this plugin runs on (its app-server API, and MCP servers outside the job's sandbox). */
 export const MIN_CODEX_VERSION = '0.160.0'

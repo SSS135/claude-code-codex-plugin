@@ -69,6 +69,7 @@ import {
   LineBuffer,
   modelEffortError,
   nodeOptionPreloads,
+  oldBuildNotice,
   withoutPreloads,
   effortFor,
   PER_MODEL_EFFORT,
@@ -355,6 +356,8 @@ function runRelay($: Engine, { current: first, argv, env }: RelayRequest): void 
   let current = first
   /** Set once the relay exited: a recovery retry armed after that would swap in a socket of its dead daemon. */
   let isOver = false
+  /** Set once this relay told the person its daemon runs the previous build: a retried ready must not say it again. */
+  let isOldBuildShown = false
   const handle = async (line: string): Promise<void> => {
     let event: BridgeEvent
     try {
@@ -366,6 +369,10 @@ function runRelay($: Engine, { current: first, argv, env }: RelayRequest): void 
     if (event.type === 'fatal') {
       const tail = event.logTail.trim().split('\n').slice(-6).join(' | ')
       current.reject(new CodexError(`codex bridge failed: ${event.message}${tail ? ` (${clip(tail, 1200)})` : ''}`))
+    }
+    if (event.type === 'ready' && event.oldBuild?.turns && !isOldBuildShown) {
+      isOldBuildShown = true
+      $.ui.log(oldBuildNotice(event.oldBuild.turns))
     }
     try {
       await onEvent($, event)

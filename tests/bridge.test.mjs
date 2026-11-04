@@ -304,9 +304,54 @@ test('a relay waits for a slow daemon whose pid lives instead of starting anothe
     for (let i = 0; i < 50 && lines.length === 0; i += 1) await sleep(100)
     assert.equal(lines[0]?.type, 'ready')
     assert.deepEqual(lines[0].active, { 'th-1': 't1' })
+    // Its own build's daemon: no update waits.
+    assert.equal(lines[0].oldBuild, undefined)
     // The relay names its parent, here this process, as the Claude Code process to watch.
     assert.match(eventsUrl, new RegExp(`relay=${relay.pid}&claude=${process.pid}$`))
     assert.match(fs.readFileSync(`${dir}.log`, 'utf8'), new RegExp(`daemon ${process.pid} answered`))
+  } finally {
+    relay.kill()
+    server.closeAllConnections()
+    server.close()
+    await sleep(300)
+    for (const leftover of [dir, `${dir}.log`, scratch]) fs.rmSync(leftover, { recursive: true, force: true, maxRetries: 5 })
+  }
+})
+
+test("a relay that drives another build's busy daemon names that build and its running turns in its ready line", async () => {
+  const base = process.platform === 'win32' ? path.join(os.tmpdir(), 'cxb') : `/tmp/cxb-${process.getuid()}`
+  fs.mkdirSync(base, { recursive: true, mode: 0o700 })
+  const key = randomBytes(8).toString('hex')
+  // No daemon of this build; the previous build's runs two turns.
+  const dir = path.join(base, `${key}-0ldbu11d`)
+  fs.mkdirSync(dir, { mode: 0o700 })
+  const active = { 'th-1': 't1', 'th-2': 't2' }
+  const server = http.createServer((req, res) => {
+    if (req.url.endsWith('/health')) {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      return res.end(JSON.stringify({ ok: true, pid: process.pid, build: '0ldbu11d', active }))
+    }
+    if (req.url.includes('/events')) {
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' })
+      return res.write(JSON.stringify({ type: 'hello', reattached: true, active }) + '\n')
+    }
+    res.writeHead(404).end()
+  })
+  if (process.platform === 'win32') {
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+    fs.writeFileSync(path.join(dir, 's'), `http://127.0.0.1:${server.address().port}/secret`)
+  } else await new Promise(resolve => server.listen(path.join(dir, 's'), resolve))
+
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-bridge-relay-'))
+  const fake = path.join(scratch, 'fake-codex.mjs')
+  fs.writeFileSync(fake, FAKE_CODEX, { mode: 0o755 })
+  const relay = spawn(process.execPath, [BRIDGE, fake, key], { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true, env: { ...process.env, CLAUDE_CONFIG_DIR: scratch } })
+  const lines = []
+  readline.createInterface({ input: relay.stdout }).on('line', line => lines.push(JSON.parse(line)))
+  try {
+    for (let i = 0; i < 100 && lines.length === 0; i += 1) await sleep(100)
+    assert.equal(lines[0]?.type, 'ready')
+    assert.deepEqual(lines[0].oldBuild, { build: '0ldbu11d', turns: 2 })
   } finally {
     relay.kill()
     server.closeAllConnections()

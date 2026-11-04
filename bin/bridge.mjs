@@ -14,7 +14,8 @@
 //           one instead, until it is idle; it then stops it and exits, so no
 //           reload loses a turn. It first runs `codex --version` (a CLI that
 //           does not run is a fatal line saying what to do). First line:
-//           {"type":"ready","socket",...,"codexVersion"}. It exits when its parent goes away,
+//           {"type":"ready","socket",...,"codexVersion"}, plus "oldBuild":{build,turns}
+//           while it drives another build's daemon. It exits when its parent goes away,
 //           stdout breaks or the daemon exits; the plugin killing it on reload is
 //           expected and harmless.
 //   launch: node bridge.mjs --launch <codexPath> <dir>
@@ -836,7 +837,8 @@ async function relay(codexPath, sessionKey) {
     if (first) {
       first = false
       const hello = JSON.parse(line)
-      out({ type: 'ready', socket: socketPath, registry: registry.address, reattached: hello.reattached, active: hello.active, codexVersion: version })
+      // oldBuild: this relay drives another build's daemon, so the plugin's update applies once its turns end.
+      out({ type: 'ready', socket: socketPath, registry: registry.address, reattached: hello.reattached, active: hello.active, codexVersion: version, ...(target !== dir && { oldBuild: { build: other.health.build ?? null, turns: Object.keys(hello.active ?? {}).length } }) })
       continue
     }
     process.stdout.write(line + '\n')

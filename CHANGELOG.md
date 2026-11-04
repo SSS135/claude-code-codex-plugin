@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.8
+
+Added:
+
+- After a reload onto a new plugin version while Codex turns run, the plugin says once that its bridge still runs the previous version until those turns end, and that restarting Claude Code applies the update now at the cost of those turns.
+
 ## 1.0.7
 
 Fixed:
