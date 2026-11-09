@@ -1019,8 +1019,7 @@ async function settleTurn($: Engine, agent: CodexAgent, answer: WaitAnswer): Pro
 const relayCalls = new Set<string>()
 
 /** A wrapper step that is one tool call the plugin makes. */
-async function* toolStep(e: { turnId: string; index: number }, name: string, input: Record<string, unknown>): AsyncGenerator<TurnStepChunk, TurnStepResult> {
-  const id = `toolu_codex_${crypto.randomUUID().replaceAll('-', '').slice(0, 24)}`
+async function* toolStep(e: { turnId: string; index: number }, name: string, input: Record<string, unknown>, id = `toolu_codex_${crypto.randomUUID().replaceAll('-', '').slice(0, 24)}`): AsyncGenerator<TurnStepChunk, TurnStepResult> {
   if (name === 'SendMessage') relayCalls.add(id)
   yield { kind: 'tool', index: 0, id, name }
   yield { kind: 'input', index: 0, json: JSON.stringify(input) }
@@ -1040,7 +1039,7 @@ async function isHandbackRefused($: Engine, agentId: string, turnId: string): Pr
 /** Per wrapper, the report its last SubagentHandback call carried: where the engine refuses that call, the same text follows as the final answer. */
 const handBackTexts = new Map<string, { turnId: string; text: string }>()
 
-const structuredTurns = new Map<string, string>()
+const structuredTurns = new Map<string, { turnId: string; repairs: number; callId?: string; error?: string }>()
 /** shortcut: 2.1.319 exposes no request tools/schema; observe its enforcement row until the SDK exposes them. */
 const structuredRequired = new Set<string>()
 const failedSteps = new Map<string, { turn: string; count: number }>()
@@ -1052,22 +1051,41 @@ async function* textStep(e: { turnId: string; index: number }, text: string): As
 }
 
 /** Workflow schemas require this tool even when a plain final answer would otherwise finish. */
-async function* structuredStep(e: { turnId: string; index: number; agentId?: string }, text: string): AsyncGenerator<TurnStepChunk, TurnStepResult> {
+async function* structuredStep($: Engine, e: { turnId: string; index: number; agentId?: string }, text: string): AsyncGenerator<TurnStepChunk, TurnStepResult> {
   const id = e.agentId as string
-  if (structuredTurns.get(id) === e.turnId) {
-    return yield* textStep(e, `Codex wrapper could not complete StructuredOutput; the engine did not accept its result. Codex result:\n\n${text}`)
+  let state = structuredTurns.get(id)
+  if (state?.turnId !== e.turnId) {
+    state = { turnId: e.turnId, repairs: 0 }
+    structuredTurns.set(id, state)
   }
-  structuredTurns.set(id, e.turnId)
-  let input: Record<string, unknown>
-  try {
-    const parsed: unknown = JSON.parse(text)
-    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('expected a JSON object')
-    input = parsed as Record<string, unknown>
-  } catch {
-    // The schema belongs to the engine; never invent successful values from free text.
-    input = { error: 'Codex did not return a JSON object required by StructuredOutput', result: text }
+  const failure = () => textStep(e, `Codex wrapper could not complete StructuredOutput; the engine did not accept its result. Codex result:\n\n${text}`)
+  let input: Record<string, unknown> | undefined
+  let reason = state.error
+  if (state.callId && reason === undefined) return yield* failure()
+  if (reason === undefined) {
+    try {
+      const parsed: unknown = JSON.parse(text)
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('expected a JSON object')
+      input = parsed as Record<string, unknown>
+    } catch {
+      reason = 'it was not a JSON object'
+    }
   }
-  return yield* toolStep(e, 'StructuredOutput', input)
+  if (reason !== undefined) {
+    const agent = (await read($, agentsAtom))[id]
+    if (state.repairs >= 2 || !agent?.threadId || agent.stoppedAt) return yield* failure()
+    state.repairs += 1
+    state.callId = undefined
+    state.error = undefined
+    try {
+      await sendMessage($, agent, `Your reply could not be submitted as the required structured output: ${reason}. Reply again with ONLY the corrected JSON object, no prose.`)
+    } catch (error) {
+      return yield* textStep(e, `Codex wrapper could not complete StructuredOutput; repair failed: ${errorText(error)}. Codex result:\n\n${text}`)
+    }
+    return yield* toolStep(e, AWAIT_TOOL, {})
+  }
+  state.callId = `toolu_codex_${crypto.randomUUID().replaceAll('-', '').slice(0, 24)}`
+  return yield* toolStep(e, 'StructuredOutput', input as Record<string, unknown>, state.callId)
 }
 
 /** Whether `to` names a Codex job of this session that runs or finished recently, its wrapper ended or not: a peer's message reaches it. */
@@ -1600,6 +1618,16 @@ export const register: Register = (on, options) => {
         kept.message.content.some(block => block.type === 'text' && block.text === '[structured-output-enforce] You MUST call the StructuredOutput tool to complete this request. Call this tool now.')) {
       structuredRequired.add(e.agentId)
     }
+    if (e.agentId !== undefined && e.origin.kind === 'tool' && e.origin.tool === 'StructuredOutput') {
+      const state = structuredTurns.get(e.agentId)
+      for (const block of kept.message?.content ?? []) {
+        if (state?.callId && block.type === 'tool_result' && block.tool_use_id === state.callId && block.is_error === true) {
+          state.error = typeof block.content === 'string' ? block.content
+            : Array.isArray(block.content) ? block.content.filter(part => part.type === 'text').map(part => part.text).join('\n')
+            : String(block.content)
+        }
+      }
+    }
     return kept
   })
 
@@ -1646,7 +1674,7 @@ export const register: Register = (on, options) => {
         return yield* toolStep(e, 'SendMessage', { to: 'main', summary: `${agent.name} finished`, message })
       }
       const tools = await $.tool.list()
-      if (structuredRequired.has(e.agentId) || tools.some(tool => tool.name === 'StructuredOutput')) return yield* structuredStep(e, wrapperAnswer(agent))
+      if (structuredRequired.has(e.agentId) || tools.some(tool => tool.name === 'StructuredOutput')) return yield* structuredStep($, e, wrapperAnswer(agent))
       const isRefused = !tools.some(tool => tool.name === HANDBACK_TOOL) || await isHandbackRefused($, e.agentId, e.turnId)
       // Where the engine requires it (auto mode), the report goes back through SubagentHandback;
       // where that tool is not offered, the final text is the report.
@@ -1679,7 +1707,7 @@ export const register: Register = (on, options) => {
         const text = `Codex wrapper failed after ${count} completion attempts: ${failureText(next.error)}. Codex result:\n\n${wrapperAnswer(agent)}`
         $.ui.log(text, { to: 'transcript' })
         const tools = await $.tool.list().catch(() => [])
-        if (structuredRequired.has(e.agentId) || tools.some(tool => tool.name === 'StructuredOutput')) return yield* structuredStep(e, text)
+        if (structuredRequired.has(e.agentId) || tools.some(tool => tool.name === 'StructuredOutput')) return yield* structuredStep($, e, text)
         return yield* textStep(e, text)
       }
     } else failedSteps.delete(e.agentId)
@@ -1751,6 +1779,7 @@ export const register: Register = (on, options) => {
     const done = await next(e)
     if (e.agentId !== undefined) {
       structuredRequired.delete(e.agentId)
+      structuredTurns.delete(e.agentId)
       agentEndedAt.set(e.agentId, await $.clock.now())
     }
     if (e.agentId === undefined || e.reason !== 'aborted' || foreignAgents.has(e.agentId)) return done

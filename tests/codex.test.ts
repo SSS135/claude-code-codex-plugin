@@ -606,21 +606,105 @@ test('Workflow enforcement completes JSON when StructuredOutput is absent from t
   } finally { done(fake) }
 })
 
-test('Workflow schema reports non-JSON output and does not repeat a rejected structured call', { timeoutMs: 20_000 }, async ($, on) => {
+test('Workflow non-object replies repair on the same Codex thread before submitting JSON', { timeoutMs: 20_000 }, async ($, on) => {
   const fake = fakeBridge(on)
   try {
     await start($, fake)
     await spawn($, fake)
     fake.tools = ['StructuredOutput']
-    fake.waitQueue = [completed('turn-1', '24 entries; model=GPT-6')]
+    fake.messagesDeny = 'unreadable Workflow transcript'
+    fake.waitQueue = [completed('turn-1', 'not JSON')]
+    await awaitCall($, 'a1')
+    expect((await step($, 'a1', 1)).chunks[0]).toMatchObject({ kind: 'tool', name: 'mcp__codex__codex_await' })
+    expect(fake.rpcs.filter(rpc => rpc.method === 'turn/start').at(-1)?.params).toMatchObject({
+      threadId: 'th-1', input: [{ text: 'Your reply could not be submitted as the required structured output: it was not a JSON object. Reply again with ONLY the corrected JSON object, no prose.' }],
+    })
+    fake.waitQueue = [completed('turn-2', '{"count":24}')]
+    await awaitCall($, 'a1')
+    expect((await step($, 'a1', 2)).result).toMatchObject({ toolUses: [{ name: 'StructuredOutput', input: { count: 24 } }] })
+    expect(fake.rpcs.filter(rpc => rpc.method === 'thread/start')).toHaveLength(1)
+    expect(fake.modelSteps).toBe(0)
+  } finally { done(fake) }
+})
+
+test('a rejected StructuredOutput call is corrected and resubmitted', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  try {
+    await start($, fake)
+    await spawn($, fake)
+    fake.tools = ['StructuredOutput']
+    fake.waitQueue = [completed('turn-1', '{"count":"24"}')]
     await awaitCall($, 'a1')
     const call = await step($, 'a1', 1)
-    expect(call.chunks[0]).toMatchObject({ kind: 'tool', name: 'StructuredOutput' })
-    expect(inputOf(call.chunks)).toEqual({ error: 'Codex did not return a JSON object required by StructuredOutput', result: '24 entries; model=GPT-6' })
-    const rejected = await step($, 'a1', 2)
-    expect(rejected.result.stopReason).toBe('end_turn')
-    expect(rejected.result.answer).toContain('could not complete StructuredOutput')
+    await $.session.append({ uuid: 'schema-error', agentId: 'a1', door: 'tool-result', origin: { kind: 'tool', tool: 'StructuredOutput' },
+      message: { type: 'user', content: [{ type: 'tool_result', tool_use_id: (call.chunks[0] as { id: string }).id,
+        is_error: true, content: 'Schema validation failed: count must be a number' }] } })
+    expect((await step($, 'a1', 2)).chunks[0]).toMatchObject({ kind: 'tool', name: 'mcp__codex__codex_await' })
+    expect(fake.rpcs.filter(rpc => rpc.method === 'turn/start').at(-1)?.params).toMatchObject({
+      threadId: 'th-1', input: [{ text: 'Your reply could not be submitted as the required structured output: Schema validation failed: count must be a number. Reply again with ONLY the corrected JSON object, no prose.' }],
+    })
+    fake.waitQueue = [completed('turn-2', '{"count":24}')]
+    await awaitCall($, 'a1')
+    expect((await step($, 'a1', 3)).result).toMatchObject({ toolUses: [{ name: 'StructuredOutput', input: { count: 24 } }] })
     expect(fake.modelSteps).toBe(0)
+  } finally { done(fake) }
+})
+
+test('StructuredOutput errors repair with verbatim engine text and stop after two repairs', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  try {
+    await start($, fake)
+    await spawn($, fake)
+    fake.tools = ['StructuredOutput']
+    fake.messagesDeny = 'unreadable Workflow transcript'
+    const error = 'Invalid input: count must be a number\nReceived "24"'
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      fake.waitQueue = [completed(`turn-${attempt + 1}`, JSON.stringify({ count: String(24 + attempt) }))]
+      await awaitCall($, 'a1')
+      const call = await step($, 'a1', attempt * 2 + 1)
+      expect(call.result).toMatchObject({ toolUses: [{ name: 'StructuredOutput', input: { count: String(24 + attempt) } }] })
+      const callId = (call.chunks[0] as { id: string }).id
+      // A different call's failure must not trigger a repair.
+      await $.session.append({ uuid: `unrelated-${attempt}`, agentId: 'a1', door: 'tool-result', origin: { kind: 'tool', tool: 'StructuredOutput' },
+        message: { type: 'user', content: [{ type: 'tool_result', tool_use_id: 'other', is_error: true, content: 'unrelated' }] } })
+      await $.session.append({ uuid: `rejected-${attempt}`, agentId: 'a1', door: 'tool-result', origin: { kind: 'tool', tool: 'StructuredOutput' },
+        message: { type: 'user', content: [{ type: 'tool_result', tool_use_id: callId, is_error: true,
+          content: attempt === 1 ? [{ type: 'text', text: error }] : error }] } })
+      const next = await step($, 'a1', attempt * 2 + 2)
+      if (attempt < 2) {
+        expect(next.chunks[0]).toMatchObject({ kind: 'tool', name: 'mcp__codex__codex_await' })
+        expect(fake.rpcs.filter(rpc => rpc.method === 'turn/start').at(-1)?.params).toMatchObject({
+          threadId: 'th-1', input: [{ text: `Your reply could not be submitted as the required structured output: ${error}. Reply again with ONLY the corrected JSON object, no prose.` }],
+        })
+      } else {
+        expect(next.result.stopReason).toBe('end_turn')
+        expect(next.result.answer).toContain('could not complete StructuredOutput')
+        expect(next.result.answer).toContain('{"count":"26"}')
+        expect((await step($, 'a1', 9)).result.stopReason).toBe('end_turn')
+      }
+    }
+    expect(fake.rpcs.filter(rpc => rpc.method === 'turn/start')).toHaveLength(3)
+    expect(fake.modelSteps).toBe(0)
+  } finally { done(fake) }
+})
+
+test('non-object repairs are bounded for arrays, null and JSON primitives', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  try {
+    await start($, fake)
+    await spawn($, fake)
+    fake.tools = ['StructuredOutput']
+    for (const [index, text] of ['[]', 'null', '24'].entries()) {
+      fake.waitQueue = [completed(`turn-${index + 1}`, text)]
+      await awaitCall($, 'a1')
+      const next = await step($, 'a1', index + 1)
+      if (index < 2) expect(next.chunks[0]).toMatchObject({ kind: 'tool', name: 'mcp__codex__codex_await' })
+      else {
+        expect(next.result.stopReason).toBe('end_turn')
+        expect(next.result.answer).toContain('Codex result:\n\n24')
+      }
+    }
+    expect(fake.rpcs.filter(rpc => rpc.method === 'turn/start')).toHaveLength(3)
   } finally { done(fake) }
 })
 

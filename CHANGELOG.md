@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.12
+
+Fixed:
+
+- Workflow structured output repairs invalid JSON objects and rejected `StructuredOutput` calls on the same Codex thread, using the engine's error text. Each wrapper turn permits at most two repair turns, then ends with an explicit failure and the last Codex result.
+
 ## 1.0.11
 
 Fixed:
