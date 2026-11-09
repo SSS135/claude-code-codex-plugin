@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.10
+
+Fixed:
+
+- Workflow-spawned `codex:*` wrappers finish even when the engine cannot read their transcript. Completion uses the offered `StructuredOutput` tool for schema runs (passing through a JSON object, or reporting a non-JSON result explicitly), otherwise the offered hand-back tool or final text. A finished job whose completion hook fails three times ends with its error and Codex result instead of silently awaiting forever.
+
 ## 1.0.9
 
 Added:

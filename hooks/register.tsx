@@ -1029,15 +1029,44 @@ async function* toolStep(e: { turnId: string; index: number }, name: string, inp
 }
 
 /** Whether the wrapper's last step was a SubagentHandback call that failed: the engine does not offer that tool here. */
-async function isHandbackRefused($: Engine, agentId: string): Promise<boolean> {
+async function isHandbackRefused($: Engine, agentId: string, turnId: string): Promise<boolean> {
   const messages = await $.session.messages({ agentId })
-  if (!Array.isArray(messages)) throw new CodexError(`reading the agent's messages failed: ${messages.deny}`)
+  // Workflow transcripts may be unreadable; one attempted hand-back is enough.
+  if (!Array.isArray(messages)) return handBackTexts.get(agentId)?.turnId === turnId
   const last = messages.filter(message => message.role === 'assistant').at(-1)
   return last?.toolUses.some(use => use.tool === HANDBACK_TOOL && use.isError === true) ?? false
 }
 
 /** Per wrapper, the report its last SubagentHandback call carried: where the engine refuses that call, the same text follows as the final answer. */
-const handBackTexts = new Map<string, string>()
+const handBackTexts = new Map<string, { turnId: string; text: string }>()
+
+const structuredTurns = new Map<string, string>()
+const failedSteps = new Map<string, { turn: string; count: number }>()
+
+async function* textStep(e: { turnId: string; index: number }, text: string): AsyncGenerator<TurnStepChunk, TurnStepResult> {
+  yield { kind: 'text', index: 0, text }
+  yield { kind: 'stop', stopReason: 'end_turn', usage: null }
+  return { turnId: e.turnId, index: e.index, answer: text, toolUses: [], stopReason: 'end_turn', usage: null }
+}
+
+/** Workflow schemas require this tool even when a plain final answer would otherwise finish. */
+async function* structuredStep(e: { turnId: string; index: number; agentId?: string }, text: string): AsyncGenerator<TurnStepChunk, TurnStepResult> {
+  const id = e.agentId as string
+  if (structuredTurns.get(id) === e.turnId) {
+    return yield* textStep(e, `Codex wrapper could not complete StructuredOutput; the engine did not accept its result. Codex result:\n\n${text}`)
+  }
+  structuredTurns.set(id, e.turnId)
+  let input: Record<string, unknown>
+  try {
+    const parsed: unknown = JSON.parse(text)
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('expected a JSON object')
+    input = parsed as Record<string, unknown>
+  } catch {
+    // The schema belongs to the engine; never invent successful values from free text.
+    input = { error: 'Codex did not return a JSON object required by StructuredOutput', result: text }
+  }
+  return yield* toolStep(e, 'StructuredOutput', input)
+}
 
 /** Whether `to` names a Codex job of this session that runs or finished recently, its wrapper ended or not: a peer's message reaches it. */
 async function isReachableJob($: Engine, to: string): Promise<boolean> {
@@ -1604,22 +1633,23 @@ export const register: Register = (on, options) => {
         const message = `${agent.name}'s Codex turn ended. ${peer}'s message resumed ${agent.name}, so Claude Code hands its result and task notification to ${peer}, not to you. Its result:\n\n${wrapperAnswer(agent)}`
         return yield* toolStep(e, 'SendMessage', { to: 'main', summary: `${agent.name} finished`, message })
       }
-      const isRefused = await isHandbackRefused($, e.agentId)
+      const tools = await $.tool.list()
+      if (tools.some(tool => tool.name === 'StructuredOutput')) return yield* structuredStep(e, wrapperAnswer(agent))
+      const isRefused = !tools.some(tool => tool.name === HANDBACK_TOOL) || await isHandbackRefused($, e.agentId, e.turnId)
       // Where the engine requires it (auto mode), the report goes back through SubagentHandback;
-      // where that tool is not offered, its call fails and the final text is the report.
+      // where that tool is not offered, the final text is the report.
       if (!isRefused) {
         // Never the same turn's result twice: a resume whose message started a turn finds the job running
         // (the resume hook started it before the wrapper's loop), so one that finds it handed back ran none.
         const report = isHandedBack(agent) ? noNewTurn(agent) : wrapperAnswer(agent)
-        handBackTexts.set(e.agentId, report)
         const key = handBackKey(agent)
         await patchAgent($, agent.id, () => ({ handedBackTurnId: key }))
+        handBackTexts.set(e.agentId, { turnId: e.turnId, text: report })
         return yield* toolStep(e, HANDBACK_TOOL, { message: report })
       }
-      const text = handBackTexts.get(e.agentId) ?? wrapperAnswer(agent)
-      yield { kind: 'text' as const, index: 0, text }
-      yield { kind: 'stop' as const, stopReason: 'end_turn' as const, usage: null }
-      return { turnId: e.turnId, index: e.index, answer: text, toolUses: [], stopReason: 'end_turn' as const, usage: null }
+      const handBack = handBackTexts.get(e.agentId)
+      const text = handBack?.turnId === e.turnId ? handBack.text : wrapperAnswer(agent)
+      return yield* textStep(e, text)
     }
     return yield* toolStep(e, AWAIT_TOOL, {})
   }).catch(async function* ($, e, next) {
@@ -1627,8 +1657,20 @@ export const register: Register = (on, options) => {
     if (next.called || e.agentId === undefined || foreignAgents.has(e.agentId)) return yield* next(e)
     const isCodex = (await read($, agentsAtom))[e.agentId] !== undefined || (await isCodexType($, e.agentId).catch(() => false))
     if (!isCodex) return yield* next(e)
-    // A codex:* wrapper whose step failed never falls to its Claude model, which would hand back while
-    // the job runs: it waits on codex_await again, which reads the job afresh.
+    const agent = (await read($, agentsAtom))[e.agentId]
+    if (agent && !isLive(agent)) {
+      const turn = handBackKey(agent)
+      const previous = failedSteps.get(e.agentId)
+      const count = previous?.turn === turn ? previous.count + 1 : 1
+      failedSteps.set(e.agentId, { turn, count })
+      if (count >= 3) {
+        const text = `Codex wrapper failed after ${count} completion attempts: ${failureText(next.error)}. Codex result:\n\n${wrapperAnswer(agent)}`
+        $.ui.log(text, { to: 'transcript' })
+        const tools = await $.tool.list().catch(() => [])
+        if (tools.some(tool => tool.name === 'StructuredOutput')) return yield* structuredStep(e, text)
+        return yield* textStep(e, text)
+      }
+    } else failedSteps.delete(e.agentId)
     $.ui.log(`codex: ${e.agentId}'s step failed (${failureText(next.error)}); it calls codex_await again`, { to: 'debug' })
     return yield* toolStep(e, AWAIT_TOOL, {})
   })

@@ -42,6 +42,8 @@ type Fake = {
   delivered: { to: string; text: string }[]
   /** What the engine's session.messages answers per agent. */
   messages: Record<string, SessionMessage[]>
+  messagesDeny: string | null
+  tools: string[]
   /** Model requests that reached a Claude model beneath the plugin. */
   modelSteps: number
   asked: string[]
@@ -112,6 +114,8 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
     rosters: [],
     delivered: [],
     messages: {},
+    messagesDeny: null,
+    tools: ['SubagentHandback'],
     modelSteps: 0,
     asked: [],
     askedOptions: [],
@@ -162,7 +166,8 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
   on('agent.list', () => (fake.listError !== null ? { deny: fake.listError } : {
     value: fake.agentList.map(agent => ({ ...agent, description: '', status: 'running' as const })),
   }))
-  on('session.messages', (_$, e) => ({ value: fake.messages[(e as { agentId?: string }).agentId ?? ''] ?? [] }))
+  on('session.messages', (_$, e) => fake.messagesDeny ? { value: { deny: fake.messagesDeny } } : { value: fake.messages[(e as { agentId?: string }).agentId ?? ''] ?? [] })
+  on('tool.list', () => ({ value: fake.tools.map(name => ({ name, description: '', mcp: false })) }))
   // $.ui.ask's AskUserQuestion is the dialog itself: allowed here, so the test engine's
   // headless decider does not deny it before the tool.call hook below answers as the person.
   on('tool.check', { tool: 'AskUserQuestion' }, () => ({ decision: 'allow' as const, reason: 'the person answers below' }))
@@ -523,6 +528,88 @@ test('the wrapper loop: codex_await while Codex runs, then the Codex final messa
   expect(foreign.result.answer).toBe('from Claude')
   expect(fake.modelSteps).toBe(1)
   done(fake)
+})
+
+test('Workflow wrappers finish when their transcript cannot be read, with the tools the engine offers', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  try {
+    await start($, fake)
+    await spawn($, fake, 'Count entries', { name: undefined, subagentType: 'codex:sol', description: 'sol:plain', background: false })
+    fake.messagesDeny = 'No readable conversation for workflow agent a1'
+    fake.tools = []
+    const final = '24 entries; model=GPT-6'
+    fake.waitAnswer = completed('turn-1', final)
+    expect((await awaitCall($, 'a1')).result).toBe(final)
+    const plain = await step($, 'a1', 1)
+    expect(plain.result).toMatchObject({ answer: final, stopReason: 'end_turn', toolUses: [] })
+    expect(fake.modelSteps).toBe(0)
+  } finally { done(fake) }
+})
+
+test('an unreadable Workflow transcript permits one hand-back attempt then final text', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  try {
+    await start($, fake)
+    await spawn($, fake, 'Count entries', { name: undefined, subagentType: 'codex:sol', description: 'sol:plain', background: false })
+    fake.messagesDeny = 'No readable conversation for workflow agent a1'
+    fake.waitQueue = [completed('turn-1', '24 entries; model=GPT-6')]
+    await awaitCall($, 'a1')
+    expect(await finalOf($, 'a1', 1)).toBe('24 entries; model=GPT-6')
+    expect((await step($, 'a1', 2)).result).toMatchObject({ stopReason: 'end_turn', answer: '24 entries; model=GPT-6' })
+  } finally { done(fake) }
+})
+
+test('Workflow schema wrappers call StructuredOutput with the Codex JSON object', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  try {
+    await start($, fake)
+    await spawn($, fake, 'Reply as JSON', { name: undefined, subagentType: 'codex:sol', description: 'sol:schema', background: false })
+    fake.messagesDeny = 'No readable conversation for workflow agent a1'
+    fake.tools = ['StructuredOutput', 'SubagentHandback']
+    fake.waitAnswer = completed('turn-1', '{"count":24,"model":"GPT-6"}')
+    await awaitCall($, 'a1')
+    const result = await step($, 'a1', 1)
+    expect(result.result).toMatchObject({ toolUses: [{ name: 'StructuredOutput', input: { count: 24, model: 'GPT-6' } }], stopReason: 'tool_use' })
+    expect(fake.modelSteps).toBe(0)
+  } finally { done(fake) }
+})
+
+test('Workflow schema reports non-JSON output and does not repeat a rejected structured call', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  try {
+    await start($, fake)
+    await spawn($, fake)
+    fake.tools = ['StructuredOutput']
+    fake.waitQueue = [completed('turn-1', '24 entries; model=GPT-6')]
+    await awaitCall($, 'a1')
+    const call = await step($, 'a1', 1)
+    expect(call.chunks[0]).toMatchObject({ kind: 'tool', name: 'StructuredOutput' })
+    expect(inputOf(call.chunks)).toEqual({ error: 'Codex did not return a JSON object required by StructuredOutput', result: '24 entries; model=GPT-6' })
+    const rejected = await step($, 'a1', 2)
+    expect(rejected.result.stopReason).toBe('end_turn')
+    expect(rejected.result.answer).toContain('could not complete StructuredOutput')
+    expect(fake.modelSteps).toBe(0)
+  } finally { done(fake) }
+})
+
+test('a finished job with repeated completion hook failures ends with the error and result', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  try {
+    await start($, fake)
+    await spawn($, fake)
+    fake.waitQueue = [completed('turn-1', 'finished result')]
+    await awaitCall($, 'a1')
+    fake.listError = 'agent list unavailable'
+    for (let index = 1; index <= 2; index += 1) {
+      expect((await step($, 'a1', index)).chunks[0]).toMatchObject({ kind: 'tool', name: 'mcp__codex__codex_await' })
+    }
+    const ended = await step($, 'a1', 3)
+    expect(ended.result.stopReason).toBe('end_turn')
+    expect(ended.result.answer).toContain('failed after 3 completion attempts')
+    expect(ended.result.answer).toContain('agent list unavailable')
+    expect(ended.result.answer).toContain('finished result')
+    expect(fake.modelSteps).toBe(0)
+  } finally { done(fake) }
 })
 
 const RESTARTED = 'Codex turn interrupted: the turn was lost when the Codex process restarted; a SendMessage to its agent starts a new turn on the thread'
