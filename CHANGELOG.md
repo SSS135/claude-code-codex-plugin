@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.11
+
+Fixed:
+
+- Workflow schema wrappers complete through `StructuredOutput` even when the request-specific tool is absent from `$.tool.list()` and the Workflow transcript cannot be read. On engines without request tools/schema in their hook events, the wrapper observes the engine's structured-output enforcement row at `session.append` and submits the parsed Codex JSON on the next step. The signal is scoped to that agent and cleared when its turn ends.
+
 ## 1.0.10
 
 Fixed:

@@ -574,6 +574,38 @@ test('Workflow schema wrappers call StructuredOutput with the Codex JSON object'
   } finally { done(fake) }
 })
 
+test('Workflow enforcement completes JSON when StructuredOutput is absent from tool.list and the transcript is unreadable', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  try {
+    await start($, fake)
+    await spawn($, fake, 'Reply as JSON', { name: undefined, subagentType: 'codex:sol', workflow: { runId: 'wf_schema', agentIndex: 1 } })
+    fake.messagesDeny = 'No readable conversation for workflow agent a1'
+    fake.tools = []
+    const final = '{"answer":"24 entries; model=GPT-6","files":24}'
+    fake.waitAnswer = completed('turn-1', final)
+    await awaitCall($, 'a1')
+    expect((await step($, 'a1', 1)).result).toMatchObject({ answer: final, stopReason: 'end_turn' })
+    // Engine 2.1.319 requiresStructuredOutput injects this meta user row, then steps again.
+    const nudge = {
+      uuid: 'enforce-schema', agentId: 'a1', door: 'note' as const, origin: { kind: 'engine' as const },
+      message: { type: 'user' as const, role: 'user' as const, isMeta: true as const,
+        content: [{ type: 'text' as const, text: '[structured-output-enforce] You MUST call the StructuredOutput tool to complete this request. Call this tool now.' }] },
+    }
+    // Quoted user text and another agent's enforcement must not affect this wrapper.
+    await $.session.append({ ...nudge, message: { ...nudge.message, isMeta: undefined } })
+    await $.session.append({ ...nudge, agentId: 'other' })
+    expect((await step($, 'a1', 2)).result.stopReason).toBe('end_turn')
+    await $.session.append(nudge)
+    const result = await step($, 'a1', 3)
+    expect(result.result).toMatchObject({ toolUses: [{ name: 'StructuredOutput', input: { answer: '24 entries; model=GPT-6', files: 24 } }], stopReason: 'tool_use' })
+    // A rejected structured call remains bounded; a later turn is not a schema run.
+    expect((await step($, 'a1', 4)).result.answer).toContain('could not complete StructuredOutput')
+    await $.turn.complete({ turnId: 't-a1', agentId: 'a1', answer: final, durationMs: 1, isAborted: false, reason: 'answer' })
+    expect((await step($, 'a1', 5)).result).toMatchObject({ answer: final, stopReason: 'end_turn' })
+    expect(fake.modelSteps).toBe(0)
+  } finally { done(fake) }
+})
+
 test('Workflow schema reports non-JSON output and does not repeat a rejected structured call', { timeoutMs: 20_000 }, async ($, on) => {
   const fake = fakeBridge(on)
   try {
