@@ -769,7 +769,7 @@ export function agentDescription(alias: string, defaults: Defaults): string {
     `"approvals: auto|ask|never|yolo" (default ${defaults.approvals}; auto: Codex's own reviewer decides escalations, looser than Claude's auto mode; ask: the user approves each; never: the sandbox alone decides; yolo: no sandbox and no approvals, ONLY when the user explicitly asked for it).`,
     `Project defaults: ${PROJECT_CONFIG}.`,
     'Codex may message you mid-task as this agent. SendMessage to it steers the running Codex turn, or starts a new turn on the same thread once it finished; TaskStop interrupts it.',
-    'The Agent call needs a `name` no running or recently finished agent has: other agents (Codex jobs through message_agent, Claude subagents through SendMessage) reach it by that name; list peer names in each prompt.',
+    'The Agent call accepts an optional `name` no running or recently finished agent has (auto-generated when omitted): other agents (Codex jobs through message_agent, Claude subagents through SendMessage) reach it by that name; list peer names in each prompt.',
   ].join(' ')
 }
 

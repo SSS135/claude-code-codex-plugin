@@ -20,7 +20,7 @@ The plugin registers four agent types, one per Codex model family: `codex:luna`,
 { "subagent_type": "codex:sol", "name": "retry_fix", "description": "Fix flaky retry test", "prompt": "effort: medium\nFix the flaky test in retry.test.ts and run it." }
 ```
 
-`name` is required: other agents message the job by it. A call without one, or with a name that `main` or a running or recently finished agent (within 30 minutes) already has, is refused.
+`name` is optional: when omitted, the plugin generates a lowercase slug from the description (else label or prompt), prefixed with the model family and shortened to 30 characters. Collisions get `-2`, `-3`, and so on. The plugin shows this name in `list_agents` and routes messages to it by native agentId; the native spawn stays unnamed. An explicit name held by `main` or a running or recently finished agent (within 30 minutes) is still refused. Workflow scripts can use `agent(prompt, {agentType: 'codex:sol', label})` without a name.
 
 ### Which agent Claude picks
 
@@ -69,7 +69,7 @@ The recipient sees the native message row from the sending agent; a Codex recipi
 
 It is an MCP server, not a shell command, because Codex's sandboxes refuse a shell command's `connect()` to the bridge's Unix socket: both `read-only` and `workspace-write` fail with EPERM (tested with `codex sandbox`, Codex CLI 0.160), and only `network_access = true` lifts that, which opens the network too. Codex starts its MCP servers outside the job's sandbox, so `message_agent` works in every sandbox, and in testing it ran without an approval prompt under `approvals: ask`.
 
-Each job is named after the Agent call's `name`; the record numbers it only when an older job already has that name. The Codex thread carries the name too, so the session is easy to find in the Codex app, `codex resume` and `codex agents`.
+Each job uses the Agent call's explicit or generated `name`; the record numbers it only when an older job already has that name. The Codex thread carries the name too, so the session is easy to find in the Codex app, `codex resume` and `codex agents`.
 
 ## Install
 

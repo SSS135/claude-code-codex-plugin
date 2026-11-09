@@ -266,7 +266,7 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
       const rpc = { method: String(body.method), params: (body.params ?? {}) as Record<string, unknown> }
       const threadId = String(rpc.params.threadId)
       if (rpc.method === 'turn/start' && (fake.turnStartRefusals[threadId] ?? 0) > 0) {
-        fake.turnStartRefusals[threadId] -= 1
+        fake.turnStartRefusals[threadId] = (fake.turnStartRefusals[threadId] ?? 0) - 1
         return { deny: 'connect ECONNREFUSED 127.0.0.1:5001' }
       }
       fake.rpcs.push(rpc)
@@ -635,11 +635,61 @@ test('a message to a name no agent has is not sent; Codex is told instead', { ti
   done(fake)
 })
 
-test('a codex:* spawn needs a name no recent agent has; list_agents reads the agents the plugin sends the bridge', { timeoutMs: 20_000 }, async ($, on) => {
+test('nameless codex:* spawns use unique task slugs in the job, roster and messaging without rewriting native names', { timeoutMs: 20_000 }, async ($, on) => {
   const fake = fakeBridge(on)
   await start($, fake)
-  const nameless = await $.agent.spawn({ ...spawnInput('x'), name: undefined })
-  expect(nameless.deny).toContain('give the agent a `name`')
+  const extra = { name: undefined, subagentType: 'codex:sol', description: 'Count CWD entries!' }
+  const first = await spawn($, fake, 'count entries', extra)
+  const second = await spawn($, fake, 'count entries', extra)
+  expect(first.name).toBe('sol-count-cwd-entries')
+  expect(second.name).toBe('sol-count-cwd-entries-2')
+  expect(fake.spawned.map(agent => agent.name)).toEqual([undefined, undefined])
+  expect(fake.rosters.at(-1)).toContain('- sol-count-cwd-entries (codex:sol, running)')
+  expect(fake.rosters.at(-1)).toContain('- sol-count-cwd-entries-2 (codex:sol, running)')
+  expect(await send($, String(first.name), 'also count hidden entries')).toEqual({ isDelivered: true })
+  expect(fake.delivered.at(-1)?.to).toBe('a1')
+  expect(await $.session.send({ to: String(second.name), text: 'hello', origin: { kind: 'model' }, agentId: 'a1' })).toEqual({ isDelivered: true })
+  expect(fake.rpcs.filter(rpc => rpc.method === 'turn/steer').at(-1)?.params.input).toEqual([{ type: 'text', text: 'Message from agent sol-count-cwd-entries:\n\nhello', text_elements: [] }])
+  expect(fake.rpcs.find(rpc => rpc.method === 'turn/steer')?.params).toMatchObject({ threadId: 'th-1' })
+  push(fake, note('turn/completed', { threadId: 'th-1', turn: { id: 'turn-1', status: 'completed', items: [] } }))
+  await until(fake, async () => (await agentsOf(fake)).a1?.status === 'idle', 'first job finished')
+  fake.agentList = fake.agentList.filter(agent => agent.id !== 'a1')
+  const third = await spawn($, fake, 'count entries', extra)
+  expect(third.name).toBe('sol-count-cwd-entries-3')
+  done(fake)
+})
+
+test('simultaneous nameless spawns reserve different names', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake)
+  const extra = { name: undefined, description: 'Same task' }
+  const spawned = await Promise.all([$.agent.spawn(spawnInput('x', extra)), $.agent.spawn(spawnInput('x', extra))])
+  expect(spawned.every(agent => agent.deny === undefined)).toBe(true)
+  expect(fake.spawned.map(agent => agent.name)).toEqual([undefined, undefined])
+  await fake.clock.settle()
+  expect(Object.values(await agentsOf(fake)).map(agent => agent.name).sort()).toEqual(['luna-same-task', 'luna-same-task-2'])
+  done(fake)
+})
+
+test('generated names fall back to label, prompt or agent and stay short', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  fake.agentIds.push('a4')
+  await start($, fake)
+  for (const [extra, prompt, expected] of [
+    [{ description: '', label: 'Use LABEL' }, 'prompt', 'luna-use-label'],
+    [{ description: ' ', label: '' }, 'Use PROMPT!', 'luna-use-prompt'],
+    [{ description: '!!!' }, 'prompt', 'luna-agent'],
+    [{ description: 'A very long description with plenty of extra words' }, 'prompt', 'luna-a-very-long-description-w'],
+  ] as const) {
+    const agent = await spawn($, fake, prompt, { ...extra, name: ' ' })
+    expect(agent.name).toBe(expected)
+  }
+  done(fake)
+})
+
+test('an explicit codex:* name must be free; list_agents reads the agents the plugin sends the bridge', { timeoutMs: 20_000 }, async ($, on) => {
+  const fake = fakeBridge(on)
+  await start($, fake)
   await spawn($, fake, 'sleep 20', { name: 'peer_a' })
   expect((await $.agent.spawn(spawnInput('x', { name: 'peer_a' }))).deny).toContain('the name peer_a is taken')
   expect((await $.agent.spawn(spawnInput('x', { name: 'main' }))).deny).toContain('the name main is taken')

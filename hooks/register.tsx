@@ -134,6 +134,7 @@ let hasBeenReady = false
 let registryAddress: string | null = null
 let recovery: { reattached: boolean; active: Record<string, string> } | null = null
 let spawnsInFlight = 0
+const spawningNames = new Set<string>()
 let isBridgeRunning = false
 /** Handles the running relay's `ready` again after its handling failed, on a new start; null otherwise. */
 let retryReady: (() => Promise<void>) | null = null
@@ -1079,7 +1080,7 @@ async function recentAgents($: Engine): Promise<{ name: string; type: string; st
     const endedAt = job ? job.turnEndedAt : (agentEndedAt.get(info.id) ?? 0)
     if (!live && endedAt < now - RECENT_FINISHED_MS) return []
     const status = job ? jobStatus(job) : info.status
-    return [{ name: info.name ?? info.id, type: info.type, status, description: info.description }]
+    return [{ name: info.name ?? job?.name ?? info.id, type: info.type, status, description: info.description }]
   })
   // This session's jobs the engine no longer lists (their wrapper ended), while they run or finished recently.
   const sessionId = await $.session.id()
@@ -1481,71 +1482,84 @@ export const register: Register = (on, options) => {
       }
       return next(e)
     }
-    // Agents address each other by name: a job needs one, and one name means one recent agent.
-    const name = e.name?.trim()
-    if (!name) return { deny: 'codex: give the agent a `name` (the Agent call\'s name parameter); other agents message it by that name' }
-    if (name === 'main' || (await recentAgents($)).some(agent => agent.name === name)) {
-      return { deny: `codex: the name ${name} is taken by a running or recently finished agent; pick another` }
+    // Reserve names until the native agent exists, including simultaneous Workflow spawns.
+    let name = e.name?.trim()
+    // Older saved names would otherwise be renamed by putAgent, unlike the native agent.
+    const savedNames = name ? [] : Object.values(await read($, agentsAtom)).map(agent => agent.name)
+    const taken = new Set(['main', ...savedNames, ...(await recentAgents($)).map(agent => agent.name), ...spawningNames, ...Array.from(firstTurns.values(), job => job.input.name)])
+    if (name) {
+      if (taken.has(name)) return { deny: `codex: the name ${name} is taken by a running or recently finished agent; pick another` }
+    } else {
+      const label = e.description?.trim() || (e as { label?: string }).label?.trim() || e.prompt
+      const slug = label.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'agent'
+      const base = `${alias}-${slug}`.slice(0, 30).replace(/-$/, '')
+      name = base
+      for (let n = 2; taken.has(name); n += 1) name = `${base}-${n}`
     }
-    let input: JobInput
-    let body: string
-    let threadId: string
+    spawningNames.add(name)
     try {
-      const header = parseHeader(e.prompt)
-      body = header.body
-      if (body.trim() === '') return { deny: 'codex: the prompt is empty once its header lines are taken off' }
-      const defaults = effectiveDefaults(settings, await projectConfig($))
-      // A bridge that is down starts here again, or the refusal says why it did not; its relay has read `codex --version`.
-      await bridgeSocket($)
-      const outdated = codexVersionError(codexVersion)
-      if (outdated) return { deny: `codex: ${outdated}` }
-      const listed = await listModels($)
-      const model = modelFor(listed, alias)
-      const effort = header.effort ?? effortFor(defaults, alias)
-      const { sandbox, approvals } = permissionsFor(header, defaults)
-      const error = modelEffortError(listed, model, effort)
-      if (error) return { deny: `codex: ${error}` }
-      input = {
-        description: taskLabel(e),
-        // The Agent call's name, which SendMessage and message_agent address; putAgent suffixes it
-        // in the record only when an older job holds it.
-        name,
-        model,
-        effort,
-        sandbox,
-        approvals,
-        cwd: e.cwd ?? (await $.session.cwd()),
-        msgKey: crypto.randomUUID().replaceAll('-', ''),
+      let input: JobInput
+      let body: string
+      let threadId: string
+      try {
+        const header = parseHeader(e.prompt)
+        body = header.body
+        if (body.trim() === '') return { deny: 'codex: the prompt is empty once its header lines are taken off' }
+        const defaults = effectiveDefaults(settings, await projectConfig($))
+        // A bridge that is down starts here again, or the refusal says why it did not; its relay has read `codex --version`.
+        await bridgeSocket($)
+        const outdated = codexVersionError(codexVersion)
+        if (outdated) return { deny: `codex: ${outdated}` }
+        const listed = await listModels($)
+        const model = modelFor(listed, alias)
+        const effort = header.effort ?? effortFor(defaults, alias)
+        const { sandbox, approvals } = permissionsFor(header, defaults)
+        const error = modelEffortError(listed, model, effort)
+        if (error) return { deny: `codex: ${error}` }
+        input = {
+          description: taskLabel(e),
+          // The Agent call's name, which SendMessage and message_agent address; putAgent suffixes it
+          // in the record only when an older job holds it.
+          name,
+          model,
+          effort,
+          sandbox,
+          approvals,
+          cwd: e.cwd ?? (await $.session.cwd()),
+          msgKey: crypto.randomUUID().replaceAll('-', ''),
+        }
+        const thread = await startThread($, input)
+        threadId = thread.threadId
+        input = { ...input, model: thread.model }
+      } catch (error) {
+        return { deny: `codex: ${errorText(error)}` }
       }
-      const thread = await startThread($, input)
-      threadId = thread.threadId
-      input = { ...input, model: thread.model }
-    } catch (error) {
-      return { deny: `codex: ${errorText(error)}` }
-    }
-    const job: FirstTurn = { threadId, input, body, isStarting: true, since: await $.clock.now(), tries: 0 }
-    spawnsInFlight += 1
-    let spawned: Awaited<ReturnType<typeof next>>
-    try {
-      spawned = await next({ ...e, background: true })
-      if (spawned.agentId !== undefined) firstTurns.set(spawned.agentId, job)
-    } catch (error) {
-      // No subagent will run on the thread.
-      void releaseThread($, threadId)
-      throw error
-    } finally {
-      spawnsInFlight -= 1
-    }
-    if (spawned.agentId === undefined) {
-      void releaseThread($, threadId)
+      const job: FirstTurn = { threadId, input, body, isStarting: true, since: await $.clock.now(), tries: 0 }
+      spawnsInFlight += 1
+      let spawned: Awaited<ReturnType<typeof next>>
+      try {
+        spawned = await next({ ...e, background: true })
+        if (spawned.agentId !== undefined) firstTurns.set(spawned.agentId, job)
+      } catch (error) {
+        // No subagent will run on the thread.
+        void releaseThread($, threadId)
+        throw error
+      } finally {
+        spawnsInFlight -= 1
+      }
+      if (spawned.agentId === undefined) {
+        void releaseThread($, threadId)
+        return spawned
+      }
+      // The record and the turn are written once this hook returned: no budget cuts them off
+      // with the subagent already running (codex_await finishes a start that failed or hangs).
+      void startFirstTurn($, spawned.agentId, job).catch(error =>
+        $.ui.log(`codex: starting ${input.name}'s first turn failed: ${errorText(error)}; codex_await starts it again`, { to: 'debug' }),
+      )
       return spawned
+    } finally {
+      spawningNames.delete(name)
     }
-    // The record and the turn are written once this hook returned: no budget cuts them off
-    // with the subagent already running (codex_await finishes a start that failed or hangs).
-    void startFirstTurn($, spawned.agentId, job).catch(error =>
-      $.ui.log(`codex: starting ${input.name}'s first turn failed: ${errorText(error)}; codex_await starts it again`, { to: 'debug' }),
-    )
-    return spawned
   }).catch(($, e, next) => (next.called ? next(e) : { deny: `codex: the Codex job did not start (its hook failed: ${failureText(next.error)})` }))
 
   // The codex:* subagent's loop: every model request is answered here and no
@@ -1636,13 +1650,14 @@ export const register: Register = (on, options) => {
       return { isDelivered: false as const, reason: `${agent.name} was stopped by the user; only the main session can resume it` }
     }
     // From another agent, Codex is told whom to answer; main's messages arrive as they are.
-    const sender = e.agentId === undefined ? undefined : (await $.agent.list()).find(info => info.id === e.agentId)
-    const text = e.agentId === undefined ? e.text : fromAgent(sender?.name ?? e.agentId, e.text)
+    const native = await $.agent.list()
+    const sender = native.find(info => info.id === e.agentId)
+    const senderJob = e.agentId === undefined ? undefined : (await read($, agentsAtom))[e.agentId]
+    const text = e.agentId === undefined ? e.text : fromAgent(sender?.name ?? senderJob?.name ?? e.agentId, e.text)
     let sent: 'steered' | 'started'
     try {
       sent = await sendMessage($, agent, text)
       sentToCodex.add(agent.id)
-      const senderJob = e.agentId === undefined ? undefined : (await read($, agentsAtom))[e.agentId]
       if (senderJob) resumers.set(agent.id, senderJob.name)
       else resumers.delete(agent.id)
     } catch (error) {
@@ -1655,7 +1670,9 @@ export const register: Register = (on, options) => {
       })).catch(failure => $.ui.log(`codex: recording the refused message to ${e.to} failed: ${errorText(failure)}`, { to: 'debug' }))
       return { isDelivered: false as const, reason: `Codex did not take the message: ${errorText(error)}` }
     }
-    const delivered = await next(e)
+    // Generated job names are plugin aliases; the native nameless agent is addressed by id.
+    const to = e.to === agent.name && !native.some(info => info.name === e.to) ? agent.id : e.to
+    const delivered = await next({ ...e, to })
     if (delivered.isDelivered) {
       // Delivered already: a failed write must not reach the .catch below, which would deliver it again.
       if (agent.stoppedAt) await patchAgent($, agent.id, () => ({ stoppedAt: null })).catch(error => $.ui.log(`codex: clearing ${agent?.name}'s stop failed: ${errorText(error)}`, { to: 'debug' }))

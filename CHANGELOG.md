@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.9
+
+Added:
+
+- `codex:*` agents accept calls without a `name`, including Workflow scripts. The plugin generates a model-prefixed task slug and numbers collisions, using it for the job record, roster and messaging. Native unnamed agents stay unnamed; messages to the generated name route by agentId. Explicit taken names are still refused.
+
 ## 1.0.8
 
 Added:
