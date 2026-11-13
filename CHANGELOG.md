@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.13
+
+Fixed:
+
+- No more `session.append hook was skipped` transcript lines where Claude Code's managed `cc-plugin-sec-default` runs first (#20). The hook now matches only the `note` and `tool-result` doors it reads; sec-default passes `attachment`, `hook-context` and `compaction` rows over user plugins, and the engine's structured-output enforcement row (door `note`) was never skipped.
+
 ## 1.0.12
 
 Fixed:

@@ -1612,12 +1612,18 @@ export const register: Register = (on, options) => {
   }).catch(($, e, next) => (next.called ? next(e) : { deny: `codex: the Codex job did not start (its hook failed: ${failureText(next.error)})` }))
 
   // Unlike session.messages, the keep-point event also sees Workflow conversations.
-  on('session.append', async ($, e, next) => {
+  // Only the doors read here: a managed cc-plugin-sec-default sends attachment, hook-context and
+  // compaction rows past user plugins, and a hook on those doors is reported skipped (#20).
+  on('session.append', { door: 'note' }, async ($, e, next) => {
     const kept = await next(e)
     if (e.agentId !== undefined && e.origin.kind === 'engine' && kept.message?.type === 'user' && kept.message.isMeta &&
         kept.message.content.some(block => block.type === 'text' && block.text === '[structured-output-enforce] You MUST call the StructuredOutput tool to complete this request. Call this tool now.')) {
       structuredRequired.add(e.agentId)
     }
+    return kept
+  })
+  on('session.append', { door: 'tool-result' }, async ($, e, next) => {
+    const kept = await next(e)
     if (e.agentId !== undefined && e.origin.kind === 'tool' && e.origin.tool === 'StructuredOutput') {
       const state = structuredTurns.get(e.agentId)
       for (const block of kept.message?.content ?? []) {
