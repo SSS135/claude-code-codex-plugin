@@ -1688,9 +1688,11 @@ export const register: Register = (on, options) => {
       }
       const tools = await $.tool.list()
       if (structuredRequired.has(e.agentId) || tools.some(tool => tool.name === 'StructuredOutput')) return yield* structuredStep($, e, wrapperAnswer(agent))
-      const isRefused = !tools.some(tool => tool.name === HANDBACK_TOOL) || await isHandbackRefused($, e.agentId, e.turnId)
+      // $.tool.list() is the session's tool pool, never this agent's: it lacks SubagentHandback even where
+      // the engine requires it (auto mode), so only a failed call tells that the engine does not offer it.
+      const isRefused = await isHandbackRefused($, e.agentId, e.turnId)
       // Where the engine requires it (auto mode), the report goes back through SubagentHandback;
-      // where that tool is not offered, the final text is the report.
+      // where that tool is not offered, its call fails and the final text is the report.
       if (!isRefused) {
         // Never the same turn's result twice: a resume whose message started a turn finds the job running
         // (the resume hook started it before the wrapper's loop), so one that finds it handed back ran none.

@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.15
+
+Fixed:
+
+- In auto mode a `codex:*` Agent call returns the Codex final message, not "The subagent ended without delivering a report through SubagentHandback". Since 1.0.10 the wrapper handed back only when `$.tool.list()` listed `SubagentHandback`, but that list is the session's tool pool and never holds a subagent's `SubagentHandback`, so the wrapper answered with plain text, which auto mode does not deliver. The wrapper now always calls `SubagentHandback` first and falls back to the final text only after that call fails (the engine does not offer the tool, as in default mode).
+
 ## 1.0.14
 
 Changed:

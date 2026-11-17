@@ -115,7 +115,8 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
     delivered: [],
     messages: {},
     messagesDeny: null,
-    tools: ['SubagentHandback'],
+    // The session's tool pool, as the engine lists it: never a subagent's SubagentHandback.
+    tools: [],
     modelSteps: 0,
     asked: [],
     askedOptions: [],
@@ -531,22 +532,6 @@ test('the wrapper loop: codex_await while Codex runs, then the Codex final messa
   done(fake)
 })
 
-test('Workflow wrappers finish when their transcript cannot be read, with the tools the engine offers', { timeoutMs: 20_000 }, async ($, on) => {
-  const fake = fakeBridge(on)
-  try {
-    await start($, fake)
-    await spawn($, fake, 'Count entries', { name: undefined, subagentType: 'codex:sol', description: 'sol:plain', background: false })
-    fake.messagesDeny = 'No readable conversation for workflow agent a1'
-    fake.tools = []
-    const final = '24 entries; model=GPT-6'
-    fake.waitAnswer = completed('turn-1', final)
-    expect((await awaitCall($, 'a1')).result).toBe(final)
-    const plain = await step($, 'a1', 1)
-    expect(plain.result).toMatchObject({ answer: final, stopReason: 'end_turn', toolUses: [] })
-    expect(fake.modelSteps).toBe(0)
-  } finally { done(fake) }
-})
-
 test('an unreadable Workflow transcript permits one hand-back attempt then final text', { timeoutMs: 20_000 }, async ($, on) => {
   const fake = fakeBridge(on)
   try {
@@ -585,7 +570,9 @@ test('Workflow enforcement completes JSON when StructuredOutput is absent from t
     const final = '{"answer":"24 entries; model=GPT-6","files":24}'
     fake.waitAnswer = completed('turn-1', final)
     await awaitCall($, 'a1')
-    expect((await step($, 'a1', 1)).result).toMatchObject({ answer: final, stopReason: 'end_turn' })
+    // One hand-back attempt (tool.list never shows SubagentHandback), then the final text.
+    expect(await finalOf($, 'a1', 1)).toBe(final)
+    expect((await step($, 'a1', 2)).result).toMatchObject({ answer: final, stopReason: 'end_turn' })
     // Engine 2.1.319 requiresStructuredOutput injects this meta user row, then steps again.
     const nudge = {
       uuid: 'enforce-schema', agentId: 'a1', door: 'note' as const, origin: { kind: 'engine' as const },
@@ -595,14 +582,14 @@ test('Workflow enforcement completes JSON when StructuredOutput is absent from t
     // Quoted user text and another agent's enforcement must not affect this wrapper.
     await $.session.append({ ...nudge, message: { ...nudge.message, isMeta: undefined } })
     await $.session.append({ ...nudge, agentId: 'other' })
-    expect((await step($, 'a1', 2)).result.stopReason).toBe('end_turn')
+    expect((await step($, 'a1', 3)).result.stopReason).toBe('end_turn')
     await $.session.append(nudge)
-    const result = await step($, 'a1', 3)
+    const result = await step($, 'a1', 4)
     expect(result.result).toMatchObject({ toolUses: [{ name: 'StructuredOutput', input: { answer: '24 entries; model=GPT-6', files: 24 } }], stopReason: 'tool_use' })
     // A rejected structured call remains bounded; a later turn is not a schema run.
-    expect((await step($, 'a1', 4)).result.answer).toContain('could not complete StructuredOutput')
+    expect((await step($, 'a1', 5)).result.answer).toContain('could not complete StructuredOutput')
     await $.turn.complete({ turnId: 't-a1', agentId: 'a1', answer: final, durationMs: 1, isAborted: false, reason: 'answer' })
-    expect((await step($, 'a1', 5)).result).toMatchObject({ answer: final, stopReason: 'end_turn' })
+    expect((await step($, 'a1', 6)).result).toMatchObject({ answer: final, stopReason: 'end_turn' })
     expect(fake.modelSteps).toBe(0)
   } finally { done(fake) }
 })
