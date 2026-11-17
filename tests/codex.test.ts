@@ -419,7 +419,7 @@ test('a codex:* spawn starts the Codex turn with the exact prompt, keyed by the 
   const fake = fakeBridge(on, {}, { [CODEX_DEFAULT]: '', [NODE_DEFAULT]: '' })
   await start($, fake)
   expect(fake.argv[0]).toBe(NODE_DEFAULT)
-  expect(fake.argv[1]).toMatch(/bin\/bridge\.mjs$/)
+  expect(fake.argv[1]).toMatch(/scripts\/bridge\.mjs$/)
   expect(fake.argv[2]).toBe(CODEX_DEFAULT)
 
   const prompt = 'Write unit tests for calc.js\n\n  keep the indentation\n'
@@ -428,12 +428,12 @@ test('a codex:* spawn starts the Codex turn with the exact prompt, keyed by the 
   expect(agent).toMatchObject({ id: 'a1', name: 'calc_tests', description: 'Write calc tests', model: 'gpt-6-luna', effort: 'max', status: 'running', currentTurnId: 'turn-1', cwd: '/work/app' })
   expect(fake.rpcs.map(rpc => rpc.method)).toEqual(['model/list', 'thread/start', 'thread/name/set', 'turn/start'])
   expect(fake.rpcs[1]?.params).toMatchObject({ model: 'gpt-6-luna', cwd: '/work/app', sandbox: 'workspace-write', approvalPolicy: 'on-request', approvalsReviewer: 'auto_review', ephemeral: false })
-  // The job can message the session: bin/codex-msg as an MCP server, named with the bridge's socket and the job's key.
+  // The job can message the session: scripts/codex-msg as an MCP server, named with the bridge's socket and the job's key.
   const msgKey = String(agent.msgKey)
   expect(msgKey).toMatch(/^[0-9a-f]{32}$/)
   const started = fake.rpcs[1]?.params as { config: { mcp_servers: Record<string, { command: string; args: string[] }> }; developerInstructions: string }
   expect(started.config.mcp_servers.claude_agents?.command).toBe(NODE_DEFAULT)
-  expect(started.config.mcp_servers.claude_agents?.args).toEqual([expect.stringMatching(/\/bin\/codex-msg$/), '/tmp/cxb-test/s', msgKey])
+  expect(started.config.mcp_servers.claude_agents?.args).toEqual([expect.stringMatching(/\/scripts\/codex-msg$/), '/tmp/cxb-test/s', msgKey])
   expect(started.developerInstructions).toContain('call the message_agent tool of the claude_agents MCP server')
   expect(fake.rpcs[2]?.params).toEqual({ threadId: 'th-1', name: 'calc_tests' })
   expect(fake.rpcs[3]?.params).toMatchObject({ threadId: 'th-1', effort: 'max', input: [{ type: 'text', text: prompt, text_elements: [] }] })

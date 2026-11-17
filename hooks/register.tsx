@@ -5,7 +5,7 @@
 //   subagent's loop is answered by turn.step here (no Claude model runs): it
 //   calls codex_await until the turn ends, then answers the Codex final message.
 //
-//   this module --$.http.fetch(socketPath)--> bin/bridge.mjs daemon
+//   this module --$.http.fetch(socketPath)--> scripts/bridge.mjs daemon
 //   --stdio JSON-RPC--> codex app-server; the relay's stdout (NDJSON events)
 //   --$.process.spawn--> onEvent
 //
@@ -156,7 +156,7 @@ const startedTurns = new Map<string, string>()
 const turnStarts = new Set<string>()
 /** `<threadId> <turnId>` of turns Codex ran on a stopped job that were interrupted, each once. */
 const stopInterrupts = new Set<string>()
-/** The node binary the bridge runs on, which Codex runs bin/codex-msg on too. */
+/** The node binary the bridge runs on, which Codex runs scripts/codex-msg on too. */
 let nodeBinary = 'node'
 /** Subagents seen at turn.step that are not codex:* agents. */
 const foreignAgents = new Set<string>()
@@ -341,7 +341,7 @@ async function startBridge($: Engine): Promise<void> {
   const node = await resolveBinary($, settings.nodePath, 'node')
   nodeBinary = node
   const codex = await resolveBinary($, settings.codexPath, 'codex')
-  const argv = [node, `${$.plugin.root}/bin/bridge.mjs`, codex, key]
+  const argv = [node, `${$.plugin.root}/scripts/bridge.mjs`, codex, key]
   const env = await bridgeEnv($)
   const request = { current, argv, env }
   // Without a supervisor (session.start did not fire after a reload) the relay is this hook's child.
@@ -553,7 +553,7 @@ function onThread<T>(threadId: string, work: () => Promise<T>): Promise<T> {
 /**
  * Unsubscribes from a thread whose turn ended and that runs no newer one, so
  * app-server unloads it once idle (about a minute later) and stops its MCP
- * servers: bin/codex-msg and the MCP servers of Codex's own plugins. The next
+ * servers: scripts/codex-msg and the MCP servers of Codex's own plugins. The next
  * turn on it resumes it first (ensureLoaded).
  */
 function releaseThread($: Engine, threadId: string): Promise<void> {

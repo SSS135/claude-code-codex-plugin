@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.16
+
+Changed:
+
+- The bridge, the registry and `codex-msg` move from `bin/` to `scripts/`. The plugin directory blocks a plugin's `bin/` for non-Verified organizations and claude.ai organization sync rejects a top-level `bin/`. The new path is a new bridge build, so after an update the relay drains or stops the previous build's daemon, as on any version change.
+
 ## 1.0.15
 
 Fixed:

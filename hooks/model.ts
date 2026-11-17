@@ -26,7 +26,7 @@ export type BridgeEvent =
 /** A failure to show the model as the tool's error. */
 export class CodexError extends Error {}
 
-/** Where $.http.fetch sends a bridge endpoint: over the daemon's Unix socket, or on Windows to its loopback URL, which carries the daemon's secret (bin/bridge.mjs). */
+/** Where $.http.fetch sends a bridge endpoint: over the daemon's Unix socket, or on Windows to its loopback URL, which carries the daemon's secret (scripts/bridge.mjs). */
 export const bridgeTarget = (socket: string, endpoint: string): { url: string; socketPath?: string } =>
   /^https?:/.test(socket) ? { url: `${socket}${endpoint}` } : { url: `http://codex${endpoint}`, socketPath: socket }
 
@@ -53,7 +53,7 @@ export const aliasOf = (model: string): string =>
 
 export const UPDATE_HINT = 'Update the Codex CLI: npm i -g @openai/codex@latest, or update the ChatGPT app on macOS.'
 
-/** What the person is told when a reload's relay drives the previous build's daemon (bin/bridge.mjs drain) while `turns` turns run on it. */
+/** What the person is told when a reload's relay drives the previous build's daemon (scripts/bridge.mjs drain) while `turns` turns run on it. */
 export const oldBuildNotice = (turns: number): string =>
   `Codex plugin updated, but its bridge still runs the previous version for the ${turns} Codex turn(s) running now; the update applies once they end. ` +
   'To apply it now, restart Claude Code (those turns are lost; a SendMessage to each job resumes it afterwards).'
@@ -696,12 +696,12 @@ export function permissionsFor(
 
 // ------------------------------------------------------------ codex-msg
 
-/** The MCP server, bin/codex-msg, through which a job messages the session's agents; Codex starts it outside the job's sandbox. */
+/** The MCP server, scripts/codex-msg, through which a job messages the session's agents; Codex starts it outside the job's sandbox. */
 export const MSG_SERVER = 'claude_agents'
 
 /** What thread/start and thread/resume take so a job can message the session's agents: the server in `config`, its use in the developer instructions. */
 export const messagingParams = (node: string, root: string, socketPath: string, key: string) => ({
-  config: { mcp_servers: { [MSG_SERVER]: { command: node, args: [`${root}/bin/codex-msg`, socketPath, key] } } },
+  config: { mcp_servers: { [MSG_SERVER]: { command: node, args: [`${root}/scripts/codex-msg`, socketPath, key] } } },
   developerInstructions: [
     'You run as a background job of a Claude Code session, which gets your final message when your turn ends.',
     `To message that session while you work, call the message_agent tool of the ${MSG_SERVER} MCP server with the text.`,

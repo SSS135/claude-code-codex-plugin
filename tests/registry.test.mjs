@@ -5,7 +5,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
-import { readAgents, serveRegistry, writeAgent } from '../bin/registry.mjs'
+import { readAgents, serveRegistry, writeAgent } from '../scripts/registry.mjs'
 
 test('separate sessions persist independently, survive registry-server restart, and retain stale records', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-registry-test-'))

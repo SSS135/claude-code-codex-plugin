@@ -54,7 +54,7 @@ const write = message => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', .
 const post = (route, payload) =>
   new Promise(resolve => {
     const body = JSON.stringify(payload)
-    // On Windows the bridge's address is a loopback URL rather than a socket (see bin/bridge.mjs).
+    // On Windows the bridge's address is a loopback URL rather than a socket (see scripts/bridge.mjs).
     const [url, via] = /^https?:/.test(socketPath) ? [`${socketPath}${route}`, {}] : [`http://bridge${route}`, { socketPath }]
     const req = http.request(
       url,

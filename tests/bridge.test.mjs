@@ -11,8 +11,8 @@ import path from 'node:path'
 import readline from 'node:readline'
 import { fileURLToPath } from 'node:url'
 
-const BRIDGE = fileURLToPath(new URL('../bin/bridge.mjs', import.meta.url))
-const MSG = fileURLToPath(new URL('../bin/codex-msg', import.meta.url))
+const BRIDGE = fileURLToPath(new URL('../scripts/bridge.mjs', import.meta.url))
+const MSG = fileURLToPath(new URL('../scripts/codex-msg', import.meta.url))
 const HOLD_MS = 300
 const FAKE_CODEX = `#!/usr/bin/env node
 import { spawn } from 'node:child_process'

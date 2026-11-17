@@ -38,9 +38,9 @@
 //             POST /reply {id, result} | {id, error}   answers a server request
 //             POST /wait  {threadId, msgKey?, timeoutMs} long-poll for turn end or a codex-msg message
 //             POST /subagents {threadId}              -> {active: {threadId: turnId}} the running turns of the sub-agents it spawned, at any depth
-//             POST /msg   {key, text, to?}             bin/codex-msg: a message from a Codex job, to an agent or main
+//             POST /msg   {key, text, to?}             scripts/codex-msg: a message from a Codex job, to an agent or main
 //             POST /roster {text}                      the plugin: the agent list list_agents answers
-//             POST /agents {key}                       bin/codex-msg: that list, as plain text
+//             POST /agents {key}                       scripts/codex-msg: that list, as plain text
 //           While no relay is attached it buffers events (so a plugin reload
 //           loses nothing) and keeps codex and its running turns while the
 //           Claude Code process the last relay named lives (its parent, passed
@@ -49,7 +49,7 @@
 //           IDLE_MS with no turn running and no request in flight; the plugin
 //           starts a new one when it next needs Codex. Lifecycle events go, one
 //           timestamped line each, to <dir>.log beside the directory, so the log
-//           outlives the daemon that wrote it. Codex stops a thread's MCP servers (bin/codex-msg among them)
+//           outlives the daemon that wrote it. Codex stops a thread's MCP servers (scripts/codex-msg among them)
 //           when it unloads the thread, and all of them when it exits; off
 //           Windows the daemon then ends what is left of codex's process group. It also
 //           stops daemons of bridge builds that predate this lifecycle (their
