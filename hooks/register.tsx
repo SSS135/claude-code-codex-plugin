@@ -18,7 +18,7 @@ import type { EngineInterface, HookFailure, Register, TurnStepChunk, TurnStepRes
 import type { CodexAgent, CodexApprovals, CodexSandbox, OutboxItem } from '../types'
 import {
   AGENT_PREFIX,
-  agentSpecs,
+  agentDescription,
   aliasOf,
   aliasOfType,
   afterTurnEnd,
@@ -30,6 +30,8 @@ import {
   autoReviewDigest,
   AWAIT_TOOL,
   HANDBACK_TOOL,
+  WRAPPER_MODEL,
+  WRAPPER_PROMPT,
   configDirs,
   type Defaults,
   effectiveDefaults,
@@ -610,14 +612,14 @@ type JobInput = {
 
 /** Starts and names the Codex thread; the turn starts once the subagent's id is known. */
 async function startThread($: Engine, input: JobInput): Promise<{ threadId: string; model: string }> {
-  const started = await rpc<{ thread: { id: string }; model: string }>($, 'thread/start', {
+  const started = (await rpc($, 'thread/start', {
     model: input.model,
     cwd: input.cwd,
     sandbox: sandboxMode(input.sandbox),
     ...approvalParams(input.approvals),
     ephemeral: false,
     ...(await messagingFor($, input.msgKey)),
-  })
+  })) as { thread: { id: string }; model: string }
   loadedThreads.add(started.thread.id)
   // Names the session in the Codex app, `codex resume` and `codex agents`; the agent runs either way.
   await rpc($, 'thread/name/set', { threadId: started.thread.id, name: input.name }).catch(error =>
@@ -669,7 +671,7 @@ async function startTurnOnQueue($: Engine, agent: CodexAgent, text: string, capa
   let started: { turn: { id: string } }
   turnStarts.add(agent.threadId)
   try {
-    started = await rpc<{ turn: { id: string } }>($, 'turn/start', turnStartParams(agent, text))
+    started = (await rpc($, 'turn/start', turnStartParams(agent, text))) as { turn: { id: string } }
     startedTurns.set(agent.threadId, started.turn.id)
   } finally {
     turnStarts.delete(agent.threadId)
@@ -1489,7 +1491,12 @@ export const register: Register = (on, options) => {
       $.ui.log(`codex: ${errorText(error)}`)
     }
     for (const tool of TOOL_SPECS) await $.tool.register(tool)
-    for (const spec of agentSpecs(effectiveDefaults(settings, project))) await $.agent.register(spec)
+    const defaults = effectiveDefaults(settings, project)
+    // One call written out per MODEL_ALIASES entry, in its order, with a fixed permissionMode: the plugin directory accepts no other form.
+    await $.agent.register({ name: 'luna', description: agentDescription('luna', defaults), prompt: WRAPPER_PROMPT, tools: [AWAIT_TOOL, 'SendMessage', HANDBACK_TOOL], model: WRAPPER_MODEL, background: true, omitClaudeMd: true, permissionMode: 'default' })
+    await $.agent.register({ name: 'sol', description: agentDescription('sol', defaults), prompt: WRAPPER_PROMPT, tools: [AWAIT_TOOL, 'SendMessage', HANDBACK_TOOL], model: WRAPPER_MODEL, background: true, omitClaudeMd: true, permissionMode: 'default' })
+    await $.agent.register({ name: 'astra', description: agentDescription('astra', defaults), prompt: WRAPPER_PROMPT, tools: [AWAIT_TOOL, 'SendMessage', HANDBACK_TOOL], model: WRAPPER_MODEL, background: true, omitClaudeMd: true, permissionMode: 'default' })
+    await $.agent.register({ name: 'terra', description: agentDescription('terra', defaults), prompt: WRAPPER_PROMPT, tools: [AWAIT_TOOL, 'SendMessage', HANDBACK_TOOL], model: WRAPPER_MODEL, background: true, omitClaudeMd: true, permissionMode: 'default' })
     await loadFromStore($)
     if (!wakeSupervisor) void superviseRelays($)
     await startBridge($)

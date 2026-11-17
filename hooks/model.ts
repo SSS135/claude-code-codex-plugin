@@ -3,7 +3,7 @@
 // protocol parameters, how events change an agent, and the texts the model
 // and the person read.
 
-import type { EngineInterface, ToolSpec } from 'claude-code'
+import type { ToolSpec } from 'claude-code'
 
 import type { CodexAgent, CodexApprovals, CodexSandbox } from '../types'
 
@@ -738,8 +738,6 @@ export const WRAPPER_MODEL = 'haiku'
 /** How a background subagent hands its report back where the engine requires it (auto mode); elsewhere its final text is the report. */
 export const HANDBACK_TOOL = 'SubagentHandback'
 
-type AgentSpec = Parameters<EngineInterface['agent']['register']>[0]
-
 /** The alias a `codex:<alias>` agent type names, or undefined for any other type. */
 export const aliasOfType = (subagentType: string): string | undefined => {
   if (!subagentType.startsWith(AGENT_PREFIX)) return undefined
@@ -783,17 +781,6 @@ export const WRAPPER_PROMPT = [
   `If ${AWAIT_TOOL} fails or returns an error, call it again: the Codex job may still run, and only the result it returns ends your work.`,
   'Never compose a message, status or report of your own: relay only text the tool returned, and never diagnose the tool yourself.',
 ].join(' ')
-
-export const agentSpecs = (defaults: Defaults): AgentSpec[] =>
-  Object.keys(MODEL_ALIASES).map(alias => ({
-    name: alias,
-    description: agentDescription(alias, defaults),
-    prompt: WRAPPER_PROMPT,
-    tools: [AWAIT_TOOL, 'SendMessage', HANDBACK_TOOL],
-    model: WRAPPER_MODEL,
-    background: true,
-    omitClaudeMd: true,
-  }))
 
 const HEADER_KEYS = ['effort', 'sandbox', 'approvals'] as const
 type HeaderKey = (typeof HEADER_KEYS)[number]

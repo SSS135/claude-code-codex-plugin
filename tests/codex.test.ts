@@ -2,7 +2,7 @@ import type { On, SessionMessage, TurnStepChunk, TurnStepResult } from 'claude-c
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
 
-import { agentDescription, agentSpecs, aliasOf, aliasOfType, approvalAnswer, approvalOptions, bridgeTarget, codexVersionError, configDirs, describeAgent, effectiveDefaults, effortFor, listText, MIN_CODEX_VERSION, modelEffortError, modelFor, nodeOptionPreloads, oldBuildNotice, parseHeader, permissionsFor, resultText, shortCommand, TOOL_SPECS, UPDATE_HINT, withoutPreloads, wrapperAnswer, isCapacityFailure } from '../hooks/model'
+import { agentDescription, aliasOf, aliasOfType, approvalAnswer, approvalOptions, bridgeTarget, codexVersionError, configDirs, describeAgent, effectiveDefaults, effortFor, listText, MIN_CODEX_VERSION, modelEffortError, modelFor, nodeOptionPreloads, oldBuildNotice, parseHeader, permissionsFor, resultText, shortCommand, TOOL_SPECS, UPDATE_HINT, withoutPreloads, wrapperAnswer, isCapacityFailure } from '../hooks/model'
 import type { CodexAgent } from '../types'
 
 // A fake bridge: the relay's stdout is a queue the test pushes NDJSON into,
@@ -164,7 +164,7 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
     return { model: 'claude-haiku-4-5', agentId }
   })
   on('agent.list', () => (fake.listError !== null ? { deny: fake.listError } : {
-    value: fake.agentList.map(agent => ({ ...agent, description: '', status: 'running' as const })),
+    value: fake.agentList.map(agent => ({ ...agent, description: '', status: 'running' as const, kind: 'local_agent' as const, taskStatus: 'running' as const, label: '', startTime: 0, cwd: '/work', tokenCount: 0, tokenSamples: [], hasRow: true })),
   }))
   on('session.messages', (_$, e) => fake.messagesDeny ? { value: { deny: fake.messagesDeny } } : { value: fake.messages[(e as { agentId?: string }).agentId ?? ''] ?? [] })
   on('tool.list', () => ({ value: fake.tools.map(name => ({ name, description: '', mcp: false })) }))
@@ -251,7 +251,8 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
     fake.targets.push(`${e.init?.socketPath ?? ''} ${e.url}`)
     // A Windows bridge's paths sit under its secret (see the Windows test).
     const path = new URL(e.url).pathname.replace(/^\/s3cret(?=\/)/, '')
-    const body = JSON.parse(e.init?.body ?? '{}') as Record<string, unknown>
+    const raw = e.init?.body
+    const body = JSON.parse(typeof raw === 'string' ? raw : '{}') as Record<string, unknown>
     const hold = fake.fetchHolds[path]
     if (hold) await hold
     if (fake.deadSockets.includes(e.init?.socketPath ?? '')) return { deny: 'connect ECONNREFUSED' }
@@ -404,7 +405,7 @@ test('registers one native agent type per model alias, run on haiku with codex_a
   await start($, fake)
   expect(fake.registeredAgents.map(spec => spec.name)).toEqual(['luna', 'sol', 'astra', 'terra'])
   for (const spec of fake.registeredAgents) {
-    expect(spec).toMatchObject({ tools: ['mcp__codex__codex_await', 'SendMessage', 'SubagentHandback'], model: 'haiku', background: true, omitClaudeMd: true })
+    expect(spec).toMatchObject({ tools: ['mcp__codex__codex_await', 'SendMessage', 'SubagentHandback'], model: 'haiku', background: true, omitClaudeMd: true, permissionMode: 'default' })
   }
   const luna = String(fake.registeredAgents[0]?.description)
   expect(luna).toContain('the newest Luna model, effort medium.')
@@ -1143,7 +1144,6 @@ test('permissions: auto by default, yolo forces full access and refuses a contra
   expect(configDirs('/elsewhere', '/work')).toEqual(['/elsewhere', '/'])
   expect(approvalOptions('item/fileChange/requestApproval', { proposedExecpolicyAmendment: ['x'] })).not.toContain('Allow always')
   expect(approvalAnswer('item/fileChange/requestApproval', {}, { kind: 'always' })).toEqual({ result: { decision: 'acceptForSession' } })
-  expect(agentSpecs(defaults).map(spec => spec.name)).toEqual(['luna', 'sol', 'astra', 'terra'])
 })
 
 test('Windows paths: config dirs split at \\ and end at the drive; commands drop the PowerShell wrapper', () => {

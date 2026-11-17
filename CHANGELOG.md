@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.14
+
+Changed:
+
+- The four `codex:*` agent types register in `default` permission mode instead of the parent session's. Each type is one `$.agent.register` call written out, and `rpc` calls take no type argument, the form the plugin directory's code checks accept.
+- README: new section "What this plugin runs, reads and sends" lists the programs the plugin starts, its network targets, what reaches Codex, which hooks read or allow what, and why it needs no credential.
+
+Fixed:
+
+- `claude plugin validate` reports no type errors in tests/codex.test.ts (the `agent.list` mock's shape, a `string | { base64 }` body).
+
 ## 1.0.13
 
 Fixed:

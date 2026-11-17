@@ -198,6 +198,17 @@ node --test tests/registry.test.mjs tests/bridge.test.mjs
 claude --plugin-dir .
 ```
 
+## What this plugin runs, reads and sends
+
+- Programs. The hooks module starts one program with `$.process.spawn`: the relay, `node bin/bridge.mjs <codex> <key>`, because the plugin API cannot write to a child's stdin and `codex app-server` speaks JSON-RPC over stdio. The relay runs `codex --version`, then starts the detached daemon (`node bin/bridge.mjs --launch`, which starts `--daemon`), which runs `codex app-server --listen stdio://`. Codex starts `node bin/codex-msg` per thread as its `claude_agents` MCP server, so a job can message the session's agents. Hooks also run `node -e "setTimeout(() => {}, <ms>)"` with `$.process.run` as a pause that does not spend the hook's time budget. On Windows the bridge may run `powershell.exe` with `Get-AppxPackage OpenAI.Codex` to find the Codex app's `codex.exe`, and stops Codex with `taskkill /T /F`. `node` and `codex` come from `nodePath` and `codexPath`, else from PATH (see [Configuration](#configuration)).
+- Network. `$.http.fetch` reaches only the bridge on this machine: the daemon over its Unix socket (on Windows a `127.0.0.1` port) and the relay's agent registry on a `127.0.0.1` port. The plugin contacts no remote host. Codex itself talks to OpenAI under your Codex login.
+- Data sent to Codex, and so to OpenAI: the prompt of a `codex:*` Agent call (header lines removed), `SendMessage` texts to a Codex job, the plugin's own follow-ups (`continue` after a capacity failure, a structured-output correction), and for `list_agents` the session's agent list (name, type, status and the Agent call's short description). No other part of the conversation is sent.
+- Conversation read. The `session.append` hook matches only the `note` and `tool-result` doors and only detects structured-output enforcement and `StructuredOutput` errors for Codex wrapper agents in Workflows; every row passes through unchanged. `$.session.messages` reads only a Codex wrapper's own transcript, to see whether its `SubagentHandback` was refused.
+- `agent.spawn` acts only on `codex:*` types. Any other spawn passes through unchanged; the plugin then refreshes the agent list `list_agents` answers. The plugin registers the four `codex:*` agent types in `default` permission mode with the tools `codex_await`, `SendMessage` and `SubagentHandback`.
+- `tool.check` on `SendMessage` allows only a call the plugin itself made for a wrapper: relaying a Codex job's message, verbatim. Every other `SendMessage` goes to the next decider unchanged.
+- Commands Codex runs are bounded by the job's sandbox and approvals (see [Approval modes](#approval-modes)); with `ask`, each escalation is a Claude Code dialog.
+- Credentials. The plugin reads no API key or token; the hooks module reads only `NODE_OPTIONS` from the environment. `http://codex/...` and `http://bridge/...` are placeholder hosts for requests over the local Unix socket. The registry, and on Windows the daemon, listen on `127.0.0.1:<random port>/<random secret>`: a per-process token the bridge creates (`bin/registry.mjs`, `bin/bridge.mjs`) that never leaves the machine. Codex authenticates with its own login, which this plugin never reads.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
